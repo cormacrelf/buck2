@@ -120,6 +120,7 @@ load(
     ":releases.bzl",
     "releases",
 )
+load("@prelude//:rules.bzl", "http_archive")
 
 DEFAULT_MAKE_COMP_DB = "prelude//cxx/tools:make_comp_db"
 
@@ -188,48 +189,6 @@ zig_distribution = rule(
     },
 )
 
-def _http_archive_impl(ctx: AnalysisContext) -> list[Provider]:
-    url = ctx.attrs.urls[0]
-    if url.endswith(".tar.xz"):
-        ext = "tar.xz"
-        flags = ["tar", "xJf"]
-    elif url.endswith(".zip"):
-        flags = ["unzip"]
-        ext = "zip"
-    else:
-        fail("Unknown archive type in URL '{}'".format(url))
-
-    # Download archive.
-    archive = ctx.actions.declare_output("archive." + ext)
-    ctx.actions.download_file(archive.as_output(), url, sha256 = ctx.attrs.sha256, is_deferrable = True)
-
-    # Unpack archive to output directory.
-    output = ctx.actions.declare_output(ctx.label.name)
-    script, _ = ctx.actions.write(
-        "unpack.sh",
-        [
-            cmd_args(output, format = "mkdir -p {}"),
-            cmd_args(output, format = "cd {}"),
-            cmd_args(flags, archive, delimiter = " ").relative_to(output),
-        ],
-        is_executable = True,
-        allow_args = True,
-    )
-    ctx.actions.run(cmd_args(["/bin/sh", script])
-        .hidden([archive, output.as_output()]), category = "http_archive")
-
-    return [DefaultInfo(default_output = output)]
-
-# TODO Switch to http_archive once that supports zip download.
-#   See https://github.com/facebook/buck2/issues/21
-_http_archive = rule(
-    impl = _http_archive_impl,
-    attrs = {
-        "sha256": attrs.string(default = ""),
-        "urls": attrs.list(attrs.string(), default = []),
-    },
-)
-
 def _host_arch() -> str:
     arch = host_info().arch
     if arch.is_x86_64:
@@ -269,7 +228,7 @@ def download_zig_distribution(
         os = _host_os()
     archive_name = name + "-archive"
     release = _get_zig_release(version, "{}-{}".format(arch, os))
-    _http_archive(
+    http_archive(
         name = archive_name,
         urls = [release.url],
         sha256 = release.sha256,
