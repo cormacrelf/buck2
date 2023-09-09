@@ -247,20 +247,13 @@ def download_zig_distribution(
         os = os,
     )
 
-def _get_linker_type(os: str) -> str:
-    if os == "linux":
-        return "gnu"
-    elif os == "macos" or os == "freebsd":
-        return "darwin"
-    elif os == "windows":
-        return "windows"
-    else:
-        fail("Cannot determine linker type: Unknown OS '{}'".format(os))
-
 def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
     dist = ctx.attrs.distribution[ZigDistributionInfo]
     zig = ctx.attrs.distribution[RunInfo]
     target = ["-target", ctx.attrs.target] if ctx.attrs.target else []
+    linker_type = ctx.attrs.linker_type
+    if linker_type == None:
+        fail("No matching rules to configure linker_type")
     return [ctx.attrs.distribution[DefaultInfo]] + cxx_toolchain_infos(
         platform_name = dist.arch,
         c_compiler_info = CCompilerInfo(
@@ -312,9 +305,9 @@ def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             #requires_objects = None,
             #supports_distributed_thinlto = None,
             independent_shlib_interface_linker_flags = ctx.attrs.shared_library_interface_flags,
-            type = _get_linker_type(dist.os),
+            type = linker_type,
             use_archiver_flags = True,
-            is_pdb_generated = is_pdb_generated(_get_linker_type(dist.os), ctx.attrs.linker_flags),
+            is_pdb_generated = is_pdb_generated(linker_type, ctx.attrs.linker_flags),
         ),
         binary_utilities_info = BinaryUtilitiesInfo(
             bolt_msdk = None,
@@ -345,6 +338,16 @@ def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
         #bolt_enabled = False,
     )
 
+
+_LINKER_TYPE = select({
+    "config//os:linux": "gnu",
+    "config//os:macos": "darwin",
+    "config//os:freebsd": "darwin",
+    "config//os:windows": "windows",
+    # None becomes a fail in the rule impl if you don't supply a value
+    "DEFAULT": None,
+})
+
 cxx_zig_toolchain = rule(
     impl = _cxx_zig_toolchain_impl,
     attrs = {
@@ -355,6 +358,7 @@ cxx_zig_toolchain = rule(
         "distribution": attrs.exec_dep(providers = [RunInfo, ZigDistributionInfo]),
         "link_style": attrs.enum(LinkStyle.values(), default = "static"),
         "linker_flags": attrs.list(attrs.arg(), default = []),
+        "linker_type": attrs.option(attrs.string(), default = _LINKER_TYPE),
         "make_comp_db": attrs.dep(providers = [RunInfo], default = DEFAULT_MAKE_COMP_DB),
         "shared_dep_runtime_ld_flags": attrs.list(attrs.arg(), default = []),
         "shared_library_interface_flags": attrs.list(attrs.string(), default = []),
