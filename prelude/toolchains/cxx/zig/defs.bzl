@@ -344,6 +344,7 @@ _LINKER_TYPE = select({
     "config//os:macos": "darwin",
     "config//os:freebsd": "darwin",
     "config//os:windows": "windows",
+    "config//cpu:wasm32": "wasm",
     # None becomes a fail in the rule impl if you don't supply a value
     "DEFAULT": None,
 })
