@@ -113,6 +113,10 @@ load(
     "is_pdb_generated",
 )
 load(
+    "@prelude//linking:lto.bzl",
+    "LtoMode",
+)
+load(
     "@prelude//linking:link_info.bzl",
     "LinkStyle",
 )
@@ -292,6 +296,7 @@ def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             #link_ordering = None,
             linker = RunInfo(args = cmd_args([zig, "c++"])),
             linker_flags = cmd_args(target + ctx.attrs.linker_flags),
+            lto_mode = LtoMode("none"),
             #lto_mode = None,  # TODO support LTO
             object_file_extension = "o",
             #mk_shlib_intf = None,  # not needed if shlib_interfaces = "disabled"
