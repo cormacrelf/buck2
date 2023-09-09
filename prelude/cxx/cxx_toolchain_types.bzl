@@ -7,7 +7,7 @@
 
 load("@prelude//cxx:debug.bzl", "SplitDebugMode")
 
-LinkerType = ["gnu", "darwin", "windows"]
+LinkerType = ["gnu", "darwin", "windows", "wasm"]
 
 ShlibInterfacesMode = enum("disabled", "enabled", "defined_only")
 
