@@ -689,11 +689,21 @@ impl REClient {
 
     pub async fn upload_blob(
         &self,
-        _blob: Vec<u8>,
-        _metadata: RemoteExecutionMetadata,
-    ) -> anyhow::Result<TDigest> {
-        // TODO(aloiscochard)
-        Err(anyhow::anyhow!("Not implemented (RE upload_blob)"))
+        blob: InlinedBlobWithDigest,
+        metadata: RemoteExecutionMetadata,
+    ) -> anyhow::Result<()> {
+        self.upload(
+            metadata,
+            UploadRequest {
+                inlined_blobs_with_digest: Some(vec![blob]),
+                files_with_digest: None,
+                directories: None,
+                upload_only_missing: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn download(
@@ -898,13 +908,11 @@ fn convert_taction_result_to_rbe(taction_result: TActionResult2) -> anyhow::Resu
         output_symlinks: vec![],
         output_file_symlinks: vec![],
         output_directory_symlinks: vec![],
-        stdout_raw: stdout_raw.ok_or_else(|| {
-            anyhow::anyhow!("stdout_raw not populated on action that ran locally")
-        })?,
+        // If missing, it's because we uploaded it already
+        // if present, it's inline
+        stdout_raw: stdout_raw.unwrap_or(Vec::new()),
         stdout_digest: stdout_digest.map(tdigest_to),
-        stderr_raw: stderr_raw.ok_or_else(|| {
-            anyhow::anyhow!("stderr_raw not populated on action that ran locally")
-        })?,
+        stderr_raw: stderr_raw.unwrap_or(Vec::new()),
         stderr_digest: stderr_digest.map(tdigest_to),
     })
 }
