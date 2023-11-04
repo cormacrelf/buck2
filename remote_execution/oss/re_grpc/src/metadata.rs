@@ -10,27 +10,27 @@
 pub type TPlatform = crate::grpc::Platform;
 pub type TProperty = crate::grpc::Property;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct ActionHistoryInfo {
     pub action_key: String,
     pub disable_retry_on_oom: bool,
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct HostResourceRequirements {
     pub affinity_keys: Vec<String>,
     pub input_files_bytes: i64,
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct BuckInfo {
     pub build_id: String,
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct RemoteExecutionMetadata {
     pub action_history_info: Option<ActionHistoryInfo>,
     pub buck_info: Option<BuckInfo>,

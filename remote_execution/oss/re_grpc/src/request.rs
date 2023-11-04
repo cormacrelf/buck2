@@ -87,7 +87,7 @@ pub struct TExecutionPolicy {
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct WriteActionResultRequest {
     pub action_digest: TDigest,
     pub action_result: TActionResult2,

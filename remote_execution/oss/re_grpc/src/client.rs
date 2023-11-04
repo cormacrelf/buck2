@@ -502,7 +502,7 @@ impl REClient {
         _metadata: RemoteExecutionMetadata,
         _request: WriteActionResultRequest,
     ) -> anyhow::Result<WriteActionResultResponse> {
-        Err(anyhow::anyhow!("Not supported"))
+        Err(anyhow::anyhow!("write_action_result not supported, failed to write {_request:?}"))
     }
 
     pub async fn execute_with_progress(

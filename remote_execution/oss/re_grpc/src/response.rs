@@ -7,6 +7,8 @@
  * of this source tree.
  */
 
+use std::fmt;
+
 use dupe::Dupe;
 
 use crate::digest::*;
@@ -100,6 +102,33 @@ pub struct TActionResult2 {
     pub auxiliary_metadata: Vec<TAny>,
     // Compatibility with the Thrift structs
     pub _dot_dot_default: (),
+}
+
+impl fmt::Debug for TActionResult2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct FileNamesOnly<'a>(&'a [TFile]);
+        impl fmt::Debug for FileNamesOnly<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list()
+                    .entries(self.0.iter().map(|x| &x.name))
+                    .finish()
+            }
+        }
+        f.debug_struct("TActionResult2")
+            .field("exit_code", &self.exit_code)
+            .field("output_files", &FileNamesOnly(&self.output_files))
+            .field("output_directories", &self.output_directories)
+            .field("execution_dir", &self.execution_metadata.execution_dir)
+            .field(
+                "stdout_bytes",
+                &self.stdout_raw.as_ref().map_or(0, |x| x.len()),
+            )
+            .field(
+                "stderr_bytes",
+                &self.stderr_raw.as_ref().map_or(0, |x| x.len()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -214,7 +243,7 @@ pub struct ExecuteWithProgressResponse {
 #[derive(Clone, Debug, Dupe, Default)]
 pub struct UploadResponse {}
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct TDirectory2 {
     pub path: String,
     pub tree_digest: TDigest,

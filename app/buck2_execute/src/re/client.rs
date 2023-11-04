@@ -192,6 +192,9 @@ impl RemoteExecutionClient {
         self.data
             .action_cache
             .op(self.data.client.action_cache(action_digest, use_case))
+            .inspect_err(|x| {
+                tracing::error!("fetch failed from action cache: {x}");
+            })
             .await
     }
 
@@ -1141,6 +1144,9 @@ impl RemoteExecutionClientImpl {
                     ..Default::default()
                 },
             )
+            .inspect_err(|x| {
+                tracing::error!("write_action_result got: {x}");
+            })
             .await
     }
 }
