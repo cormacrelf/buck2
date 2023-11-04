@@ -922,6 +922,9 @@ fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionR
         || !action_result.output_file_symlinks.is_empty()
         || !action_result.output_directory_symlinks.is_empty()
     {
+        tracing::error!(
+            "CAS ActionResult returned with symlinks in it, buck2 cannot handle these yet"
+        );
         anyhow::bail!(
             "CAS ActionResult returned with symlinks in it, buck2 cannot handle these yet"
         );
