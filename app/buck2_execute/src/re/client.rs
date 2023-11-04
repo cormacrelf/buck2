@@ -191,9 +191,12 @@ impl RemoteExecutionClient {
     ) -> anyhow::Result<Option<ActionResultResponse>> {
         self.data
             .action_cache
-            .op(self.data.client.action_cache(action_digest, use_case))
-            .inspect_err(|x| {
-                tracing::error!("fetch failed from action cache: {x}");
+            .op(self
+                .data
+                .client
+                .action_cache(action_digest.dupe(), use_case))
+            .inspect_err(move |_| {
+                tracing::warn!("fetch failed from action cache: {action_digest}");
             })
             .await
     }
