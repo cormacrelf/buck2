@@ -196,7 +196,7 @@ impl RemoteExecutionClient {
                 .client
                 .action_cache(action_digest.dupe(), use_case))
             .inspect_err(move |_| {
-                tracing::warn!("fetch failed from action cache: {action_digest}");
+                tracing::warn!("CAS cache miss: {action_digest}");
             })
             .await
     }
