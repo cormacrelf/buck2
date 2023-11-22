@@ -7,6 +7,7 @@
 
 def check_targets_impl(ctx):
     target_universe = ctx.uquery().owner(ctx.cli_args.file)
+    target_universe = ctx.target_universe(target_universe).target_set()
     owners = ctx.cquery().owner(ctx.cli_args.file, target_universe)
     nodes = ctx.cquery().kind("^(rust_binary|rust_library|rust_test)$", owners)
 
