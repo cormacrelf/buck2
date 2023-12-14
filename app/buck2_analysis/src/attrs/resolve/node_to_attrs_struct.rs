@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use anyhow::Context;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use starlark::values::structs::AllocStruct;
@@ -23,7 +24,12 @@ pub(crate) fn node_to_attrs_struct<'v>(
     let attrs_iter = node.attrs(AttrInspectOptions::All);
     let mut resolved_attrs = Vec::with_capacity(attrs_iter.size_hint().0);
     for a in attrs_iter {
-        resolved_attrs.push((a.name, a.value.resolve_single(node.label().pkg(), ctx)?));
+        resolved_attrs.push((
+            a.name,
+            a.value
+                .resolve_single(node.label().pkg(), ctx)
+                .with_context(|| format!("Resolving attribute `{}`", a.name))?,
+        ));
     }
     Ok(ctx.heap().alloc(AllocStruct(resolved_attrs)))
 }
