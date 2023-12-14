@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use anyhow::Context;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::StarlarkArtifact;
@@ -102,32 +103,44 @@ impl ConfiguredAttrExt for ConfiguredAttr {
             }
             ConfiguredAttr::List(list) => {
                 let mut values = Vec::with_capacity(list.len());
-                for v in list.iter() {
-                    values.append(&mut v.resolve(pkg.dupe(), ctx)?);
+                for (i, v) in list.iter().enumerate() {
+                    values.append(
+                        &mut v
+                            .resolve(pkg.dupe(), ctx)
+                            .with_context(|| format!("In attrs.list() [{i}]"))?,
+                    );
                 }
                 Ok(ctx.heap().alloc(values))
             }
             ConfiguredAttr::Tuple(list) => {
                 let mut values = Vec::with_capacity(list.len());
-                for v in list.iter() {
-                    values.push(v.resolve_single(pkg.dupe(), ctx)?);
+                for (i, v) in list.iter().enumerate() {
+                    values.push(
+                        v.resolve_single(pkg.dupe(), ctx)
+                            .with_context(|| format!("In attrs.tuple() [{i}]"))?,
+                    );
                 }
                 Ok(ctx.heap().alloc(AllocTuple(values)))
             }
             ConfiguredAttr::Dict(dict) => {
                 let mut res = SmallMap::with_capacity(dict.len());
                 for (k, v) in dict.iter() {
-                    res.insert_hashed(
-                        k.resolve_single(pkg.dupe(), ctx)?
-                            .get_hashed()
-                            .map_err(BuckStarlarkError::new)?,
-                        v.resolve_single(pkg.dupe(), ctx)?,
-                    );
+                    let key = k
+                        .resolve_single(pkg.dupe(), ctx)
+                        .context("In attrs.dict() key")?
+                        .get_hashed()
+                        .map_err(BuckStarlarkError::new)?;
+                    let value = v
+                        .resolve_single(pkg.dupe(), ctx)
+                        .with_context(|| format!("In attrs.dict() value for key {}", key.key()))?;
+                    res.insert_hashed(key, value);
                 }
                 Ok(ctx.heap().alloc(Dict::new(res)))
             }
             ConfiguredAttr::None => Ok(Value::new_none()),
-            ConfiguredAttr::OneOf(box l, _) => l.resolve_single(pkg, ctx),
+            ConfiguredAttr::OneOf(box l, _) => {
+                l.resolve_single(pkg, ctx).context("In attrs.one_of()")
+            }
             a @ (ConfiguredAttr::Visibility(_) | ConfiguredAttr::WithinView(_)) => {
                 // TODO(nga): rule implementations should not need visibility attribute.
                 //   But adding it here to preserve existing behavior.
@@ -135,22 +148,29 @@ impl ConfiguredAttrExt for ConfiguredAttr {
             }
             ConfiguredAttr::ExplicitConfiguredDep(d) => {
                 ExplicitConfiguredDepAttrType::resolve_single(ctx, d.as_ref())
+                    .context("In attrs.dep()")
             }
             ConfiguredAttr::SplitTransitionDep(d) => {
                 SplitTransitionDepAttrType::resolve_single(ctx, d.as_ref())
+                    .context("In attrs.split_transition_dep()")
             }
             ConfiguredAttr::ConfigurationDep(d) => ConfigurationDepAttrType::resolve_single(ctx, d),
             ConfiguredAttr::PluginDep(d) => {
                 Ok(ctx.heap().alloc(StarlarkTargetLabel::new(d.0.dupe())))
             }
-            ConfiguredAttr::Dep(d) => DepAttrType::resolve_single(ctx, d),
-            ConfiguredAttr::SourceLabel(s) => SourceAttrType::resolve_single_label(ctx, s),
+            ConfiguredAttr::Dep(d) => {
+                DepAttrType::resolve_single(ctx, d).context("In attrs.split_transition_dep()")
+            }
+            ConfiguredAttr::SourceLabel(s) => SourceAttrType::resolve_single_label(ctx, s)
+                .with_context(|| format!("Resolving attrs.source() with label {s}")),
             ConfiguredAttr::Label(label) => {
                 let label = StarlarkConfiguredProvidersLabel::new(*label.clone());
                 Ok(ctx.heap().alloc(label))
             }
-            ConfiguredAttr::Arg(arg) => arg.resolve(ctx, &pkg),
-            ConfiguredAttr::Query(query) => query.resolve(ctx),
+            ConfiguredAttr::Arg(arg) => arg.resolve(ctx, &pkg).context("In attrs.arg()"),
+            ConfiguredAttr::Query(query) => query
+                .resolve(ctx)
+                .context("In attrs.split_transition_dep()"),
             ConfiguredAttr::SourceFile(s) => Ok(SourceAttrType::resolve_single_file(
                 ctx,
                 BuckPath::new(pkg.dupe(), s.path().dupe()),
