@@ -84,7 +84,7 @@ pub(crate) struct Crate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) target_spec: Option<TargetSpec>,
+    pub(crate) build_info: Option<BuildInfo>,
     /// Environment for the crate, often used by `env!`.
     pub(crate) env: FxHashMap<String, String>,
     /// Whether the crate is a proc-macro crate/
@@ -109,49 +109,45 @@ pub(crate) struct BuckExtensions {
 
 /// Build system-specific additions the `rust-project.json`.
 ///
-/// rust-analyzer encodes Cargo-specific knowledge in features
-/// such as flycheck or runnable and constructs Cargo-specific commands
-/// on the fly. This is a reasonable decision on its part, as most people
-/// use Cargo. However, to support equivalent functionality with non-Cargo
-/// build systems in rust-analyzer, this struct encodes pre-defined runnables
-/// and other bits of metadata. Below is an example of `TargetSpec` in JSON:
+/// rust-analyzer allows customising the flycheck command and various
+/// runnables using pure shell. We hook into this to have rust-analyzer
+/// call buck2 when you save files etc. Below is an example of `BuildInfo`
+/// in JSON, which is a field on a crate in rust-project.json:
 ///
 /// ```json
-/// "target_spec": {
+/// "build_info": {
 ///     "manifest_file": "/Users/dbarsky/fbsource/fbcode/buck2/integrations/rust-project/TARGETS",
-///     "target_label": "fbcode//buck2/integrations/rust-project:rust-project",
+///     "label": "//project/foo:my-crate",
 ///     "target_kind": "bin",
-///     "runnables": {
-///         "check": [
-///            "build",
-///            "fbcode//buck2/integrations/rust-project:rust-project"
-///         ],
-///         "run": [
-///             "run",
-///             "fbcode//buck2/integrations/rust-project:rust-project"
-///         ],
-///         "test": [
-///             "test",
-///             "fbcode//buck2/integrations/rust-project:rust-project",
-///             "--",
-///             "{test_id}",
-///             "--print-passing-details"
-///         ]
+///     "shell_runnables": {
+///         {
+///             "kind": "check",
+///             "program": "buck2",
+///             "args": ["build", "//project/foo:my-crate"]
+///         },
+///         {
+///             "kind": "run",
+///             "program": "buck2",
+///             "args": ["run", "//project/foo:my-crate"]
+///         },
+///         {
+///             "kind": "test_one",
+///             "program": "test_runner",
+///             "args": ["--name=$$TEST_NAME$$"]
+///         }
 ///     },
-///     "flycheck_command": [
-///         "build",
-///         "fbcode//buck2/integrations/rust-project:rust-project"
-///     ]
 /// }
 /// ```
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct TargetSpec {
+pub(crate) struct BuildInfo {
+    /// Buck extension
+    ///
     /// `manifest_file` corresponds to the `BUCK`/`TARGETS` file.
+    #[serde(default)]
     pub(crate) manifest_file: PathBuf,
-    pub(crate) target_label: String,
+    pub(crate) label: String,
     pub(crate) target_kind: TargetKind,
-    pub(crate) runnables: Runnables,
-    pub(crate) flycheck_command: Vec<String>,
+    pub(crate) shell_runnables: Vec<ShellRunnableArgs>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
@@ -177,6 +173,22 @@ impl From<crate::target::Kind> for TargetKind {
             Test => TargetKind::Test,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellRunnableArgs {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub kind: ShellRunnableKind,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ShellRunnableKind {
+    Check,
+    Run,
+    TestOne,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]

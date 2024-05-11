@@ -28,12 +28,13 @@ use tracing::warn;
 use tracing::Level;
 
 use crate::json_project::BuckExtensions;
+use crate::json_project::BuildInfo;
 use crate::json_project::Edition;
 use crate::json_project::JsonProject;
-use crate::json_project::Runnables;
+use crate::json_project::ShellRunnableArgs;
+use crate::json_project::ShellRunnableKind;
 use crate::json_project::Source;
 use crate::json_project::Sysroot;
-use crate::json_project::TargetSpec;
 use crate::target::AliasedTargetInfo;
 use crate::target::ExpandedAndResolved;
 use crate::target::MacroOutput;
@@ -149,25 +150,51 @@ pub(crate) fn to_json_project(
             include_dirs.insert(parent.to_owned());
         }
 
-        let spec = if info.in_workspace {
-            let spec = TargetSpec {
+        let build_info = if info.in_workspace {
+            let build_info = BuildInfo {
                 manifest_file: build_file.to_owned(),
-                target_label: target.to_string(),
+                label: target.to_string(),
                 target_kind: info.kind.clone().into(),
-                runnables: Runnables {
-                    check: vec!["build".to_owned(), target.to_string()],
-                    run: vec!["run".to_owned(), target.to_string()],
-                    test: vec![
-                        "test".to_owned(),
-                        target.to_string(),
-                        "--".to_owned(),
-                        "{test_id}".to_owned(),
-                        "--print-passing-details".to_owned(),
-                    ],
-                },
-                flycheck_command: vec!["build".to_owned(), target.to_string()],
+                shell_runnables: vec![
+                    ShellRunnableArgs {
+                        kind: ShellRunnableKind::Check,
+                        program: "buck2".to_string(),
+                        args: vec!["build".to_owned(), target.to_string()],
+                        cwd: project_root.clone(),
+                    },
+                    ShellRunnableArgs {
+                        kind: ShellRunnableKind::Run,
+                        program: "buck2".to_string(),
+                        args: vec!["run".to_owned(), target.to_string()],
+                        cwd: project_root.clone(),
+                    },
+                    ShellRunnableArgs {
+                        kind: ShellRunnableKind::Run,
+                        program: "buck2".to_string(),
+                        args: vec![
+                            "test".to_owned(),
+                            target.to_string(),
+                            "--".to_owned(),
+                            // R-A substitutes $$TEST_NAME$$ with e.g. `mycrate::tests::one`
+                            // --test-arg tells `buck2 test` to pass that string through to
+                            // the test program, which we will assume to be the rust test
+                            // harness.
+                            // Same overall effect as `cargo test -- mycrate::tests::one`,
+                            //
+                            // But this is a bit less than ideal, because buck will build
+                            // all of the related test binaries, including integration tests.
+                            // We don't know your naming conventions for library tests.
+                            // You might have a rust_test target named `mycrate-test`. So
+                            // we might need a way (probably buck metadata in the library
+                            // target) to tell rust-project about these.
+                            "--test-arg".to_owned(),
+                            "$$TEST_NAME$$".to_owned(),
+                        ],
+                        cwd: project_root.clone(),
+                    },
+                ],
             };
-            Some(spec)
+            Some(build_info)
         } else {
             None
         };
@@ -188,7 +215,7 @@ pub(crate) fn to_json_project(
             }),
             cfg: info.cfg(),
             env,
-            target_spec: spec,
+            build_info,
             is_proc_macro: info.proc_macro.unwrap_or(false),
             proc_macro_dylib_path,
             ..Default::default()
