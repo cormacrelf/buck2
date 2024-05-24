@@ -39,6 +39,11 @@ impl Check {
         let cell_root = buck.resolve_root_of_file(&self.saved_file)?;
         let diagnostic_files = buck.check_saved_file(self.use_clippy, &self.saved_file)?;
 
+        let normalize = |path: &Path| -> PathBuf {
+            let path = path.strip_prefix("./").unwrap_or(path);
+            cell_root.join(path)
+        };
+
         let mut diagnostics = vec![];
         for path in diagnostic_files {
             let contents = std::fs::read_to_string(path)?;
@@ -56,14 +61,14 @@ impl Check {
                 // path.
                 if let Ok(mut message) = serde_json::from_str::<diagnostics::Message>(l) {
                     for span in message.spans.iter_mut() {
-                        span.file_name = cell_root.join(&span.file_name);
+                        span.file_name = normalize(&span.file_name);
                     }
                     for span in message
                         .children
                         .iter_mut()
                         .flat_map(|child| child.spans.iter_mut())
                     {
-                        span.file_name = cell_root.join(&span.file_name);
+                        span.file_name = normalize(&span.file_name);
                     }
                     let span = serde_json::to_value(message)?;
                     // this is done under the assumption that the number of diagnostics inside the vector
