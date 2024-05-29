@@ -12,6 +12,7 @@ def check_targets_impl(ctx):
     nodes = ctx.cquery().kind("^(rust_binary|rust_library|rust_test)$", owners)
 
     if len(nodes) == 0:
+        ctx.output.print_json([])
         return
 
     diag_kind = "clippy.json" if ctx.cli_args.use_clippy else "diag.json"
