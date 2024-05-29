@@ -35,6 +35,7 @@ pub(crate) struct Develop {
     pub(crate) relative_paths: bool,
     pub(crate) buck: buck::Buck,
     pub(crate) check_cycles: bool,
+    pub(crate) use_clippy: bool,
 }
 
 pub(crate) struct OutputCfg {
@@ -64,6 +65,7 @@ impl Develop {
             buck,
             relative_paths: false,
             check_cycles: false,
+            use_clippy: true,
         }
     }
 
@@ -79,6 +81,7 @@ impl Develop {
             relative_paths,
             mode,
             check_cycles,
+            use_clippy,
         } = command
         {
             let out = if stdout {
@@ -103,6 +106,7 @@ impl Develop {
                 relative_paths,
                 buck,
                 check_cycles,
+                use_clippy,
             };
             let out = OutputCfg { out, pretty };
 
@@ -212,6 +216,7 @@ impl Develop {
             relative_paths,
             buck,
             check_cycles,
+            use_clippy,
         } = self;
 
         let project_root = buck.resolve_project_root()?;
@@ -246,6 +251,7 @@ impl Develop {
             aliased_libraries,
             *relative_paths,
             *check_cycles,
+            *use_clippy,
         )?;
         Ok(rust_project)
     }

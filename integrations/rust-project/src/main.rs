@@ -102,12 +102,19 @@ enum Command {
         /// Optional argument specifying build mode.
         #[clap(short = 'm', long)]
         mode: Option<String>,
+
+        /// Enables clippy in the flycheck commands in `rust-project.json`
+        /// Default is true, pass `--use-clippy false` to disable
+        #[clap(short = 'c', long, default_value = "true", action = ArgAction::Set)]
+        use_clippy: bool,
     },
     /// Build the saved file's owning target. This is meant to be used by IDEs to provide diagnostics on save.
     Check {
         /// Optional argument specifying build mode.
         #[clap(short = 'm', long)]
         mode: Option<String>,
+        /// Enables clippy in the flycheck commands in `rust-project.json`
+        /// Default is true, pass `--use-clippy false` to disable
         #[clap(short = 'c', long, default_value = "true", action = ArgAction::Set)]
         use_clippy: bool,
         target: String,
