@@ -31,6 +31,7 @@ use crate::json_project::BuckExtensions;
 use crate::json_project::BuildInfo;
 use crate::json_project::Edition;
 use crate::json_project::JsonProject;
+use crate::json_project::ProjectBuildInfo;
 use crate::json_project::ShellRunnableArgs;
 use crate::json_project::ShellRunnableKind;
 use crate::json_project::Source;
@@ -91,7 +92,7 @@ pub(crate) fn to_json_project(
 
     let mut crates: Vec<Crate> = Vec::with_capacity(targets_vec.len());
     for target in &targets_vec {
-        let info = target_index.get(&target).unwrap();
+        let info = target_index.get(target).unwrap();
 
         let dep_targets = resolve_aliases(&info.deps, &aliases, &proc_macros);
         let deps = as_deps(&dep_targets, info, &targets_to_ids, &target_index);
@@ -155,44 +156,12 @@ pub(crate) fn to_json_project(
                 manifest_file: build_file.to_owned(),
                 label: target.to_string(),
                 target_kind: info.kind.clone().into(),
-                shell_runnables: vec![
-                    ShellRunnableArgs {
-                        kind: ShellRunnableKind::Check,
-                        program: "buck2".to_string(),
-                        args: vec!["build".to_owned(), target.to_string()],
-                        cwd: project_root.clone(),
-                    },
-                    ShellRunnableArgs {
-                        kind: ShellRunnableKind::Run,
-                        program: "buck2".to_string(),
-                        args: vec!["run".to_owned(), target.to_string()],
-                        cwd: project_root.clone(),
-                    },
-                    ShellRunnableArgs {
-                        kind: ShellRunnableKind::Run,
-                        program: "buck2".to_string(),
-                        args: vec![
-                            "test".to_owned(),
-                            target.to_string(),
-                            "--".to_owned(),
-                            // R-A substitutes $$TEST_NAME$$ with e.g. `mycrate::tests::one`
-                            // --test-arg tells `buck2 test` to pass that string through to
-                            // the test program, which we will assume to be the rust test
-                            // harness.
-                            // Same overall effect as `cargo test -- mycrate::tests::one`,
-                            //
-                            // But this is a bit less than ideal, because buck will build
-                            // all of the related test binaries, including integration tests.
-                            // We don't know your naming conventions for library tests.
-                            // You might have a rust_test target named `mycrate-test`. So
-                            // we might need a way (probably buck metadata in the library
-                            // target) to tell rust-project about these.
-                            "--test-arg".to_owned(),
-                            "$$TEST_NAME$$".to_owned(),
-                        ],
-                        cwd: project_root.clone(),
-                    },
-                ],
+                shell_runnables: vec![ShellRunnableArgs {
+                    kind: ShellRunnableKind::Check,
+                    program: "buck2".to_string(),
+                    args: vec!["build".to_owned(), target.to_string() + "[check]"],
+                    cwd: project_root.clone(),
+                }],
             };
             Some(build_info)
         } else {
@@ -227,9 +196,51 @@ pub(crate) fn to_json_project(
         check_cycles_in_crate_graph(&crates);
     }
 
+    let build_info = ProjectBuildInfo {
+        default_shell_runnables: vec![
+            ShellRunnableArgs {
+                kind: ShellRunnableKind::Flycheck,
+                program: "rust-project".to_owned(),
+                args: vec!["check".to_owned(), "$$LABEL$$".to_owned()],
+                cwd: project_root.clone(),
+            },
+            ShellRunnableArgs {
+                kind: ShellRunnableKind::Run,
+                program: "buck2".to_string(),
+                args: vec!["run".to_owned(), "$$LABEL$$".to_owned()],
+                cwd: project_root.clone(),
+            },
+            ShellRunnableArgs {
+                kind: ShellRunnableKind::TestOne,
+                program: "buck2".to_string(),
+                args: vec![
+                    "test".to_owned(),
+                    "$$LABEL$$".to_owned(),
+                    "--".to_owned(),
+                    // R-A substitutes $$TEST_NAME$$ with e.g. `mycrate::tests::one`
+                    // --test-arg tells `buck2 test` to pass that string through to
+                    // the test program, which we will assume to be the rust test
+                    // harness.
+                    // Same overall effect as `cargo test -- mycrate::tests::one`,
+                    //
+                    // But this is a bit less than ideal, because buck will build
+                    // all of the related test binaries, including integration tests.
+                    // We don't know your naming conventions for library tests.
+                    // You might have a rust_test target named `mycrate-test`. So
+                    // we might need a way (probably buck metadata in the library
+                    // target) to tell rust-project about these.
+                    "--test-arg".to_owned(),
+                    "$$TEST_NAME$$".to_owned(),
+                ],
+                cwd: project_root.clone(),
+            },
+        ],
+    };
+
     let jp = JsonProject {
         sysroot,
         crates,
+        build_info,
         // needed to ignore the generated `rust-project.json` in diffs, but including the actual
         // string will mark this file as generated
         generated: String::from("\x40generated"),
@@ -514,26 +525,12 @@ impl Buck {
 
         command.arg("prelude//rust/rust-analyzer/check.bxl:check");
 
-        let mut file_path = saved_file.to_owned();
-        if !file_path.is_absolute() {
-            if let Ok(cwd) = std::env::current_dir() {
-                file_path = cwd.join(saved_file);
-            }
-        }
-
         // apply BXL scripts-specific arguments:
-        command.args(["--", "--file"]);
-        command.arg(file_path.as_os_str());
-
+        command.arg("--");
+        command.args(["--file"]);
+        command.arg(saved_file.as_os_str());
         command.args(["--use-clippy", &use_clippy.to_string()]);
 
-        // Set working directory to the containing directory of the target file.
-        // This fixes cases where the working directory happens to be an
-        // unrelated buck project (e.g. www).
-        if let Some(parent_dir) = saved_file.parent() {
-            command.current_dir(parent_dir);
-        }
-        
         tracing::debug!(?command, "running bxl");
 
         let output = command.output();
@@ -542,6 +539,32 @@ impl Buck {
         Ok(files)
     }
 
+    #[instrument]
+    pub(crate) fn check_target(
+        &self,
+        use_clippy: bool,
+        target: &str,
+    ) -> Result<Vec<PathBuf>, anyhow::Error> {
+        let mut command = self.command(["bxl"]);
+
+        if let Some(mode) = &self.mode {
+            command.arg(mode);
+        }
+
+        command.arg("prelude//rust/rust-analyzer/check.bxl:check");
+
+        command.arg("--");
+        command.arg("--target");
+        command.arg(target);
+        command.args(["--use-clippy", &use_clippy.to_string()]);
+
+        tracing::debug!(?command, "running bxl");
+
+        let output = command.output();
+
+        let files = deserialize_output(output, &command)?;
+        Ok(files)
+    }
     #[instrument(skip_all)]
     pub(crate) fn expand_and_resolve(
         &self,

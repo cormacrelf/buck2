@@ -35,6 +35,12 @@ pub(crate) struct JsonProject {
     /// libcore, etc.).
     pub(crate) crates: Vec<Crate>,
     pub(crate) generated: String,
+    pub(crate) build_info: ProjectBuildInfo,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectBuildInfo {
+    pub(crate) default_shell_runnables: Vec<ShellRunnableArgs>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -186,16 +192,11 @@ pub(crate) struct ShellRunnableArgs {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ShellRunnableKind {
+    Flycheck,
+    FlycheckWorkspace,
     Check,
     Run,
     TestOne,
-}
-
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct Runnables {
-    pub(crate) check: Vec<String>,
-    pub(crate) run: Vec<String>,
-    pub(crate) test: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]

@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -17,31 +18,29 @@ use crate::diagnostics;
 pub(crate) struct Check {
     pub(crate) buck: buck::Buck,
     pub(crate) use_clippy: bool,
-    pub(crate) saved_file: PathBuf,
+    pub(crate) target: String,
 }
 
 impl Check {
-    pub(crate) fn new(mode: Option<String>, use_clippy: bool, saved_file: PathBuf) -> Self {
-        let saved_file = saved_file.canonicalize().unwrap_or(saved_file);
-
+    pub(crate) fn new(mode: Option<String>, use_clippy: bool, target: String) -> Self {
         let mode = select_mode(mode.as_deref());
         let buck = buck::Buck::new(mode);
         Self {
             buck,
             use_clippy,
-            saved_file,
+            target,
         }
     }
 
     pub(crate) fn run(&self) -> Result<(), anyhow::Error> {
         let buck = &self.buck;
 
-        let cell_root = buck.resolve_root_of_file(&self.saved_file)?;
-        let diagnostic_files = buck.check_saved_file(self.use_clippy, &self.saved_file)?;
+        let project_root = buck.resolve_root_of_file(Path::new("."))?;
+        let diagnostic_files = buck.check_target(self.use_clippy, &self.target)?;
 
         let normalize = |path: &Path| -> PathBuf {
             let path = path.strip_prefix("./").unwrap_or(path);
-            cell_root.join(path)
+            project_root.join(path)
         };
 
         let mut diagnostics = vec![];

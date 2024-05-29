@@ -110,8 +110,7 @@ enum Command {
         mode: Option<String>,
         #[clap(short = 'c', long, default_value = "true", action = ArgAction::Set)]
         use_clippy: bool,
-        /// The file saved by the user. `rust-project` will infer the owning target(s) of the saved file and build them.
-        saved_file: PathBuf,
+        target: String,
     },
     /// Start an LSP server whose functionality is similar to [Command::Develop].
     #[clap(hide = true)]
@@ -139,8 +138,8 @@ fn main() -> Result<(), anyhow::Error> {
         Command::Check {
             mode,
             use_clippy,
-            saved_file,
-        } => cli::Check::new(mode, use_clippy, saved_file).run(),
+            target,
+        } => cli::Check::new(mode, use_clippy, target).run(),
         c @ Command::Develop { .. } => {
             let (develop, input, out) = cli::Develop::from_command(c);
             develop.run_as_cli(input, out)
