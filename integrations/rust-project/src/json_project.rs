@@ -261,14 +261,13 @@ pub(crate) struct Sysroot {
     /// It also claims that `${sysroot}/lib/rustlib/src/rust/library` is the
     /// default value. But it fails to add `std` and `core` as dependencies
     /// if you do not provide a value. So we will always provide one.
+    ///
+    /// Technically some users might want to manually link std/core as a dependency
+    /// on every target, and omit sysroot_src here, so that rust-analyzer does not link
+    /// std/core with every crate anyway. For that use case we could probably recognize
+    /// a special value `--sysroot-src NONE`.
     pub(crate) sysroot_src: PathBuf,
 }
-
 impl Sysroot {
-    pub(crate) fn with_default_sysroot_src(sysroot: PathBuf) -> Self {
-        Self {
-            sysroot_src: sysroot.join("lib/rustlib/src/rust/library"),
-            sysroot,
-        }
-    }
+    pub(crate) const DEFAULT_SYSROOT_SRC_RELATIVE: &'static str = "lib/rustlib/src/rust/library";
 }
