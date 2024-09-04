@@ -10,6 +10,8 @@
 use std::path::Path;
 use std::str::FromStr;
 
+use tracing::instrument;
+
 use crate::buck;
 use crate::buck::select_mode;
 use crate::diagnostics;
@@ -74,7 +76,7 @@ impl Check {
             println!("{}", out);
         }
 
-        crate::scuba::log_check(start.elapsed(), &self.saved_file, self.use_clippy);
+        crate::scuba::log_check(start.elapsed(), &self.target, self.use_clippy);
 
         Ok(())
     }

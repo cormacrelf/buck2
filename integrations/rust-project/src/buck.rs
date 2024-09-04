@@ -53,6 +53,7 @@ pub(crate) fn to_json_project(
     aliases: FxHashMap<Target, AliasedTargetInfo>,
     check_cycles: bool,
     include_all_buildfiles: bool,
+    use_clippy: bool,
     extra_cfgs: &[String],
 ) -> Result<JsonProject, anyhow::Error> {
     let mode = select_mode(None);
@@ -219,6 +220,19 @@ pub(crate) fn to_json_project(
                 ],
                 cwd: project_root.to_owned(),
                 kind: RunnableKind::TestOne,
+            },
+            Runnable {
+                kind: RunnableKind::Flycheck,
+                program: "rust-project".to_owned(),
+                args: {
+                    let mut args = vec!["check".to_owned(), "{label}".to_owned()];
+                    if !use_clippy {
+                        args.push("--use-clippy".to_owned());
+                        args.push("false".to_owned());
+                    }
+                    args
+                },
+                cwd: project_root.clone(),
             },
             Runnable {
                 kind: RunnableKind::Run,

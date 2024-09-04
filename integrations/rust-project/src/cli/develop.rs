@@ -38,6 +38,7 @@ pub(crate) struct Develop {
     pub(crate) check_cycles: bool,
     pub(crate) invoked_by_ra: bool,
     pub(crate) include_all_buildfiles: bool,
+    pub(crate) use_clippy: bool,
 }
 
 pub(crate) struct OutputCfg {
@@ -64,6 +65,7 @@ impl Develop {
             mode,
             check_cycles,
             include_all_buildfiles,
+            use_clippy,
             ..
         } = command
         {
@@ -90,6 +92,7 @@ impl Develop {
                 check_cycles,
                 invoked_by_ra: false,
                 include_all_buildfiles,
+                use_clippy,
             };
             let out = OutputCfg { out, pretty };
 
@@ -104,7 +107,10 @@ impl Develop {
         }
 
         if let crate::Command::DevelopJson {
-            sysroot_mode, args, ..
+            sysroot_mode,
+            args,
+            use_clippy,
+            ..
         } = command
         {
             let out = Output::Stdout;
@@ -131,6 +137,7 @@ impl Develop {
                 check_cycles: false,
                 invoked_by_ra: true,
                 include_all_buildfiles: false,
+                use_clippy,
             };
             let out = OutputCfg { out, pretty: false };
 
@@ -230,6 +237,7 @@ impl Develop {
             buck,
             check_cycles,
             include_all_buildfiles,
+            use_clippy,
             ..
         } = self;
 
@@ -263,6 +271,7 @@ impl Develop {
             exclude_workspaces,
             *check_cycles,
             *include_all_buildfiles,
+            *use_clippy,
             extra_cfgs,
         )
     }
@@ -303,6 +312,7 @@ pub(crate) fn develop_with_sysroot(
     exclude_workspaces: bool,
     check_cycles: bool,
     include_all_buildfiles: bool,
+    use_clippy: bool,
     extra_cfgs: &[String],
 ) -> Result<JsonProject, anyhow::Error> {
     info!(kind = "progress", "building generated code");
@@ -322,6 +332,7 @@ pub(crate) fn develop_with_sysroot(
         aliased_libraries,
         check_cycles,
         include_all_buildfiles,
+        use_clippy,
         extra_cfgs,
     )?;
 
