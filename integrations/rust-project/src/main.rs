@@ -145,8 +145,8 @@ enum Command {
         #[clap(long)]
         client: Option<String>,
 
-        /// The file saved by the user. `rust-project` will infer the owning target(s) of the saved file and build them.
-        saved_file: PathBuf,
+        /// The target the users wishes to check.
+        target: String,
     },
 }
 
@@ -286,13 +286,13 @@ fn main() -> Result<(), anyhow::Error> {
         Command::Check {
             mode,
             use_clippy,
-            saved_file,
+            target,
             ..
         } => {
             let subscriber = tracing_subscriber::registry().with(fmt.with_filter(filter));
             tracing::subscriber::set_global_default(subscriber)?;
 
-            cli::Check::new(mode, use_clippy, saved_file.clone())
+            cli::Check::new(mode, use_clippy, target.clone())
                 .run()
                 .inspect_err(|e| crate::scuba::log_check_error(&e, &saved_file, use_clippy))
         }
