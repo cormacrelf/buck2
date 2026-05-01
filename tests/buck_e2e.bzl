@@ -12,6 +12,7 @@ load("@fbcode_macros//build_defs:platform_utils.bzl", "platform_utils")
 load("@fbcode_macros//build_defs:python_unittest.bzl", "python_unittest")
 load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 load("@fbsource//tools/target_determinator/macros:ci_hint.bzl", "ci_hint")
+load("@prelude//:is_full_meta_repo.bzl", "is_full_meta_repo")
 
 def buck_e2e_test(
     name,
@@ -37,10 +38,13 @@ def buck_e2e_test(
     remote_execution = None,
     network_access = None,
     visibility = None,
+    meta_only = False,
 ):
     """
     Custom macro for buck2/buckaemon end-to-end tests.
     """
+    if meta_only and not is_full_meta_repo():
+        return
     srcs = srcs or []
     labels = labels or []
     deps = deps or []
@@ -230,6 +234,7 @@ def buck2_e2e_test(
     remote_execution = None,
     network_access = None,
     visibility = None,
+    meta_only = False,
 ):
     """
     Custom macro for buck2 end-to-end tests. All tests are run against buck2 compiled in-repo (compiled buck2).
@@ -256,6 +261,8 @@ def buck2_e2e_test(
         dependency for Target Determinator purposes (e.g., bxl tests that test Starlark logic).
         Default is False.
     """
+    if meta_only and not is_full_meta_repo():
+        return
     kwargs = {
         "base_module": base_module,
         "ci_deps": ci_deps,
@@ -297,7 +304,7 @@ def buck2_e2e_test(
         # link these tests to buck2 or tpx sources.
         if use_compiled_buck2_client_and_tpx:
             compiled_env["LLVM_COVERAGE_ADDITIONAL_OBJECT_PATHS"] = ";".join(
-                ["$(location fbcode//buck2:symlinked_buck2_and_tpx)/" + binary for binary in ["buck2", "buck2-daemon", "buck2-tpx"]]
+                ["$(location fbcode//buck2:symlinked_buck2_and_tpx)/" + binary for binary in ["buck2", "buck2-daemon", "buck2-tpx"]],
             )
             base_exe = "$(location fbcode//buck2:symlinked_buck2_and_tpx)/buck2"
             exe = select({
