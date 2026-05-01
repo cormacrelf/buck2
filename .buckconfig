@@ -17,7 +17,14 @@ ignore = \
     app_dep_graph_rules, \
     examples, \
     integrations/rust-project/tests, \
-    tests, \
+    tests/e2e/build, \
+    tests/e2e/bxl/fs, \
+    tests/e2e/check_dependencies_test, \
+    tests/e2e/configurations/cfg_constructor/bxl, \
+    tests/e2e/configurations/configuration_alias, \
+    tests/e2e/test_prelude, \
+    tests/lint_rules, \
+    tests/prelude, \
     .jj, \
     .git, \
     target
