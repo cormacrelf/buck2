@@ -6,10 +6,18 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-def python_library(srcs = [], visibility = ["PUBLIC"], cpp_deps = [], **kwargs):
+load("@shim//build_defs/lib:oss.bzl", "default_base_module", "translate_target")
+
+def python_library(srcs = [], visibility = ["PUBLIC"], cpp_deps = [], deps = None, base_module = None, **kwargs):
     # `cpp_deps` is an fbcode-only attribute for native extension dependencies;
     # the open source prelude `python_library` rule does not support it, so drop it.
-    _unused = (srcs, cpp_deps)  # @unused
+    _unused = cpp_deps  # @unused
+
+    if deps != None:
+        kwargs["deps"] = [translate_target(d) for d in deps]
+
+    if base_module == None:
+        base_module = default_base_module()
 
     # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
-    native.python_library(visibility = visibility, **kwargs)
+    native.python_library(srcs = srcs, visibility = visibility, base_module = base_module, **kwargs)

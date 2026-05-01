@@ -6,7 +6,12 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@shim//build_defs/lib:oss.bzl", "default_base_module")
+
 def python_binary(name, srcs = [], main_src = None, deps = [], base_module = None, visibility = ["PUBLIC"], **kwargs):
+    if base_module == None:
+        base_module = default_base_module()
+
     native.python_library(
         name = name + "-library",
         srcs = srcs,
