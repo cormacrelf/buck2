@@ -359,19 +359,13 @@ impl WatchmanFileWatcher {
         ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     ) -> buck2_error::Result<Self> {
         let watchman_merge_base = root_config
-            .get(BuckconfigKeyRef {
-                section: "project",
-                property: "watchman_merge_base",
-            })
+            .get(BuckconfigKeyRef::new("project", "watchman_merge_base"))
             .map(|s| s.to_owned());
 
         let empty_on_fresh_instance = if watchman_merge_base.is_some() {
             // double negative here because we'd prefer that rollout changes config value from false->true.
             !root_config
-                .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "disable_watchman_empty_on_fresh_instance",
-                })?
+                .parse::<RolloutPercentage>(BuckconfigKeyRef::new("buck2", "disable_watchman_empty_on_fresh_instance"))?
                 .unwrap_or_else(RolloutPercentage::never)
                 .roll()
         } else {
@@ -384,10 +378,7 @@ impl WatchmanFileWatcher {
         };
 
         let report_global_rev = root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "watchman_report_global_rev",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "watchman_report_global_rev"))?
             .unwrap_or(false);
 
         let dice_clear_on_mergebase_change =

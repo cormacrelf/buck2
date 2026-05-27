@@ -644,43 +644,22 @@ pub struct CleanStaleConfig {
 impl CleanStaleConfig {
     pub fn from_buck_config(root_config: &LegacyBuckConfig) -> buck2_error::Result<Option<Self>> {
         let clean_stale_enabled = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_enabled",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_enabled"))?
             .unwrap_or(false);
         let clean_stale_artifact_ttl_hours = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_artifact_ttl_hours",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_artifact_ttl_hours"))?
             .unwrap_or(24.0 * 7.0);
         let clean_stale_period_hours = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_period_hours",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_period_hours"))?
             .unwrap_or(24.0);
         let clean_stale_start_offset_hours = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_start_offset_hours",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_start_offset_hours"))?
             .unwrap_or(12.0);
         let clean_stale_dry_run = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_dry_run",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_dry_run"))?
             .unwrap_or(false);
-        let decreased_ttl_hours: Option<f64> = root_config.parse(BuckconfigKeyRef {
-            section: "buck2",
-            property: "clean_stale_low_disk_artifact_ttl_hours",
-        })?;
-        let decreased_ttl_hours_disk_threshold = root_config.parse(BuckconfigKeyRef {
-            section: "buck2",
-            property: "clean_stale_low_disk_threshold",
-        })?;
+        let decreased_ttl_hours: Option<f64> = root_config.parse(BuckconfigKeyRef::new("buck2", "clean_stale_low_disk_artifact_ttl_hours"))?;
+        let decreased_ttl_hours_disk_threshold = root_config.parse(BuckconfigKeyRef::new("buck2", "clean_stale_low_disk_threshold"))?;
 
         let secs_in_hour = 60.0 * 60.0;
         let clean_stale_config = if clean_stale_enabled {

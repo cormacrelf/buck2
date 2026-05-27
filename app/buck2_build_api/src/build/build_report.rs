@@ -1034,10 +1034,7 @@ pub async fn build_report_opts<'a>(
         print_unconfigured_section: ctx
             .parse_legacy_config_property(
                 cell_resolver.root_cell(),
-                BuckconfigKeyRef {
-                    section: "build_report",
-                    property: "print_unconfigured_section",
-                },
+                BuckconfigKeyRef::new("build_report", "print_unconfigured_section"),
             )
             .await?
             .unwrap_or(true),

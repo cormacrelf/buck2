@@ -121,15 +121,9 @@ impl<'a> LegacyBuckConfigsForStarlark<'a> {
         }
 
         let value = if from_root_cell {
-            configs_view.read_root_cell_config(BuckconfigKeyRef {
-                section: section.key(),
-                property: key.key(),
-            })?
+            configs_view.read_root_cell_config(BuckconfigKeyRef::new(section.key(), key.key()))?
         } else {
-            configs_view.read_current_cell_config(BuckconfigKeyRef {
-                section: section.key(),
-                property: key.key(),
-            })?
+            configs_view.read_current_cell_config(BuckconfigKeyRef::new(section.key(), key.key()))?
         }
         .map(|v| eval.frozen_heap().alloc_str(&v));
 
@@ -221,10 +215,7 @@ fn read_config_and_report_deprecated(
     let result = config.lookup(ctx, key)?;
     let property = format!("{}.{}", key.section, key.property);
 
-    let key = BuckconfigKeyRef {
-        section: "deprecated_config",
-        property: &property,
-    };
+    let key = BuckconfigKeyRef::new("deprecated_config", &property);
     let msg = config.lookup(ctx, key)?;
     if let Some(msg) = msg {
         // soft error category can only contain ascii lowercese characters

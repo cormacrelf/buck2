@@ -39,10 +39,7 @@ pub async fn configure_dice_for_buck(
         || {
             root_config
                 .and_then(|c| {
-                    c.parse::<DetectCycles>(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "detect_cycles",
-                    })
+                    c.parse::<DetectCycles>(BuckconfigKeyRef::new("buck2", "detect_cycles"))
                     .transpose()
                 })
                 .unwrap_or(Ok(DetectCycles::Enabled))
@@ -55,10 +52,7 @@ pub async fn configure_dice_for_buck(
     dice.set_digest_config(digest_config);
     let invalidation_tracking_enabled = match root_config {
         Some(c) => c
-            .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "invalidation_tracking_enabled",
-            })?
+            .parse::<RolloutPercentage>(BuckconfigKeyRef::new("buck2", "invalidation_tracking_enabled"))?
             .is_some_and(|v| v.roll()),
         None => false,
     };

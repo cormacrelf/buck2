@@ -48,10 +48,7 @@ pub(crate) fn dice_clear_on_mergebase_change(
     root_config: &LegacyBuckConfig,
 ) -> buck2_error::Result<bool> {
     let config_value = root_config
-        .parse::<bool>(BuckconfigKeyRef {
-            section: "buck2",
-            property: "dice_clear_on_mergebase_change",
-        })
+        .parse::<bool>(BuckconfigKeyRef::new("buck2", "dice_clear_on_mergebase_change"))
         .buck_error_context("Failed to parse dice_clear_on_mergebase_change config")?
         .unwrap_or(true);
     let env_skip = buck2_env!(
@@ -95,10 +92,7 @@ impl dyn FileWatcher {
         let _allow_unused = fb;
 
         let watcher_conf = root_config
-            .get(BuckconfigKeyRef {
-                section: "buck2",
-                property: "file_watcher",
-            })
+            .get(BuckconfigKeyRef::new("buck2", "file_watcher"))
             .unwrap_or(default);
 
         let watcher_conf = if let "edenfs" = watcher_conf {

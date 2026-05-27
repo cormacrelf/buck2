@@ -39,10 +39,7 @@ impl HasCellFileIgnores for DiceComputations<'_> {
 
         let ignore_spec = config.lookup(
             self,
-            BuckconfigKeyRef {
-                section: "project",
-                property: "ignore",
-            },
+            BuckconfigKeyRef::new("project", "ignore"),
         )?;
         let ignore_spec = ignore_spec.as_ref().map_or("", |s| &**s);
 

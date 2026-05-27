@@ -116,10 +116,7 @@ impl Key for CellPackageBoundaryExceptionsKey {
         let s = ctx
             .get_legacy_config_property(
                 self.0,
-                BuckconfigKeyRef {
-                    section: "project",
-                    property: "package_boundary_exceptions",
-                },
+                BuckconfigKeyRef::new("project", "package_boundary_exceptions"),
             )
             .await?;
         if let Some(s) = s {

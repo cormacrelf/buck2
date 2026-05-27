@@ -34,10 +34,7 @@ pub async fn create_io_provider(
             RolloutPercentage::from_bool(cfg!(any(target_os = "macos", target_os = "windows")));
 
         let allow_eden_io = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "allow_eden_io",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "allow_eden_io"))?
             .unwrap_or(allow_eden_io_default)
             .roll();
 

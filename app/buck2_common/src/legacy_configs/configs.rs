@@ -256,7 +256,7 @@ impl LegacyBuckConfig {
                 let values: SortedMap<_, _> = section_data
                     .values
                     .iter()
-                    .filter(|(property, _)| filter(&BuckconfigKeyRef { section, property }))
+                    .filter(|(property, _)| filter(&BuckconfigKeyRef::new(section, property)))
                     .map(|(property, value)| (property.clone(), value.clone()))
                     .collect();
                 if values.is_empty() {
@@ -522,17 +522,11 @@ pub(crate) mod tests {
 
         assert_eq!(
             None,
-            config.get(BuckconfigKeyRef {
-                section: "section",
-                property: "missing"
-            })
+            config.get(BuckconfigKeyRef::new("section", "missing"))
         );
         assert_eq!(
             None,
-            config.get(BuckconfigKeyRef {
-                section: "missing",
-                property: "int"
-            })
+            config.get(BuckconfigKeyRef::new("missing", "int"))
         );
         assert_config_value(&config, "section", "int", "1");
         assert_config_value(&config, "section", "string", "hello");

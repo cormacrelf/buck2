@@ -70,10 +70,7 @@ async fn get_target_platform_detector(
                 match ctx
                     .get_legacy_config_property(
                         root_cell,
-                        BuckconfigKeyRef {
-                            section: "parser",
-                            property: "target_platform_detector_spec",
-                        },
+                        BuckconfigKeyRef::new("parser", "target_platform_detector_spec"),
                     )
                     .await?
                 {

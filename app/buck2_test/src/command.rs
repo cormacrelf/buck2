@@ -310,10 +310,7 @@ async fn test(
     let test_executor_config = ctx
         .get_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "test",
-                property: "v2_test_executor",
-            },
+            BuckconfigKeyRef::new("test", "v2_test_executor"),
         )
         .await?
         .filter(|s| !s.is_empty());

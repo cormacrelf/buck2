@@ -664,10 +664,7 @@ impl DiceCommandUpdater<'_, '_> {
         root_config: &LegacyBuckConfig,
     ) -> buck2_error::Result<UserComputationData> {
         let config_threads = root_config
-            .parse(BuckconfigKeyRef {
-                section: "build",
-                property: "threads",
-            })?
+            .parse(BuckconfigKeyRef::new("build", "threads"))?
             .unwrap_or(0);
 
         let concurrency = self
@@ -675,56 +672,35 @@ impl DiceCommandUpdater<'_, '_> {
             .or_else(|| parse_concurrency(config_threads))
             .unwrap_or_else(buck2_util::threads::available_parallelism_fresh);
 
-        if let Some(max_lines) = root_config.parse(BuckconfigKeyRef {
-            section: "ui",
-            property: "thread_line_limit",
-        })? {
+        if let Some(max_lines) = root_config.parse(BuckconfigKeyRef::new("ui", "thread_line_limit"))? {
             self.cmd_ctx
                 .events()
                 .instant_event(buck2_data::ConsolePreferences { max_lines });
         }
 
         let enable_miniperf = root_config
-            .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "miniperf2",
-            })?
+            .parse::<RolloutPercentage>(BuckconfigKeyRef::new("buck2", "miniperf2"))?
             .unwrap_or_else(RolloutPercentage::always)
             .roll();
 
         let log_action_keys = root_config
-            .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_action_keys",
-            })?
+            .parse::<RolloutPercentage>(BuckconfigKeyRef::new("buck2", "log_action_keys"))?
             .unwrap_or_else(RolloutPercentage::always)
             .roll();
 
         let log_configured_graph_size = root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_configured_graph_size",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "log_configured_graph_size"))?
             .unwrap_or(false);
 
         let persistent_worker_shutdown_timeout_s = root_config
-            .parse::<u32>(BuckconfigKeyRef {
-                section: "build",
-                property: "persistent_worker_shutdown_timeout_s",
-            })?
+            .parse::<u32>(BuckconfigKeyRef::new("build", "persistent_worker_shutdown_timeout_s"))?
             .or(Some(10));
 
         let re_cancel_on_estimated_queue_time_exceeds = root_config
-            .parse::<u64>(BuckconfigKeyRef {
-                section: "build",
-                property: "remote_execution_cancel_on_estimated_queue_time_exceeds_s",
-            })?
+            .parse::<u64>(BuckconfigKeyRef::new("build", "remote_execution_cancel_on_estimated_queue_time_exceeds_s"))?
             .map(Duration::from_secs);
         let re_fallback_on_estimated_queue_time_exceeds = root_config
-            .parse::<u64>(BuckconfigKeyRef {
-                section: "build",
-                property: "remote_execution_fallback_on_estimated_queue_time_exceeds_s",
-            })?
+            .parse::<u64>(BuckconfigKeyRef::new("build", "remote_execution_fallback_on_estimated_queue_time_exceeds_s"))?
             .map(Duration::from_secs);
 
         let executor_global_knobs = ExecutorGlobalKnobs {
@@ -758,10 +734,7 @@ impl DiceCommandUpdater<'_, '_> {
         ));
 
         let cycle_detector = if root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "build",
-                property: "lazy_cycle_detector",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("build", "lazy_cycle_detector"))?
             .unwrap_or(true)
         {
             Some(create_cycle_detector())
@@ -772,45 +745,27 @@ impl DiceCommandUpdater<'_, '_> {
 
         let mut run_action_knobs = self.run_action_knobs.dupe();
         run_action_knobs.use_network_action_output_cache |= root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "use_network_action_output_cache",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "use_network_action_output_cache"))?
             .unwrap_or(false);
         run_action_knobs.default_allow_cache_upload |= root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "default_allow_cache_upload",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "default_allow_cache_upload"))?
             .unwrap_or(false);
 
         if root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "share_action_paths",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "share_action_paths"))?
             .unwrap_or(false)
         {
             run_action_knobs.action_paths_interner = Some(DashMapDirectoryInterner::new());
         }
 
         run_action_knobs.deduplicate_get_digests_ttl_calls |= root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "deduplicate_get_digests_ttl_calls",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "deduplicate_get_digests_ttl_calls"))?
             .unwrap_or(false);
 
-        let output_trees_download_semaphore_size = root_config.parse::<u32>(BuckconfigKeyRef {
-            section: "buck2",
-            property: "output_trees_download_semaphore_size",
-        })?;
+        let output_trees_download_semaphore_size = root_config.parse::<u32>(BuckconfigKeyRef::new("buck2", "output_trees_download_semaphore_size"))?;
 
         let fingerprint_re_output_trees_eagerly = root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "fingerprint_re_output_trees_eagerly",
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", "fingerprint_re_output_trees_eagerly"))?
             .unwrap_or(true);
 
         let output_trees_download_config = OutputTreesDownloadConfig::new(
@@ -820,10 +775,7 @@ impl DiceCommandUpdater<'_, '_> {
 
         buck2_core::faster_directories::VALUE.store(
             root_config
-                .parse::<bool>(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "faster_directories",
-                })?
+                .parse::<bool>(BuckconfigKeyRef::new("buck2", "faster_directories"))?
                 .unwrap_or(true),
             std::sync::atomic::Ordering::Relaxed,
         );
@@ -840,16 +792,10 @@ impl DiceCommandUpdater<'_, '_> {
         let worker_pool = Arc::new(WorkerPool::new(persistent_worker_shutdown_timeout_s));
 
         let critical_path_backend = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "critical_path_backend2",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "critical_path_backend2"))?
             .unwrap_or(CriticalPathBackendName::LongestPathGraph);
 
-        let override_use_case = root_config.parse::<RemoteExecutorUseCase>(BuckconfigKeyRef {
-            section: "buck2_re_client",
-            property: "override_use_case",
-        })?;
+        let override_use_case = root_config.parse::<RemoteExecutorUseCase>(BuckconfigKeyRef::new("buck2_re_client", "override_use_case"))?;
 
         set_fallback_executor_config(&mut data.data, self.executor_config.dupe());
         // This client is only used in places that do not use the RE use case specified in the executor config.
@@ -951,10 +897,7 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
     fn extract_scuba_defaults(
         config: &LegacyBuckConfig,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let config = config.get(BuckconfigKeyRef {
-            section: "scuba",
-            property: "defaults",
-        })?;
+        let config = config.get(BuckconfigKeyRef::new("scuba", "defaults"))?;
         let unescaped_config = shlex::split(config)?.join("");
         let sample_json: serde_json::Value = serde_json::from_str(&unescaped_config).ok()?;
         sample_json.get("normals")?.as_object().cloned()
@@ -965,10 +908,7 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
     add_config(
         &mut metadata,
         config,
-        BuckconfigKeyRef {
-            section: "log",
-            property: "repository",
-        },
+        BuckconfigKeyRef::new("log", "repository"),
         "repository",
     );
 
@@ -1002,18 +942,12 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
     add_config(
         &mut metadata,
         config,
-        BuckconfigKeyRef {
-            section: "client",
-            property: "id",
-        },
+        BuckconfigKeyRef::new("client", "id"),
         "client",
     );
 
     // Soft error if client.id is set in buckconfig (deprecated, will become hard error)
-    if let Some(client_id) = config.get(BuckconfigKeyRef {
-        section: "client",
-        property: "id",
-    }) {
+    if let Some(client_id) = config.get(BuckconfigKeyRef::new("client", "id")) {
         use buck2_core::soft_error;
 
         soft_error!(

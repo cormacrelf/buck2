@@ -232,10 +232,7 @@ async fn build(
     let want_configured_graph_size = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_configured_graph_size",
-            },
+            BuckconfigKeyRef::new("buck2", "log_configured_graph_size"),
         )
         .await?
         .unwrap_or_default();
@@ -243,10 +240,7 @@ async fn build(
     let want_configured_graph_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_configured_graph_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_configured_graph_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -254,10 +248,7 @@ async fn build(
     let want_total_configured_graph_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_total_configured_graph_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_total_configured_graph_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -265,10 +256,7 @@ async fn build(
     let want_retained_analysis_memory_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_retained_analysis_memory_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_retained_analysis_memory_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -276,10 +264,7 @@ async fn build(
     let want_action_graph_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_action_graph_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_action_graph_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -338,10 +323,7 @@ async fn build(
     let want_detailed_metrics = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "detailed_aggregated_metrics",
-            },
+            BuckconfigKeyRef::new("buck2", "detailed_aggregated_metrics"),
         )
         .await?
         .unwrap_or_default();
@@ -572,10 +554,7 @@ async fn process_build_result(
     let should_create_unhashed_links = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "create_unhashed_links",
-            },
+            BuckconfigKeyRef::new("buck2", "create_unhashed_links"),
         )
         .await?;
 

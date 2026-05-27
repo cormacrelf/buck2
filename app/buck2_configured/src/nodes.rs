@@ -1348,10 +1348,7 @@ async fn check_target_enabled_for_config(
             let root_conf = ctx.get_legacy_root_config_on_dice().await?;
             let patterns: Vec<String> = root_conf
                 .view(ctx)
-                .parse_list(BuckconfigKeyRef {
-                    section: &self.section,
-                    property: &self.property,
-                })?
+                .parse_list(BuckconfigKeyRef::new(&self.section, &self.property))?
                 .unwrap_or_default();
 
             let mut result = Vec::new();
@@ -1414,10 +1411,7 @@ async fn get_dep_only_incompatible_custom_soft_error(
             let root_cell = cell_resolver.root_cell();
             let alias_resolver = ctx.get_cell_alias_resolver(root_cell).await?;
             let root_conf = ctx.get_legacy_root_config_on_dice().await?;
-            let Some(target) = root_conf.view(ctx).parse::<String>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "dep_only_incompatible_info",
-            })?
+            let Some(target) = root_conf.view(ctx).parse::<String>(BuckconfigKeyRef::new("buck2", "dep_only_incompatible_info"))?
             else {
                 return Ok(None);
             };

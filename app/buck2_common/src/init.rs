@@ -66,32 +66,14 @@ pub struct HttpConfig {
 
 impl HttpConfig {
     pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
-        let connect_timeout_ms = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "connect_timeout_ms",
-        })?;
-        let read_timeout_ms = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "read_timeout_ms",
-        })?;
-        let write_timeout_ms = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "write_timeout_ms",
-        })?;
-        let max_redirects = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "max_redirects",
-        })?;
+        let connect_timeout_ms = config.parse(BuckconfigKeyRef::new("http", "connect_timeout_ms"))?;
+        let read_timeout_ms = config.parse(BuckconfigKeyRef::new("http", "read_timeout_ms"))?;
+        let write_timeout_ms = config.parse(BuckconfigKeyRef::new("http", "write_timeout_ms"))?;
+        let max_redirects = config.parse(BuckconfigKeyRef::new("http", "max_redirects"))?;
         let http2 = config
-            .parse(BuckconfigKeyRef {
-                section: "http",
-                property: "http2",
-            })?
+            .parse(BuckconfigKeyRef::new("http", "http2"))?
             .unwrap_or(true);
-        let max_concurrent_requests = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "max_concurrent_requests",
-        })?;
+        let max_concurrent_requests = config.parse(BuckconfigKeyRef::new("http", "max_concurrent_requests"))?;
 
         Ok(Self {
             connect_timeout_ms,
@@ -166,34 +148,13 @@ pub struct SystemWarningConfig {
 
 impl SystemWarningConfig {
     pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
-        let memory_pressure_threshold_percent = config.parse(BuckconfigKeyRef {
-            section: "buck2_system_warning",
-            property: "memory_pressure_threshold_percent",
-        })?;
-        let remaining_disk_space_threshold_gb = config.parse(BuckconfigKeyRef {
-            section: "buck2_system_warning",
-            property: "remaining_disk_space_threshold_gb",
-        })?;
-        let min_re_download_bytes_threshold = config.parse(BuckconfigKeyRef {
-            section: "buck2_system_warning",
-            property: "min_re_download_bytes_threshold",
-        })?;
-        let avg_re_download_bytes_per_sec_threshold = config.parse(BuckconfigKeyRef {
-            section: "buck2_system_warning",
-            property: "avg_re_download_bytes_per_sec_threshold",
-        })?;
-        let optin_vpn_check_targets_regex = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "optin_vpn_check_targets_regex",
-        })?;
-        let enable_stable_revision_check = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "enable_stable_revision_check",
-        })?;
-        let enable_health_check_process_isolation = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "enable_health_check_process_isolation",
-        })?;
+        let memory_pressure_threshold_percent = config.parse(BuckconfigKeyRef::new("buck2_system_warning", "memory_pressure_threshold_percent"))?;
+        let remaining_disk_space_threshold_gb = config.parse(BuckconfigKeyRef::new("buck2_system_warning", "remaining_disk_space_threshold_gb"))?;
+        let min_re_download_bytes_threshold = config.parse(BuckconfigKeyRef::new("buck2_system_warning", "min_re_download_bytes_threshold"))?;
+        let avg_re_download_bytes_per_sec_threshold = config.parse(BuckconfigKeyRef::new("buck2_system_warning", "avg_re_download_bytes_per_sec_threshold"))?;
+        let optin_vpn_check_targets_regex = config.parse(BuckconfigKeyRef::new("buck2_health_check", "optin_vpn_check_targets_regex"))?;
+        let enable_stable_revision_check = config.parse(BuckconfigKeyRef::new("buck2_health_check", "enable_stable_revision_check"))?;
+        let enable_health_check_process_isolation = config.parse(BuckconfigKeyRef::new("buck2_health_check", "enable_health_check_process_isolation"))?;
         Ok(Self {
             memory_pressure_threshold_percent,
             remaining_disk_space_threshold_gb,
@@ -366,16 +327,10 @@ impl ResourceControlConfig {
             Self::deserialize(env_conf)
         } else {
             let status = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "status",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2_resource_control", "status"))?
                 .unwrap_or(ResourceControlStatus::Off);
             let status_if_min_daemon_cgroup_version: Option<u32> =
-                config.parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "status_if_min_daemon_cgroup_version",
-                })?;
+                config.parse(BuckconfigKeyRef::new("buck2_resource_control", "status_if_min_daemon_cgroup_version"))?;
             let status = if status_if_min_daemon_cgroup_version
                 .is_some_and(|min_version| DAEMON_CGROUP_VERSION >= min_version)
             {
@@ -384,56 +339,23 @@ impl ResourceControlConfig {
                 status
             };
             let init = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "init",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2_resource_control", "init"))?
                 .unwrap_or(ResourceControlInit::Systemd);
-            let memory_max = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_max",
-            })?;
-            let memory_high = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_high",
-            })?;
-            let memory_max_per_action = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_max_per_action",
-            })?;
-            let memory_high_per_action = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_high_per_action",
-            })?;
-            let memory_high_actions = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_high_actions",
-            })?;
-            let memory_max_actions = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_max_actions",
-            })?;
-            let enable_suspension = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "enable_suspension",
-            })?;
+            let memory_max = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "memory_max"))?;
+            let memory_high = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "memory_high"))?;
+            let memory_max_per_action = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "memory_max_per_action"))?;
+            let memory_high_per_action = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "memory_high_per_action"))?;
+            let memory_high_actions = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "memory_high_actions"))?;
+            let memory_max_actions = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "memory_max_actions"))?;
+            let enable_suspension = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "enable_suspension"))?;
             let enable_suspension_if_min_algo_version: Option<u32> =
-                config.parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "enable_suspension_if_min_algo_version",
-                })?;
+                config.parse(BuckconfigKeyRef::new("buck2_resource_control", "enable_suspension_if_min_algo_version"))?;
             let enable_suspension = enable_suspension.unwrap_or(false)
                 || enable_suspension_if_min_algo_version
                     .is_some_and(|min_version| RESOURCE_CONTROL_ALGO_VERSION >= min_version);
-            let experimental_suspension_algo_variant = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "experimental_suspension_algo_variant",
-            })?;
+            let experimental_suspension_algo_variant = config.parse(BuckconfigKeyRef::new("buck2_resource_control", "experimental_suspension_algo_variant"))?;
             let preferred_action_suspend_strategy = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "preferred_action_suspend_strategy",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2_resource_control", "preferred_action_suspend_strategy"))?
                 .unwrap_or(ActionSuspendStrategy::KillAndRetry);
             Ok(Self {
                 status,
@@ -485,14 +407,8 @@ pub struct HealthCheckConfig {
 
 impl HealthCheckConfig {
     pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
-        let enable_health_checks = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "enable_health_checks",
-        })?;
-        let disabled_health_check_names = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "disabled_health_check_names",
-        })?;
+        let enable_health_checks = config.parse(BuckconfigKeyRef::new("buck2_health_check", "enable_health_checks"))?;
+        let disabled_health_check_names = config.parse(BuckconfigKeyRef::new("buck2_health_check", "disabled_health_check_names"))?;
 
         Ok(Self {
             // TODO(rajneeshl): When the rollout is successful, change this to default to true.
@@ -538,19 +454,13 @@ impl DaemonStartupConfig {
             // manifold in fbcode contexts, or when specifically asked.
             let use_manifold_default = cfg!(fbcode_build);
             let use_manifold = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "log_use_manifold",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2", "log_use_manifold"))?
                 .unwrap_or(use_manifold_default);
 
             if use_manifold {
                 Ok(LogDownloadMethod::Manifold)
             } else {
-                let log_url = config.get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "log_url",
-                });
+                let log_url = config.get(BuckconfigKeyRef::new("buck2", "log_url"));
                 if let Some(log_url) = log_url {
                     if log_url.is_empty() {
                         Err(buck2_error::buck2_error!(
@@ -568,53 +478,32 @@ impl DaemonStartupConfig {
 
         Ok(Self {
             num_tokio_workers: config
-                .parse(BuckconfigKeyRef {
-                    section: "build",
-                    property: "num_tokio_workers",
-                })
+                .parse(BuckconfigKeyRef::new("build", "num_tokio_workers"))
                 .unwrap_or(Some(0)),
             daemon_buster: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "daemon_buster",
-                })
+                .get(BuckconfigKeyRef::new("buck2", "daemon_buster"))
                 .map(ToOwned::to_owned),
             digest_algorithms: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "digest_algorithms",
-                })
+                .get(BuckconfigKeyRef::new("buck2", "digest_algorithms"))
                 .map(ToOwned::to_owned),
             source_digest_algorithm: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "source_digest_algorithm",
-                })
+                .get(BuckconfigKeyRef::new("buck2", "source_digest_algorithm"))
                 .map(ToOwned::to_owned),
             paranoid: false, // Setup later in ImmediateConfig
             materializations: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "materializations",
-                })
+                .get(BuckconfigKeyRef::new("buck2", "materializations"))
                 .map(ToOwned::to_owned),
             http: HttpConfig::from_config(config)?,
             resource_control: ResourceControlConfig::from_config(config)?,
             log_download_method,
             health_check_config: HealthCheckConfig::from_config(config)?,
             retained_event_logs: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "retained_event_logs",
-                })
+                .get(BuckconfigKeyRef::new("buck2", "retained_event_logs"))
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_RETAINED_EVENT_LOGS),
             macos_qos_class: {
                 let from_config = config
-                    .get(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "macos_qos_class",
-                    })
+                    .get(BuckconfigKeyRef::new("buck2", "macos_qos_class"))
                     .map(ToOwned::to_owned);
                 if buck2_env!("BUCK2_DISABLE_MACOS_QOS", bool)? {
                     buck2_core::soft_error!(
@@ -634,10 +523,7 @@ impl DaemonStartupConfig {
                     from_config
                 }
             },
-            daemon_idle_timeout_s: config.parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "daemon_idle_timeout_s",
-            })?,
+            daemon_idle_timeout_s: config.parse(BuckconfigKeyRef::new("buck2", "daemon_idle_timeout_s"))?,
         })
     }
 

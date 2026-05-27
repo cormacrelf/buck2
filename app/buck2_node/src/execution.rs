@@ -22,10 +22,7 @@ use dice::DiceComputations;
 use crate::configuration::calculation::CellNameForConfigurationResolution;
 use crate::configuration::resolved::ConfigurationSettingKey;
 
-pub const EXECUTION_PLATFORMS_BUCKCONFIG: BuckconfigKeyRef = BuckconfigKeyRef {
-    section: "build",
-    property: "execution_platforms",
-};
+pub const EXECUTION_PLATFORMS_BUCKCONFIG: BuckconfigKeyRef = BuckconfigKeyRef::new("build", "execution_platforms");
 
 #[async_trait]
 pub trait GetExecutionPlatformsImpl: 'static + Send + Sync {

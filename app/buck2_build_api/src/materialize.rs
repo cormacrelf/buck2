@@ -195,10 +195,7 @@ async fn ensure_uploaded(
         .get_legacy_root_config_on_dice()
         .await
         .and_then(|cfg| {
-            cfg.view(ctx).get(BuckconfigKeyRef {
-                section: "build",
-                property: "default_remote_execution_use_case",
-            })
+            cfg.view(ctx).get(BuckconfigKeyRef::new("build", "default_remote_execution_use_case"))
         })
         .ok()
         .flatten()

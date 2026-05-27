@@ -185,10 +185,7 @@ impl LegacyConfigParser {
     {
         for (section, section_builder) in self.values.iter_mut() {
             section_builder.values.retain(|key, _| {
-                filter(&BuckconfigKeyRef {
-                    section,
-                    property: key,
-                })
+                filter(&BuckconfigKeyRef::new(section, key))
             });
         }
         self

@@ -66,10 +66,7 @@ impl ImmediateConfig {
             #[cfg(fbcode_build)]
             show_sentiment: cells
                 .root_config
-                .get(BuckconfigKeyRef {
-                    section: "experiments",
-                    property: "sentiment",
-                })
+                .get(BuckconfigKeyRef::new("experiments", "sentiment"))
                 .is_some_and(|v| v == "true"),
         })
     }

@@ -42,15 +42,9 @@ pub fn parse_buildfile_name(
     // This scheme provides a natural progression to buckv2, with the ability to use separate
     // buildfiles for the two where necessary.
     let mut base = if let Some(buildfiles_value) =
-        config.parse_list::<String>(BuckconfigKeyRef {
-            section: "buildfile",
-            property: "name_v2",
-        })? {
+        config.parse_list::<String>(BuckconfigKeyRef::new("buildfile", "name_v2"))? {
         buildfiles_value.into_try_map(FileNameBuf::try_from)?
-    } else if let Some(buildfiles_value) = config.parse_list::<String>(BuckconfigKeyRef {
-        section: "buildfile",
-        property: "name",
-    })? {
+    } else if let Some(buildfiles_value) = config.parse_list::<String>(BuckconfigKeyRef::new("buildfile", "name"))? {
         let mut buildfiles = Vec::new();
         for buildfile in buildfiles_value {
             buildfiles.push(FileNameBuf::try_from(format!("{buildfile}.v2"))?);
@@ -61,10 +55,7 @@ pub fn parse_buildfile_name(
         DEFAULT_BUILDFILES.map(|&n| FileNameBuf::try_from(n.to_owned()).unwrap())
     };
 
-    if let Some(buildfile) = config.parse::<String>(BuckconfigKeyRef {
-        section: "buildfile",
-        property: "extra_for_test",
-    })? {
+    if let Some(buildfile) = config.parse::<String>(BuckconfigKeyRef::new("buildfile", "extra_for_test"))? {
         base.push(FileNameBuf::try_from(buildfile)?);
     }
 

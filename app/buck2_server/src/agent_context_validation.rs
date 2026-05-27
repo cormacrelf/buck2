@@ -48,10 +48,7 @@ impl AgentContextSchema {
     /// Parse the schema from buckconfig.
     pub(crate) fn from_config(config: &LegacyBuckConfig) -> Self {
         let enforced_clients = config
-            .get(BuckconfigKeyRef {
-                section: "agent_context",
-                property: "enforced_clients",
-            })
+            .get(BuckconfigKeyRef::new("agent_context", "enforced_clients"))
             .map(|v| v.split('|').map(|s| s.trim().to_owned()).collect())
             .unwrap_or_default();
 
