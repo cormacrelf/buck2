@@ -447,10 +447,7 @@ async fn path_artifact_value(
             let use_correct_source_symlink_reading = ctx
                 .parse_legacy_config_property(
                     root_cell,
-                    BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "use_correct_source_symlink_reading",
-                    },
+                    BuckconfigKeyRef::new("buck2", "use_correct_source_symlink_reading"),
                 )
                 .await?
                 .unwrap_or(true);

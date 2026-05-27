@@ -35,16 +35,12 @@ const DEFAULT_ISOLATION_DIR: &str = "v2";
 /// agent_hostname_fail_v2_glob = bad-host-*.example.com,other-*
 /// agent_hostname_fail_v2_context = See S123456.
 /// ```
-const FAIL_GLOB_KEY: BuckconfigKeyRef = BuckconfigKeyRef {
-    section: "buck2",
-    property: "agent_hostname_fail_v2_glob",
-};
+const FAIL_GLOB_KEY: BuckconfigKeyRef =
+    BuckconfigKeyRef::new("buck2", "agent_hostname_fail_v2_glob");
 /// Optional extra context appended to the rejection message, e.g. a SEV link.
 /// Unset/empty just omits it.
-const FAIL_CONTEXT_KEY: BuckconfigKeyRef = BuckconfigKeyRef {
-    section: "buck2",
-    property: "agent_hostname_fail_v2_context",
-};
+const FAIL_CONTEXT_KEY: BuckconfigKeyRef =
+    BuckconfigKeyRef::new("buck2", "agent_hostname_fail_v2_context");
 
 #[derive(Debug, buck2_error::Error)]
 enum AgentHostGuardError {

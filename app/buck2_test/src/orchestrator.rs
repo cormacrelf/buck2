@@ -722,10 +722,7 @@ impl Key for TestExecutionKey {
         let config = InternalRunnerConfig::parse(
             ctx.get_legacy_config_property(
                 cell_resolver.root_cell(),
-                BuckconfigKeyRef {
-                    section: "test",
-                    property: "use_internal_runner",
-                },
+                BuckconfigKeyRef::new("test", "use_internal_runner"),
             )
             .await
             .map_err(ExecuteError::Error)?

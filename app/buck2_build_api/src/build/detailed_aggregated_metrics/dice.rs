@@ -216,10 +216,7 @@ fn get_detailed_aggregated_metrics_handle<'a>(
 fn detailed_aggregated_metrics_requested(config: &LegacyBuckConfig) -> buck2_error::Result<bool> {
     for property in ["detailed_aggregated_metrics", "log_action_graph_sketch"] {
         if config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property,
-            })?
+            .parse::<bool>(BuckconfigKeyRef::new("buck2", property))?
             .unwrap_or(false)
         {
             return Ok(true);

@@ -132,10 +132,7 @@ impl EdenFsFileWatcher {
         let project_root = manager.get_proj_relative_path().to_owned();
 
         let mergebase_with = root_config
-            .get(BuckconfigKeyRef {
-                section: "project",
-                property: "watchman_merge_base",
-            })
+            .get(BuckconfigKeyRef::new("project", "watchman_merge_base"))
             .map(|s| s.to_owned());
 
         let dice_clear_on_mergebase_change =

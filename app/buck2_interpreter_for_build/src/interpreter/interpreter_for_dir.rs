@@ -690,10 +690,7 @@ impl InterpreterForDir {
                 package_boundary_exception,
                 &loaded_modules,
             )?;
-            let buckconfig_key = BuckconfigKeyRef {
-                section: "buck2",
-                property: "check_starlark_peak_memory",
-            };
+            let buckconfig_key = BuckconfigKeyRef::new("buck2", "check_starlark_peak_memory");
             let starlark_peak_mem_config_enabled = LegacyBuckConfig::parse_value(
                 buckconfig_key,
                 buckconfigs

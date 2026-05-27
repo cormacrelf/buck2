@@ -117,10 +117,12 @@ impl StarlarkEvaluatorProvider {
         let profile_listener = ctx.get_profile_event_listener().cloned();
 
         let starlark_max_callstack_size =
-            root_buckconfig.view(ctx).parse::<usize>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "starlark_max_callstack_size",
-            })?;
+            root_buckconfig
+                .view(ctx)
+                .parse::<usize>(BuckconfigKeyRef::new(
+                    "buck2",
+                    "starlark_max_callstack_size",
+                ))?;
 
         let debugger_handle = ctx.get_starlark_debugger_handle();
         let debugger = match debugger_handle {

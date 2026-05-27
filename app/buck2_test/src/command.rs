@@ -353,10 +353,7 @@ async fn test(
     let test_executor_config = ctx
         .get_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "test",
-                property: "v2_test_executor",
-            },
+            BuckconfigKeyRef::new("test", "v2_test_executor"),
         )
         .await?
         .filter(|s| !s.is_empty());
@@ -680,10 +677,7 @@ async fn test_targets(
     let internal_test_timeout = ctx
         .get_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "test",
-                property: "timeout_default_s",
-            },
+            BuckconfigKeyRef::new("test", "timeout_default_s"),
         )
         .await?
         .and_then(|s| s.parse::<u64>().ok())
@@ -693,10 +687,7 @@ async fn test_targets(
     let internal_runner_config = InternalRunnerConfig::parse(
         ctx.get_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "test",
-                property: "use_internal_runner",
-            },
+            BuckconfigKeyRef::new("test", "use_internal_runner"),
         )
         .await?
         .as_deref(),

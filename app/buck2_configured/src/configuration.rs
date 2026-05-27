@@ -102,10 +102,7 @@ async fn configuration_matches(
         let v = ctx
             .get_legacy_config_property(
                 target_node_cell.0,
-                BuckconfigKeyRef {
-                    section: &config_section_and_key.section,
-                    property: &config_section_and_key.key,
-                },
+                BuckconfigKeyRef::new(&config_section_and_key.section, &config_section_and_key.key),
             )
             .await?;
         match v {

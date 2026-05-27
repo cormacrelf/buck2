@@ -18,3 +18,9 @@ pub struct BuckconfigKeyRef<'a> {
     pub section: &'a str,
     pub property: &'a str,
 }
+
+impl<'a> BuckconfigKeyRef<'a> {
+    pub const fn new(section: &'a str, property: &'a str) -> Self {
+        Self { section, property }
+    }
+}

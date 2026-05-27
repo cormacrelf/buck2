@@ -52,10 +52,10 @@ impl DiskStateOptions {
             materialization_method,
             MaterializationMethod::Deferred | MaterializationMethod::DeferredSkipFinalArtifacts
         ) && root_config
-            .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "sqlite_materializer_state",
-            })?
+            .parse::<RolloutPercentage>(BuckconfigKeyRef::new(
+                "buck2",
+                "sqlite_materializer_state",
+            ))?
             .unwrap_or_else(RolloutPercentage::always)
             .roll();
         Ok(Self {
@@ -85,10 +85,9 @@ fn sqlite_db_setup_metadata_and_versions(
         );
     }
 
-    if let Some(buckconfig_version) = root_config.parse(BuckconfigKeyRef {
-        section: "buck2",
-        property: version_config,
-    })? {
+    if let Some(buckconfig_version) =
+        root_config.parse(BuckconfigKeyRef::new("buck2", version_config))?
+    {
         versions.insert("buckconfig_version".to_owned(), buckconfig_version);
     }
     if let Some(hostname) = metadata.get("hostname") {
@@ -157,10 +156,7 @@ pub(crate) async fn maybe_initialize_incremental_sqlite_db(
 ) -> buck2_error::Result<IncrementalDbState> {
     // Rolling it out by default, but giving an option to disable in case something goes horribly wrong
     if !root_config
-        .parse(BuckconfigKeyRef {
-            section: "buck2",
-            property: "sqlite_incremental_state",
-        })?
+        .parse(BuckconfigKeyRef::new("buck2", "sqlite_incremental_state"))?
         .unwrap_or(true)
     {
         // When sqlite incremental state is disabled, we should always delete the db to

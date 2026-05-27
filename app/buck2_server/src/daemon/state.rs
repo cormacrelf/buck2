@@ -316,29 +316,23 @@ impl DaemonState {
                 .await?;
 
             let buffer_size = root_config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "event_log_buffer_size",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2", "event_log_buffer_size"))?
                 .unwrap_or(10000);
             let retry_backoff = Duration::from_millis(
                 root_config
-                    .parse(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "event_log_retry_backoff_duration_ms",
-                    })?
+                    .parse(BuckconfigKeyRef::new(
+                        "buck2",
+                        "event_log_retry_backoff_duration_ms",
+                    ))?
                     .unwrap_or(500),
             );
             let retry_attempts = root_config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "event_log_retry_attempts",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2", "event_log_retry_attempts"))?
                 .unwrap_or(5);
-            let message_batch_size = root_config.parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "event_log_message_batch_size",
-            })?;
+            let message_batch_size = root_config.parse(BuckconfigKeyRef::new(
+                "buck2",
+                "event_log_message_batch_size",
+            ))?;
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -402,10 +396,7 @@ impl DaemonState {
                     cell,
                     IgnoreSet::from_ignore_spec(
                         config
-                            .get(BuckconfigKeyRef {
-                                section: "project",
-                                property: "ignore",
-                            })
+                            .get(BuckconfigKeyRef::new("project", "ignore"))
                             .unwrap_or(""),
                         cells.is_root_cell(cell),
                     )?,
@@ -426,66 +417,63 @@ impl DaemonState {
 
             let deferred_materializer_configs = {
                 let defer_write_actions = root_config
-                    .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "defer_write_actions",
-                    })?
+                    .parse::<RolloutPercentage>(BuckconfigKeyRef::new(
+                        "buck2",
+                        "defer_write_actions",
+                    ))?
                     .unwrap_or_else(RolloutPercentage::never)
                     .roll();
 
                 // RE will refresh any TTL < 1 hour, so we check twice an hour and refresh any TTL
                 // < 1 hour.
                 let ttl_refresh_frequency = root_config
-                    .parse(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "ttl_refresh_frequency_seconds",
-                    })?
+                    .parse(BuckconfigKeyRef::new(
+                        "buck2",
+                        "ttl_refresh_frequency_seconds",
+                    ))?
                     .unwrap_or(1800);
 
                 let ttl_refresh_min_ttl = root_config
-                    .parse(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "ttl_refresh_min_ttl_seconds",
-                    })?
+                    .parse(BuckconfigKeyRef::new(
+                        "buck2",
+                        "ttl_refresh_min_ttl_seconds",
+                    ))?
                     .unwrap_or(3600);
 
                 let ttl_refresh_enabled = root_config
-                    .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "ttl_refresh_enabled",
-                    })?
+                    .parse::<RolloutPercentage>(BuckconfigKeyRef::new(
+                        "buck2",
+                        "ttl_refresh_enabled",
+                    ))?
                     .unwrap_or_else(RolloutPercentage::never)
                     .roll();
 
                 let update_access_times = AccessTimesUpdates::try_new_from_config_value(
-                    root_config.get(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "update_access_times",
-                    }),
+                    root_config.get(BuckconfigKeyRef::new("buck2", "update_access_times")),
                 )?;
 
                 let verbose_materializer_log = root_config
-                    .parse(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "verbose_materializer_event_log",
-                    })?
+                    .parse(BuckconfigKeyRef::new(
+                        "buck2",
+                        "verbose_materializer_event_log",
+                    ))?
                     .unwrap_or(false);
 
                 let clean_stale_config = CleanStaleConfig::from_buck_config(root_config)?;
 
                 let disable_eager_write_dispatch = root_config
-                    .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "disable_eager_write_dispatch",
-                    })?
+                    .parse::<RolloutPercentage>(BuckconfigKeyRef::new(
+                        "buck2",
+                        "disable_eager_write_dispatch",
+                    ))?
                     .unwrap_or_else(RolloutPercentage::never)
                     .roll();
 
                 let eager_materialization_enabled = root_config
-                    .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "eager_materialization_enabled",
-                    })?
+                    .parse::<RolloutPercentage>(BuckconfigKeyRef::new(
+                        "buck2",
+                        "eager_materialization_enabled",
+                    ))?
                     .unwrap_or_else(RolloutPercentage::never)
                     .roll();
 
@@ -513,10 +501,7 @@ impl DaemonState {
                 deferred_materializer_configs.eager_materialization_enabled;
 
             let use_eden_thrift_read = root_config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "use_eden_thrift_read",
-                })?
+                .parse(BuckconfigKeyRef::new("buck2", "use_eden_thrift_read"))?
                 .unwrap_or(cfg!(any(target_os = "macos", target_os = "windows")));
 
             tracing::info!("Creating materializer...");
@@ -640,19 +625,16 @@ impl DaemonState {
             })?;
 
             let use_network_action_output_cache = root_config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "use_network_action_output_cache",
-                })?
+                .parse(BuckconfigKeyRef::new(
+                    "buck2",
+                    "use_network_action_output_cache",
+                ))?
                 .unwrap_or(false);
 
             let create_unhashed_outputs_lock = Arc::new(Mutex::new(()));
 
             let enable_restarter = root_config
-                .parse::<RolloutPercentage>(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "restarter",
-                })?
+                .parse::<RolloutPercentage>(BuckconfigKeyRef::new("buck2", "restarter"))?
                 .unwrap_or_else(RolloutPercentage::never)
                 .roll();
 
@@ -668,10 +650,10 @@ impl DaemonState {
             };
 
             let remote_dep_files_enabled = root_config
-                .parse(BuckconfigKeyRef {
-                    section: "build",
-                    property: "remote_dep_file_cache_enabled",
-                })?
+                .parse(BuckconfigKeyRef::new(
+                    "build",
+                    "remote_dep_file_cache_enabled",
+                ))?
                 .unwrap_or(false);
 
             let action_freezing_enabled = init_ctx
@@ -706,19 +688,16 @@ impl DaemonState {
             ];
             let system_warning_config = SystemWarningConfig::from_config(root_config)?;
 
-            let declare_output_has_content_based_path_default =
-                root_config.parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "declare_output_has_content_based_path_default",
-                })?;
+            let declare_output_has_content_based_path_default = root_config.parse(
+                BuckconfigKeyRef::new("buck2", "declare_output_has_content_based_path_default"),
+            )?;
             init_declare_output_has_content_based_path_default(
                 declare_output_has_content_based_path_default,
             )?;
 
-            let action_has_content_based_path_default = root_config.parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "action_has_content_based_path_default",
-            })?;
+            let action_has_content_based_path_default = root_config.parse(
+                BuckconfigKeyRef::new("buck2", "action_has_content_based_path_default"),
+            )?;
             init_action_has_content_based_path_default(action_has_content_based_path_default)?;
 
             // Kick off an initial sync eagerly. This gets Watchamn to start watching the path we care

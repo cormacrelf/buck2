@@ -37,13 +37,7 @@ impl HasCellFileIgnores for DiceComputations<'_> {
         let instance = cells.get(cell_name)?;
         let config = self.get_legacy_config_on_dice(cell_name).await?;
 
-        let ignore_spec = config.lookup(
-            self,
-            BuckconfigKeyRef {
-                section: "project",
-                property: "ignore",
-            },
-        )?;
+        let ignore_spec = config.lookup(self, BuckconfigKeyRef::new("project", "ignore"))?;
         let ignore_spec = ignore_spec.as_ref().map_or("", |s| &**s);
 
         let cell_ignores = CellFileIgnores::new_for_interpreter(

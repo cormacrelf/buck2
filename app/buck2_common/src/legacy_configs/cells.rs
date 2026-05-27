@@ -102,10 +102,7 @@ impl ExternalBuckconfigData {
                 .filter(|arg| match arg {
                     ResolvedLegacyConfigArg::Flag(flag) => {
                         flag.cell.is_some()
-                            || filter(&BuckconfigKeyRef {
-                                section: &flag.section,
-                                property: &flag.key,
-                            })
+                            || filter(&BuckconfigKeyRef::new(&flag.section, &flag.key))
                     }
                     _ => true,
                 })
@@ -503,7 +500,9 @@ impl BuckConfigBasedCells {
 
         let get_config = |section: &str, property: &str| {
             config
-                .get(crate::legacy_configs::key::BuckconfigKeyRef { section, property })
+                .get(crate::legacy_configs::key::BuckconfigKeyRef::new(
+                    section, property,
+                ))
                 .ok_or_else(|| {
                     ExternalCellOriginParseError::MissingConfiguration(
                         section.to_owned(),
@@ -796,24 +795,15 @@ mod tests {
             .await?;
 
         assert_eq!(
-            root_config.get(BuckconfigKeyRef {
-                section: "foo",
-                property: "bar"
-            }),
+            root_config.get(BuckconfigKeyRef::new("foo", "bar")),
             Some("blah")
         );
         assert_eq!(
-            other_config.get(BuckconfigKeyRef {
-                section: "foo",
-                property: "bar"
-            }),
+            other_config.get(BuckconfigKeyRef::new("foo", "bar")),
             Some("blah")
         );
         assert_eq!(
-            tp_config.get(BuckconfigKeyRef {
-                section: "foo",
-                property: "bar"
-            }),
+            tp_config.get(BuckconfigKeyRef::new("foo", "bar")),
             Some("blah")
         );
 
@@ -851,10 +841,7 @@ mod tests {
             .await?;
 
         assert_eq!(
-            other_config.get(BuckconfigKeyRef {
-                section: "foo",
-                property: "bar"
-            }),
+            other_config.get(BuckconfigKeyRef::new("foo", "bar")),
             Some("baz")
         );
 
@@ -920,17 +907,11 @@ mod tests {
             .await?;
 
         assert_eq!(
-            other_config.get(BuckconfigKeyRef {
-                section: "apple",
-                property: "ide"
-            }),
+            other_config.get(BuckconfigKeyRef::new("apple", "ide")),
             Some("Xcode")
         );
         assert_eq!(
-            other_config.get(BuckconfigKeyRef {
-                section: "apple",
-                property: "test_tool"
-            }),
+            other_config.get(BuckconfigKeyRef::new("apple", "test_tool")),
             Some("xctool")
         );
 

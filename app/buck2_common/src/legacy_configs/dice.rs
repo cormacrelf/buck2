@@ -313,10 +313,7 @@ impl ProjectionKey for LegacyBuckConfigPropertyProjectionKey {
         // See the comment in `LegacyBuckConfigErrorKey` for why this is safe
         let config = config.as_ref().unwrap();
         config
-            .get(BuckconfigKeyRef {
-                section: &self.section,
-                property: &self.property,
-            })
+            .get(BuckconfigKeyRef::new(&self.section, &self.property))
             .map(|s| s.to_owned().into())
     }
 
@@ -459,14 +456,8 @@ fn is_config_invisible_to_dice(key: &BuckconfigKeyRef) -> bool {
 /// to these configs do not cause state invalidations.
 // FIXME(JakobDegen): Error if someone tries to read any of these from in dice
 const CONFIGS_INVISIBLE_TO_DICE: &[BuckconfigKeyRef<'static>] = &[
-    BuckconfigKeyRef {
-        section: "buck2_re_client",
-        property: "override_use_case",
-    },
-    BuckconfigKeyRef {
-        section: "scuba",
-        property: "defaults",
-    },
+    BuckconfigKeyRef::new("buck2_re_client", "override_use_case"),
+    BuckconfigKeyRef::new("scuba", "defaults"),
 ];
 
 #[cfg(test)]

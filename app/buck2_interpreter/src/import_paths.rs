@@ -48,10 +48,7 @@ impl ImplicitImportPaths {
         // normal imports. e.g. it uses `cell//path/to/file.bzl` instead of
         // `cell//path/to:file.bzl`.
         let root_import = config
-            .get(BuckconfigKeyRef {
-                section: "buildfile",
-                property: "includes",
-            })?
+            .get(BuckconfigKeyRef::new("buildfile", "includes"))?
             .map(|i| {
                 let (cell_alias, path): (&str, &str) = i.split_once("//").unwrap_or(("", &*i));
                 let path = CellRelativePathBuf::try_from(path.to_owned())?;
@@ -66,10 +63,7 @@ impl ImplicitImportPaths {
             cell_name,
             cell_alias_resolver.dupe(),
             config
-                .get(BuckconfigKeyRef {
-                    section: "buildfile",
-                    property: "package_includes",
-                })?
+                .get(BuckconfigKeyRef::new("buildfile", "package_includes"))?
                 .as_deref(),
         )?;
         Ok(ImplicitImportPaths {

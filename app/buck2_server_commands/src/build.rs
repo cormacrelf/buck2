@@ -236,10 +236,7 @@ async fn build(
     let want_configured_graph_size = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_configured_graph_size",
-            },
+            BuckconfigKeyRef::new("buck2", "log_configured_graph_size"),
         )
         .await?
         .unwrap_or_default();
@@ -247,10 +244,7 @@ async fn build(
     let want_configured_graph_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_configured_graph_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_configured_graph_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -258,10 +252,7 @@ async fn build(
     let want_total_configured_graph_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_total_configured_graph_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_total_configured_graph_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -269,10 +260,7 @@ async fn build(
     let want_retained_analysis_memory_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_retained_analysis_memory_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_retained_analysis_memory_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -280,10 +268,7 @@ async fn build(
     let want_action_graph_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_action_graph_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_action_graph_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -291,10 +276,7 @@ async fn build(
     let want_peak_analysis_memory_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_peak_analysis_memory_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_peak_analysis_memory_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -302,10 +284,7 @@ async fn build(
     let want_peak_load_memory_sketch = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_peak_load_memory_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_peak_load_memory_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -313,10 +292,7 @@ async fn build(
     let want_artifact_count_sketch: bool = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_artifact_count_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_artifact_count_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -324,10 +300,7 @@ async fn build(
     let want_artifact_size_sketch: bool = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_artifact_size_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "log_artifact_size_sketch"),
         )
         .await?
         .unwrap_or_default();
@@ -335,10 +308,7 @@ async fn build(
     let want_log_sketch_cardinalities: bool = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "log_sketch_cardinalities",
-            },
+            BuckconfigKeyRef::new("buck2", "log_sketch_cardinalities"),
         )
         .await?
         .unwrap_or_default();
@@ -359,10 +329,7 @@ async fn build(
     let providers_to_skip_in_artifact_path_sketch: HashSet<BuildProviderType> = ctx
         .parse_legacy_config_list_property::<SkipProvider>(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "providers_to_skip_in_artifact_path_sketch",
-            },
+            BuckconfigKeyRef::new("buck2", "providers_to_skip_in_artifact_path_sketch"),
         )
         .await?
         .unwrap_or_default()
@@ -421,10 +388,7 @@ async fn build(
     let want_detailed_metrics = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "detailed_aggregated_metrics",
-            },
+            BuckconfigKeyRef::new("buck2", "detailed_aggregated_metrics"),
         )
         .await?
         .unwrap_or_default();
@@ -700,10 +664,7 @@ async fn process_build_result(
     let should_create_unhashed_links = ctx
         .parse_legacy_config_property(
             cell_resolver.root_cell(),
-            BuckconfigKeyRef {
-                section: "buck2",
-                property: "create_unhashed_links",
-            },
+            BuckconfigKeyRef::new("buck2", "create_unhashed_links"),
         )
         .await?;
 

@@ -822,52 +822,43 @@ pub enum LowDiskCleanMode {
 impl CleanStaleConfig {
     pub fn from_buck_config(root_config: &LegacyBuckConfig) -> buck2_error::Result<Option<Self>> {
         let clean_stale_enabled = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_enabled",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_enabled"))?
             .unwrap_or(false);
         let clean_stale_artifact_ttl_hours = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_artifact_ttl_hours",
-            })?
+            .parse(BuckconfigKeyRef::new(
+                "buck2",
+                "clean_stale_artifact_ttl_hours",
+            ))?
             .unwrap_or(24.0 * 7.0);
         let clean_stale_period_hours = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_period_hours",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_period_hours"))?
             .unwrap_or(24.0);
         let clean_stale_start_offset_hours = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_start_offset_hours",
-            })?
+            .parse(BuckconfigKeyRef::new(
+                "buck2",
+                "clean_stale_start_offset_hours",
+            ))?
             .unwrap_or(12.0);
         let clean_stale_dry_run = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_dry_run",
-            })?
+            .parse(BuckconfigKeyRef::new("buck2", "clean_stale_dry_run"))?
             .unwrap_or(false);
         let adaptive_enabled = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_low_disk_adaptive_enabled",
-            })?
+            .parse(BuckconfigKeyRef::new(
+                "buck2",
+                "clean_stale_low_disk_adaptive_enabled",
+            ))?
             .unwrap_or(false);
         let adaptive_min_ttl_hours: f64 = root_config
-            .parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "clean_stale_low_disk_adaptive_min_ttl_hours",
-            })?
+            .parse(BuckconfigKeyRef::new(
+                "buck2",
+                "clean_stale_low_disk_adaptive_min_ttl_hours",
+            ))?
             .unwrap_or(12.0);
         let adaptive_min_ttl = Duration::from_hours(1).mul_f64(adaptive_min_ttl_hours);
-        let low_disk_artifact_ttl_hours: Option<f64> = root_config.parse(BuckconfigKeyRef {
-            section: "buck2",
-            property: "clean_stale_low_disk_artifact_ttl_hours",
-        })?;
+        let low_disk_artifact_ttl_hours: Option<f64> = root_config.parse(BuckconfigKeyRef::new(
+            "buck2",
+            "clean_stale_low_disk_artifact_ttl_hours",
+        ))?;
         let low_disk_mode = if adaptive_enabled {
             LowDiskCleanMode::Adaptive {
                 min_ttl: adaptive_min_ttl,
@@ -876,10 +867,10 @@ impl CleanStaleConfig {
             let hours = low_disk_artifact_ttl_hours.unwrap_or(48.0);
             LowDiskCleanMode::Fixed(Duration::from_hours(1).mul_f64(hours))
         };
-        let low_disk_threshold_percent: Option<f64> = root_config.parse(BuckconfigKeyRef {
-            section: "buck2",
-            property: "clean_stale_low_disk_threshold",
-        })?;
+        let low_disk_threshold_percent: Option<f64> = root_config.parse(BuckconfigKeyRef::new(
+            "buck2",
+            "clean_stale_low_disk_threshold",
+        ))?;
         let low_disk = low_disk_threshold_percent.map(|threshold_percent| LowDiskCleanConfig {
             threshold_percent,
             mode: low_disk_mode,

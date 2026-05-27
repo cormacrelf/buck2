@@ -68,18 +68,15 @@ impl ImmediateConfig {
             #[cfg(fbcode_build)]
             allow_daemon_start_unsandboxed_via_wrapper: cells
                 .root_config
-                .parse::<bool>(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "allow_daemon_start_unsandboxed_via_wrapper",
-                })?
+                .parse::<bool>(BuckconfigKeyRef::new(
+                    "buck2",
+                    "allow_daemon_start_unsandboxed_via_wrapper",
+                ))?
                 .unwrap_or(false),
             #[cfg(fbcode_build)]
             show_sentiment: cells
                 .root_config
-                .get(BuckconfigKeyRef {
-                    section: "experiments",
-                    property: "sentiment",
-                })
+                .get(BuckconfigKeyRef::new("experiments", "sentiment"))
                 .is_some_and(|v| v == "true"),
         })
     }
