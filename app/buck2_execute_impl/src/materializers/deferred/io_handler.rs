@@ -168,6 +168,70 @@ impl DefaultIoHandler {
             http_client,
         }
     }
+
+    /// Try to fetch a blob via the Remote Asset API. Returns `Some(Ok(()))` on success,
+    /// or `None` if FetchBlob is unavailable or failed (caller should fall back to HTTP).
+    async fn try_fetch_blob_from_remote(
+        &self,
+        path: &ProjectRelativePathBuf,
+        info: &buck2_execute::materialize::materializer::HttpDownloadInfo,
+        priority_control: &DynamicPriorityHandle,
+    ) -> Option<buck2_error::Result<()>> {
+        let connection = self.re_client_manager.get_re_connection();
+        let re_client = connection.get_client().with_use_case(
+            buck2_core::execution_types::executor_config::RemoteExecutorUseCase::buck2_default(),
+        );
+
+        let digest = match re_client
+            .fetch_blob(
+                vec![info.url.to_string()],
+                info.checksum.sha256(),
+            )
+            .await
+        {
+            Ok(Some(d)) => d,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::info!(
+                    "Remote Asset FetchBlob failed for {}, falling back to HTTP: {:#}",
+                    info.url,
+                    e
+                );
+                return None;
+            }
+        };
+
+        let name = match self.fs.resolve(path).as_maybe_relativized_str() {
+            Ok(n) => n.to_owned(),
+            Err(e) => return Some(Err(e)),
+        };
+
+        let files = vec![NamedDigestWithPermissions {
+            named_digest: NamedDigest {
+                name,
+                digest,
+                ..Default::default()
+            },
+            is_executable: info.metadata.is_executable,
+            ..Default::default()
+        }];
+
+        match re_client
+            .materialize_files(files, priority_control.dupe())
+            .await
+        {
+            Ok(()) => Some(Ok(())),
+            Err(e) => {
+                tracing::info!(
+                    "CAS materialize after FetchBlob failed for {}, falling back to HTTP: {:#}",
+                    info.url,
+                    e
+                );
+                None
+            }
+        }
+    }
+
     /// Materializes an `entry` at `path`, using the materialization `method`
     #[instrument(level = "debug", skip(self, stat, cancellations), fields(path = %path, method = %method, entry = %entry))]
     async fn materialize_entry_span(
@@ -250,6 +314,17 @@ impl DefaultIoHandler {
             }
             ArtifactMaterializationMethod::HttpDownload { info } => {
                 async {
+                    // Try Remote Asset API FetchBlob first if available.
+                    if let Some(fetched) = self.try_fetch_blob_from_remote(
+                        &path,
+                        info,
+                        &priority_control,
+                    ).await {
+                        stat.file_count = 1;
+                        stat.total_bytes = info.metadata.digest.size();
+                        return fetched;
+                    }
+
                     let downloaded = http_download(
                         &self.http_client,
                         &self.fs,
@@ -261,10 +336,6 @@ impl DefaultIoHandler {
                     )
                     .await?;
 
-                    // Check that the size we got was the one that we expected. This isn't strictly
-                    // speaking necessary here, but since an invalid size would break actions
-                    // running on RE, it's a good idea to catch it here when materializing so that
-                    // our test suite can surface bugs when downloading things locally.
                     if downloaded.size() != info.metadata.digest.size() {
                         return Err(buck2_error::buck2_error!(
                             ErrorTag::DownloadSizeMismatch,

@@ -294,6 +294,8 @@ pub struct Buck2OssReConfiguration {
     pub engine_address: Option<String>,
     /// Address for RBE Action Cache service.
     pub action_cache_address: Option<String>,
+    /// Address for Remote Asset API Fetch service. Enables server-side fetching of HTTP downloads.
+    pub asset_address: Option<String>,
     /// Whether to use TLS to interact with remote execution.
     pub tls: bool,
     /// Path to a CA certificates bundle. This must be PEM-encoded. If none is set, a default
@@ -379,6 +381,8 @@ impl Buck2OssReConfiguration {
             action_cache_address: legacy_config
                 .parse(BuckconfigKeyRef::new(BUCK2_RE_CLIENT_CFG_SECTION, "action_cache_address"))?
                 .or(default_address),
+            asset_address: legacy_config
+                .parse(BuckconfigKeyRef::new(BUCK2_RE_CLIENT_CFG_SECTION, "asset_address"))?,
             tls: legacy_config
                 .parse(BuckconfigKeyRef::new(BUCK2_RE_CLIENT_CFG_SECTION, "tls"))?
                 .unwrap_or(true),

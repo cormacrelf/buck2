@@ -374,6 +374,14 @@ impl RemoteExecutionClient {
         Ok(())
     }
 
+    pub async fn fetch_blob(
+        &self,
+        uris: Vec<String>,
+        sha256: Option<&str>,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        self.data.client.fetch_blob(uris, sha256).await
+    }
+
     pub async fn download_typed_blobs<T: Message + Default>(
         &self,
         identity: Option<&ReActionIdentity<'_>>,
@@ -2021,6 +2029,17 @@ impl RemoteExecutionClientImpl {
         );
 
         Ok(response)
+    }
+
+    async fn fetch_blob(
+        &self,
+        uris: Vec<String>,
+        sha256: Option<&str>,
+    ) -> buck2_error::Result<Option<TDigest>> {
+        self.client()
+            .fetch_blob(uris, sha256)
+            .await
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
     }
 }
 

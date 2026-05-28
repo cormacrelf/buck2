@@ -40,6 +40,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use prost::Message;
+use re_grpc_proto::build::bazel::remote::asset::v1::FetchBlobRequest;
+use re_grpc_proto::build::bazel::remote::asset::v1::fetch_client::FetchClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::ActionResult;
 use re_grpc_proto::build::bazel::remote::execution::v2::BatchReadBlobsRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::BatchReadBlobsResponse;
@@ -354,6 +356,12 @@ impl REClientBuilder {
         )
         .await;
 
+        let asset_channel = if opts.asset_address.is_some() {
+            Some(create_channel(opts.asset_address.clone()).await)
+        } else {
+            None
+        };
+
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
 
         let mut capabilities_client = CapabilitiesClient::with_interceptor(
@@ -431,6 +439,12 @@ impl REClientBuilder {
                 interceptor.dupe(),
             )
             .max_decoding_message_size(max_decoding_msg_size),
+            fetch_client: asset_channel
+                .map(|ch| {
+                    ch.context("Error creating Remote Asset Fetch client")
+                        .map(|ch| FetchClient::with_interceptor(ch, interceptor.dupe()))
+                })
+                .transpose()?,
         };
 
         Ok(REClient::new(
@@ -550,6 +564,7 @@ pub struct GRPCClients {
     execution_client: ExecutionClient<GrpcService>,
     action_cache_client: ActionCacheClient<GrpcService>,
     bytestream_client: ByteStreamClient<GrpcService>,
+    fetch_client: Option<FetchClient<GrpcService>>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1052,6 +1067,53 @@ impl REClient {
     ) -> anyhow::Result<TDigest> {
         // TODO(arr)
         Err(anyhow::anyhow!("Not implemented (RE extend_digest_ttl)"))
+    }
+
+    pub async fn fetch_blob(
+        &self,
+        uris: Vec<String>,
+        sha256: Option<&str>,
+    ) -> anyhow::Result<Option<TDigest>> {
+        use re_grpc_proto::build::bazel::remote::asset::v1::Qualifier;
+
+        let mut fetch_client = match &self.grpc_clients.fetch_client {
+            Some(c) => c.clone(),
+            None => return Ok(None),
+        };
+
+        let qualifiers = sha256
+            .map(|s| {
+                vec![Qualifier {
+                    name: "checksum.sri".to_owned(),
+                    value: format!("sha256-{s}"),
+                }]
+            })
+            .unwrap_or_default();
+
+        let response = fetch_client
+            .fetch_blob(FetchBlobRequest {
+                instance_name: self.instance_name.as_str().to_owned(),
+                timeout: None,
+                oldest_content_accepted: None,
+                uris,
+                qualifiers,
+                digest_function: 0,
+            })
+            .await
+            .context("Remote Asset FetchBlob RPC failed")?
+            .into_inner();
+
+        if let Some(status) = &response.status {
+            if status.code != 0 {
+                return Ok(None);
+            }
+        }
+
+        Ok(response.blob_digest.map(|d| TDigest {
+            hash: d.hash,
+            size_in_bytes: d.size_bytes,
+            ..Default::default()
+        }))
     }
 
     pub fn get_execution_client(&self) -> &Self {

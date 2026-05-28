@@ -474,6 +474,14 @@ impl ManagedRemoteExecutionClient {
             .await
     }
 
+    pub async fn fetch_blob(
+        &self,
+        uris: Vec<String>,
+        sha256: Option<&str>,
+    ) -> buck2_error::Result<Option<remote_execution::TDigest>> {
+        self.lock()?.get().await?.fetch_blob(uris, sha256).await
+    }
+
     pub async fn download_typed_blobs<T: Message + Default>(
         &self,
         identity: Option<&ReActionIdentity<'_>>,
