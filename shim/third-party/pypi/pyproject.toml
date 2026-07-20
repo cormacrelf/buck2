@@ -6,6 +6,8 @@ dependencies = [
     "pytest",
     "pytest-asyncio",
     "decorator",
+    "psutil",
+    "aiohttp",
     "setuptools",
     "typed-argument-parser",
     "importlib-resources",
