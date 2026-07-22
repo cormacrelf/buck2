@@ -1,0 +1,28 @@
+load(":rules.bzl", "collect_js_sources", "js_module")
+
+js_module(
+    name = "leaf",
+    srcs = ["leaf.js"],
+)
+
+js_module(
+    name = "left",
+    srcs = ["left.js"],
+    deps = [":leaf"],
+)
+
+js_module(
+    name = "right",
+    srcs = ["right.js"],
+)
+
+js_module(
+    name = "root",
+    srcs = ["root.js"],
+    deps = [":left", ":right"],
+)
+
+collect_js_sources(
+    name = "all_js_sources",
+    root = ":root",
+)
