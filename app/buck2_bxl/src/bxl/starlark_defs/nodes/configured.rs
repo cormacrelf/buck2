@@ -19,6 +19,7 @@ use buck2_analysis::analysis::calculation::get_dep_analysis;
 use buck2_analysis::analysis::calculation::resolve_queries;
 use buck2_analysis::analysis::env::RuleAnalysisAttrResolutionContext;
 use buck2_analysis::analysis::env::get_deps_from_analysis_results;
+use buck2_analysis::analysis::env::get_direct_deps_from_analysis_results;
 use buck2_analysis::attrs::resolve::configured_attr::ConfiguredAttrExt;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
@@ -538,9 +539,11 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
             ctx.via(|dice_ctx| resolve_queries(dice_ctx, configured_node).boxed_local())
         })?;
 
+        let dep_analysis = dep_analysis?;
         let resolution_ctx = RuleAnalysisAttrResolutionContext {
             module: eval.module(),
-            dep_analysis_results: get_deps_from_analysis_results(dep_analysis?)?,
+            dep_analysis_results: get_deps_from_analysis_results(dep_analysis.clone())?,
+            dep_direct_deps: get_direct_deps_from_analysis_results(&dep_analysis)?,
             query_results,
             execution_platform_resolution: configured_node.execution_platform_resolution().clone(),
         };

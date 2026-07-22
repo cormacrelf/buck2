@@ -16,6 +16,7 @@ use buck2_analysis::analysis::calculation::get_dep_analysis;
 use buck2_analysis::analysis::calculation::resolve_queries;
 use buck2_analysis::analysis::env::get_dep;
 use buck2_analysis::analysis::env::get_deps_from_analysis_results;
+use buck2_analysis::analysis::env::get_direct_deps_from_analysis_results;
 use buck2_analysis::analysis::env::resolve_query;
 use buck2_analysis::analysis::env::resolve_unkeyed_placeholder;
 use buck2_analysis::attrs::resolve::ctx::AnalysisQueryResult;
@@ -23,6 +24,7 @@ use buck2_analysis::attrs::resolve::ctx::AttrResolutionContext;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::FrozenCommandLineArg;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
+use buck2_build_api::interpreter::rule_defs::provider::dependency::DependencyData;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
@@ -116,6 +118,27 @@ impl<'v, 'a, 'e, 'c> AttrResolutionContext<'v> for LazyAttrResolutionContext<'v,
                 e
             )),
         }
+    }
+
+    fn get_dep_direct_deps(
+        &mut self,
+        target: &ConfiguredProvidersLabel,
+    ) -> buck2_error::Result<Arc<[DependencyData]>> {
+        let direct_deps = self.ctx.via_dice(self.eval, |ctx| {
+            ctx.via(|dice_ctx| {
+                get_dep_analysis(self.configured_node.as_ref(), dice_ctx).boxed_local()
+            })
+        })?;
+        get_direct_deps_from_analysis_results(&direct_deps)?
+            .get(target.target())
+            .cloned()
+            .ok_or_else(|| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Bxl,
+                    "Error getting direct dependencies for `{}`",
+                    target,
+                )
+            })
     }
 
     fn resolve_unkeyed_placeholder(

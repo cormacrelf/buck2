@@ -42,7 +42,6 @@ fn dependency_creator(builder: &mut GlobalsBuilder) {
             }
         };
         let collection = FrozenProviderCollection::testing_new_default(eval.frozen_heap());
-
         Ok(Dependency::new(eval.heap(), label, collection, None))
     }
 }
@@ -66,6 +65,8 @@ fn dependency_works() -> buck2_error::Result<()> {
             assert_eq_ignore_hash(expect, repr(frozen))
             assert_eq({}, frozen[DefaultInfo].sub_targets)
             assert_eq(["baz"], frozen.label.sub_target)
+
+            assert_eq([], frozen.deps)
         "#
     ))?;
     Ok(())

@@ -21,6 +21,7 @@ use buck2_analysis::analysis::calculation::AnalysisWithExtraData;
 use buck2_analysis::analysis::calculation::AnonTargetSplitData;
 use buck2_analysis::analysis::calculation::get_rule_spec;
 use buck2_analysis::analysis::env::RuleSpec;
+use buck2_analysis::analysis::env::dep_data_from_analysis_results;
 use buck2_analysis::analysis::env::transitive_validations;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::analysis::AnalysisResult;
@@ -501,6 +502,8 @@ impl AnonTargetKey {
         cancellation: &CancellationContext,
     ) -> buck2_error::Result<(AnalysisResult, Option<AnalysisSplitInstants>)> {
         let validations_from_deps = dependents_analyses.validations();
+        let direct_deps =
+            dep_data_from_analysis_results(&dependents_analyses.dep_analysis_results)?;
         let rule_impl = get_rule_spec(dice, self.0.rule_type()).await?;
 
         let eval_kind = self.0.dupe().eval_kind();
@@ -599,7 +602,8 @@ impl AnonTargetKey {
                         num_declared_actions,
                         num_declared_artifacts,
                         validations,
-                    ),
+                    )
+                    .with_direct_deps(Arc::from(direct_deps)),
                     split_instants,
                 ),
             ))

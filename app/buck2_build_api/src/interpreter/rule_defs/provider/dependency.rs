@@ -12,6 +12,7 @@ use std::fmt;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::mem;
+use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
@@ -19,6 +20,7 @@ use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::provider::label::ProviderName;
 use buck2_error::BuckErrorContext;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
+use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
 use starlark::environment::GlobalsBuilder;
@@ -26,6 +28,8 @@ use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::typing::Ty;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
+use starlark::values::Freezer;
 use starlark::values::FrozenValue;
 use starlark::values::FrozenValueTyped;
 use starlark::values::Heap;
@@ -43,6 +47,7 @@ use starlark::values::starlark_value;
 use starlark_map::StarlarkHasher;
 
 use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
+use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use crate::interpreter::rule_defs::provider::execution_platform::StarlarkExecutionPlatformResolution;
 use crate::interpreter::rule_defs::provider::ty::abstract_provider::AbstractProvider;
 
@@ -53,6 +58,28 @@ enum DependencyError {
     UnknownSubtarget(String),
 }
 
+/// The resolved data needed to materialize a direct dependency in a Starlark heap.
+#[derive(Debug, Clone, Allocative)]
+pub struct DependencyData {
+    label: ConfiguredProvidersLabel,
+    providers: FrozenProviderCollectionValue,
+    direct_deps: Arc<[DependencyData]>,
+}
+
+impl DependencyData {
+    pub fn new(
+        label: ConfiguredProvidersLabel,
+        providers: FrozenProviderCollectionValue,
+        direct_deps: Arc<[DependencyData]>,
+    ) -> Self {
+        Self {
+            label,
+            providers,
+            direct_deps,
+        }
+    }
+}
+
 /// Wraps a dependency's `ProvidersLabel` and the result of analysis together for users' rule implementation functions
 ///
 /// From Starlark, the label is accessible with `.label`, and providers from the underlying
@@ -61,7 +88,6 @@ enum DependencyError {
     Debug,
     Trace,
     Coerce,
-    Freeze,
     ProvidesStaticType,
     NoSerialize,
     Allocative,
@@ -73,6 +99,10 @@ pub struct DependencyGen<V: ValueLifetimeless> {
     provider_collection: FrozenValueTyped<'static, FrozenProviderCollection>,
     // This could be `Option<...>`, but that breaks `Coerce`.
     execution_platform: ValueOfUncheckedGeneric<V, NoneOr<StarlarkExecutionPlatformResolution>>,
+    #[trace(unsafe_ignore)]
+    #[allocative(skip)]
+    #[starlark_pagable(skip = "Arc::default()")]
+    direct_deps: Arc<[DependencyData]>,
 }
 
 starlark_complex_value!(pub Dependency);
@@ -98,6 +128,22 @@ impl<'v> Dependency<'v> {
         provider_collection: FrozenValueTyped<'v, FrozenProviderCollection>,
         execution_platform: Option<&ExecutionPlatformResolution>,
     ) -> Self {
+        Self::new_with_direct_deps(
+            heap,
+            label,
+            provider_collection,
+            execution_platform,
+            Arc::default(),
+        )
+    }
+
+    pub fn new_with_direct_deps(
+        heap: Heap<'v>,
+        label: ConfiguredProvidersLabel,
+        provider_collection: FrozenValueTyped<'v, FrozenProviderCollection>,
+        execution_platform: Option<&ExecutionPlatformResolution>,
+        direct_deps: Arc<[DependencyData]>,
+    ) -> Self {
         let execution_platform: ValueOfUnchecked<NoneOr<StarlarkExecutionPlatformResolution>> =
             match execution_platform {
                 Some(e) => ValueOfUnchecked::new(
@@ -114,6 +160,7 @@ impl<'v> Dependency<'v> {
                 >(provider_collection)
             },
             execution_platform,
+            direct_deps,
         }
     }
 
@@ -124,6 +171,19 @@ impl<'v> Dependency<'v> {
             NoneOr::None => Ok(None),
             NoneOr::Other(e) => Ok(Some(&e.0)),
         }
+    }
+}
+
+impl<'v> Freeze for DependencyGen<Value<'v>> {
+    type Frozen = DependencyGen<FrozenValue>;
+
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(DependencyGen {
+            label: self.label.freeze(freezer)?,
+            provider_collection: self.provider_collection,
+            execution_platform: self.execution_platform.freeze(freezer)?,
+            direct_deps: self.direct_deps,
+        })
     }
 }
 
@@ -222,6 +282,25 @@ fn dependency_methods(builder: &mut MethodsBuilder) {
             .providers
             .values()
             .copied()
+            .collect())
+    }
+
+    /// The immediate dependencies of this target. Accessing them does not perform
+    /// a query or graph lookup.
+    #[starlark(attribute)]
+    fn deps<'v>(this: &Dependency<'v>, heap: Heap<'v>) -> starlark::Result<Vec<Dependency<'v>>> {
+        Ok(this
+            .direct_deps
+            .iter()
+            .map(|dep| {
+                Dependency::new_with_direct_deps(
+                    heap,
+                    dep.label.dupe(),
+                    dep.providers.add_heap_ref(heap),
+                    None,
+                    dep.direct_deps.dupe(),
+                )
+            })
             .collect())
     }
 

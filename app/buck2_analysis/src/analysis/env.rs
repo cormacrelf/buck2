@@ -22,11 +22,13 @@ use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProvide
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValueRef;
 use buck2_build_api::interpreter::rule_defs::provider::collection::ProviderCollection;
+use buck2_build_api::interpreter::rule_defs::provider::dependency::DependencyData;
 use buck2_build_api::validation::transitive_validations::TransitiveValidations;
 use buck2_build_api::validation::transitive_validations::TransitiveValidationsData;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
+use buck2_core::provider::label::ProvidersName;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_core::unsafe_send_future::UnsafeSendFuture;
 use buck2_error::BuckErrorContext;
@@ -80,6 +82,7 @@ enum AnalysisError {
 pub struct RuleAnalysisAttrResolutionContext<'a, 'v> {
     pub module: &'a Module<'v>,
     pub dep_analysis_results: StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
+    pub dep_direct_deps: StdBuckHashMap<ConfiguredTargetLabel, Arc<[DependencyData]>>,
     pub query_results: StdBuckHashMap<String, Arc<AnalysisQueryResult>>,
     pub execution_platform_resolution: ExecutionPlatformResolution,
 }
@@ -94,6 +97,16 @@ impl<'a, 'v> AttrResolutionContext<'v> for &'_ RuleAnalysisAttrResolutionContext
         target: &ConfiguredProvidersLabel,
     ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenProviderCollection>> {
         get_dep(&self.dep_analysis_results, target, self.module)
+    }
+
+    fn get_dep_direct_deps(
+        &mut self,
+        target: &ConfiguredProvidersLabel,
+    ) -> buck2_error::Result<Arc<[DependencyData]>> {
+        self.dep_direct_deps
+            .get(target.target())
+            .cloned()
+            .ok_or_else(|| AnalysisError::MissingDep(target.dupe()).into())
     }
 
     fn resolve_unkeyed_placeholder(
@@ -224,6 +237,36 @@ pub fn get_deps_from_analysis_results(
         .collect::<buck2_error::Result<StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>>>()
 }
 
+/// Build the `DependencyData` for each of `results` — one per dependency, each
+/// carrying that dependency's own direct deps. Used to populate a node's
+/// `AnalysisResult::direct_deps`.
+pub fn dep_data_from_analysis_results(
+    results: &[(&ConfiguredTargetLabel, AnalysisResult)],
+) -> buck2_error::Result<Vec<DependencyData>> {
+    results
+        .iter()
+        .map(|(label, result)| {
+            Ok(DependencyData::new(
+                ConfiguredProvidersLabel::new((*label).dupe(), ProvidersName::Default),
+                result.providers()?.to_owned(),
+                result.direct_deps.dupe(),
+            ))
+        })
+        .collect()
+}
+
+/// Map each dependency in `results` to *its* direct deps (children), so that
+/// resolving an `attrs.dep()` can attach the target's children to the resulting
+/// `Dependency` for `Dependency.deps`.
+pub fn get_direct_deps_from_analysis_results(
+    results: &[(&ConfiguredTargetLabel, AnalysisResult)],
+) -> buck2_error::Result<StdBuckHashMap<ConfiguredTargetLabel, Arc<[DependencyData]>>> {
+    Ok(results
+        .iter()
+        .map(|(label, result)| ((*label).dupe(), result.direct_deps.dupe()))
+        .collect())
+}
+
 // Used to express that the impl Future below captures multiple named lifetimes.
 // See https://github.com/rust-lang/rust/issues/34511#issuecomment-373423999 for more details.
 trait Captures<'x> {}
@@ -260,10 +303,12 @@ async fn run_analysis_with_env_underlying(
             .collect::<SmallMap<_, _>>();
 
         let (attributes, plugins) = {
-            let dep_analysis_results = get_deps_from_analysis_results(analysis_env.deps)?;
+            let dep_analysis_results = get_deps_from_analysis_results(analysis_env.deps.clone())?;
+            let dep_direct_deps = get_direct_deps_from_analysis_results(&analysis_env.deps)?;
             let resolution_ctx = RuleAnalysisAttrResolutionContext {
                 module: &env,
                 dep_analysis_results,
+                dep_direct_deps,
                 query_results: analysis_env.query_results,
                 execution_platform_resolution: node.execution_platform_resolution().clone(),
             };
@@ -343,6 +388,7 @@ async fn run_analysis_with_env_underlying(
             validations_from_deps,
             recorded_values.provider_collection()?,
         );
+        let direct_deps = dep_data_from_analysis_results(&analysis_env.deps)?;
 
         Ok((
             token,
@@ -354,7 +400,8 @@ async fn run_analysis_with_env_underlying(
                     declared_actions,
                     declared_artifacts,
                     validations,
-                ),
+                )
+                .with_direct_deps(Arc::from(direct_deps)),
                 split_instants,
             ),
         ))

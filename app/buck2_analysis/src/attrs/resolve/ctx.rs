@@ -14,6 +14,7 @@ use allocative::Allocative;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::FrozenCommandLineArg;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
+use buck2_build_api::interpreter::rule_defs::provider::dependency::DependencyData;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
@@ -48,6 +49,11 @@ pub trait AttrResolutionContext<'v> {
         &mut self,
         target: &ConfiguredProvidersLabel,
     ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenProviderCollection>>;
+
+    fn get_dep_direct_deps(
+        &mut self,
+        target: &ConfiguredProvidersLabel,
+    ) -> buck2_error::Result<Arc<[DependencyData]>>;
 
     fn resolve_unkeyed_placeholder(
         &mut self,

@@ -103,6 +103,7 @@ impl DepAttrTypeExt for DepAttrType {
         is_exec_dep: bool,
     ) -> buck2_error::Result<Value<'v>> {
         let provider_collection = ctx.get_dep(target)?;
+        let direct_deps = ctx.get_dep_direct_deps(target)?;
         Self::check_providers(required_providers, provider_collection.as_ref(), target)?;
         let execution_platform_resolution = if is_exec_dep {
             Some(ctx.execution_platform_resolution())
@@ -110,12 +111,16 @@ impl DepAttrTypeExt for DepAttrType {
             None
         };
 
-        Ok(Self::alloc_dependency(
-            ctx.starlark_module(),
-            target,
-            provider_collection,
-            execution_platform_resolution,
-        ))
+        Ok(ctx
+            .starlark_module()
+            .heap()
+            .alloc(Dependency::new_with_direct_deps(
+                ctx.starlark_module().heap(),
+                target.clone(),
+                provider_collection,
+                execution_platform_resolution,
+                direct_deps,
+            )))
     }
 
     fn resolve_single<'v>(

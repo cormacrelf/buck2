@@ -18,6 +18,7 @@ use std::sync::Arc;
 use allocative::Allocative;
 use buck2_analysis::analysis::env::RuleAnalysisAttrResolutionContext;
 use buck2_analysis::analysis::env::get_deps_from_analysis_results;
+use buck2_analysis::analysis::env::get_direct_deps_from_analysis_results;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::anon_target::AnonTargetDependentAnalysisResults;
 use buck2_build_api::anon_target::AnonTargetDyn;
@@ -199,12 +200,15 @@ impl AnonTargetDyn for AnonTarget {
         exec_resolution: ExecutionPlatformResolution,
     ) -> buck2_error::Result<ValueOfUncheckedGeneric<Value<'v>, StructRef<'static>>> {
         let dep_analysis_results =
-            get_deps_from_analysis_results(dependents_analyses.dep_analysis_results)?;
+            get_deps_from_analysis_results(dependents_analyses.dep_analysis_results.clone())?;
+        let dep_direct_deps =
+            get_direct_deps_from_analysis_results(&dependents_analyses.dep_analysis_results)?;
 
         // No attributes are allowed to contain macros or other stuff, so an empty resolution context works
         let rule_analysis_attr_resolution_ctx = RuleAnalysisAttrResolutionContext {
             module: env,
             dep_analysis_results,
+            dep_direct_deps,
             query_results: StdBuckHashMap::default(),
             execution_platform_resolution: exec_resolution,
         };

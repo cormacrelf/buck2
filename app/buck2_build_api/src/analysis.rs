@@ -32,6 +32,7 @@ use dupe::Dupe;
 
 use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValueRef;
+use crate::interpreter::rule_defs::provider::dependency::DependencyData;
 use crate::validation::transitive_validations::TransitiveValidations;
 
 #[derive(Debug, Clone, Dupe, Allocative, pagable::Pagable)]
@@ -47,6 +48,9 @@ pub struct AnalysisResult {
     pub num_declared_artifacts: u64,
     /// `None` means there are no `ValidationInfo` providers in transitive dependencies.
     pub validations: Option<TransitiveValidations>,
+    /// Immediate dependencies retained for `Dependency.deps`.
+    #[pagable(discard = "Arc::default()")]
+    pub direct_deps: Arc<[DependencyData]>,
 }
 
 impl AnalysisResult {
@@ -66,7 +70,13 @@ impl AnalysisResult {
             num_declared_actions,
             num_declared_artifacts,
             validations,
+            direct_deps: Arc::default(),
         }
+    }
+
+    pub fn with_direct_deps(mut self, direct_deps: Arc<[DependencyData]>) -> Self {
+        self.direct_deps = direct_deps;
+        self
     }
 
     pub fn providers(&self) -> buck2_error::Result<FrozenProviderCollectionValueRef<'_>> {

@@ -229,6 +229,15 @@ pub(crate) fn resolution_ctx_with_providers<'v>(
                 .add_heap_ref(self.module.heap()))
         }
 
+        fn get_dep_direct_deps(
+            &mut self,
+            _target: &ConfiguredProvidersLabel,
+        ) -> buck2_error::Result<
+            Arc<[buck2_build_api::interpreter::rule_defs::provider::dependency::DependencyData]>,
+        > {
+            Ok(Arc::default())
+        }
+
         fn resolve_unkeyed_placeholder(
             &mut self,
             name: &str,
