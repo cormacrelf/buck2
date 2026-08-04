@@ -135,15 +135,7 @@ def cpp_unittest(
     )
 
 def cpp_binary(
-    name,
-    deps = [],
-    external_deps = [],
-    visibility = ["PUBLIC"],
-    dlopen_enabled = None,
-    compiler_specific_flags = None,
-    allocator = None,
-    modules = None,
-    **kwargs,
+    name, deps = [], external_deps = [], visibility = ["PUBLIC"], dlopen_enabled = None, compiler_specific_flags = None, allocator = None, modules = None, **kwargs
 ):
     _unused = (dlopen_enabled, compiler_specific_flags, allocator, modules)  # @unused
     prelude.cxx_binary(name = name, deps = _fix_deps(deps + external_deps_to_targets(external_deps)), visibility = visibility, **kwargs)
@@ -219,6 +211,9 @@ def rust_library(
     named_deps = None,
     mapped_srcs = {},
     resources = {},
+    test_deps = None,
+    test_env = None,
+    unittests = None,
     visibility = ["PUBLIC"],
     **kwargs,
 ):
@@ -240,6 +235,30 @@ def rust_library(
         resources = resources,
         **_drop_fbcode_only_rust_attrs(kwargs),
     )
+
+    # The in-crate `#[cfg(test)] mod tests` of a `rust_library` are only reachable
+    # through a `--test` compilation of the same crate, which is a separate rule.
+    # Without this, `buck2 test` on a library builds its doctests and nothing else,
+    # and every unit test in the repo is cargo-only.
+    if unittests != False and not kwargs.get("proc_macro", False):
+        prelude.rust_test(
+            name = name + "-unittest",
+            edition = edition or _default_rust_edition(),
+            rustc_flags = rustc_flags + [_CFG_BUCK_BUILD],
+            deps = deps + _fix_deps(test_deps or []),
+            env = test_env or {},
+            visibility = visibility,
+            mapped_srcs = mapped_srcs,
+            resources = resources,
+            **{
+                # `rust_test` shares most of `rust_library`'s attributes, but not
+                # all of them: `proc_macro`, `doctests` and `doc_deps` are
+                # library-only, and passing them through is an error.
+                k: v
+                for k, v in kwargs.items()
+                if k in _RUST_UNITTEST_KWARGS
+            },
+        )
 
 def rust_binary(name, edition = None, rustc_flags = [], deps = [], resources = {}, visibility = ["PUBLIC"], **kwargs):
     deps = _fix_deps(deps)
@@ -281,7 +300,8 @@ def rust_protobuf_library(
     build_env = None,
     proto_srcs = None,
     crate_name = None,
-):  # Use a proto_srcs() target, path is exposed as BUCK_PROTO_SRCS.
+):
+    # Use a proto_srcs() target, path is exposed as BUCK_PROTO_SRCS.
     _rust_protobuf_library(
         name,
         srcs,
@@ -320,7 +340,8 @@ def _rust_protobuf_library(
     build_env,
     proto_srcs,
     crate_name,
-):  # Use a proto_srcs() target, path is exposed as BUCK_PROTO_SRCS.
+):
+    # Use a proto_srcs() target, path is exposed as BUCK_PROTO_SRCS.
     versioned_prost_target = {
         "0.14": "prost",
     }[prost_version]
@@ -358,7 +379,7 @@ def _rust_protobuf_library(
     new_deps = [
         {
             "0.14": "fbsource//third-party/rust:prost",
-        }[prost_version]
+        }[prost_version],
     ] + (deps or [])
 
     rust_library(
@@ -404,6 +425,19 @@ def ocaml_binary(name, deps = [], visibility = ["PUBLIC"], **kwargs):
     prelude.ocaml_binary(name = name, deps = deps, visibility = visibility, **kwargs)
 
 _CFG_BUCK_BUILD = "--cfg=buck_build"
+
+# `rust_library` attributes that also exist on `rust_test`, and so can be passed
+# through to the generated `-unittest` target.
+_RUST_UNITTEST_KWARGS = [
+    "compatible_with",
+    "crate",
+    "crate_root",
+    "features",
+    "labels",
+    "modifiers",
+    "srcs",
+    "target_compatible_with",
+]
 
 def _maybe_select_map(v, mapper):
     if is_select(v):
