@@ -31,3 +31,13 @@ class ImplicitImportsTest(BuckTestCase):
             buck.targets("//...", "-c", f"buildfile.includes=//{data_file}"),
             stderr_regex=rf"Implicit import `root//{data_file}` is not a `\.bzl` file",
         )
+
+    @buck_test()
+    async def test_format_hint_on_include_is_rejected(self, buck: Buck) -> None:
+        # `?as=` belongs to `load()`. An implicit import is always evaluated as
+        # Starlark, so a hint there must not be honoured or ignored silently: the
+        # path, hint and all, is rejected as an import path.
+        await expect_failure(
+            buck.targets("//...", "-c", "buildfile.includes=//data.lock?as=toml"),
+            stderr_regex=r"Invalid import path `root//data\.lock\?as=toml`",
+        )
