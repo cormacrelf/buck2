@@ -45,6 +45,8 @@ load("//path/to/file:name.bzl", alias1="symbol1", alias2="symbol2")
   - Absolute to cell: `//package/path:file.bzl`
   - Relative to package: `:file.bzl`
   - From external cell: `@cell//package/path:file.bzl`
+  - In a subdirectory of the package (as in Bazel): `//package/path:sub/file.bzl`
+    or `:sub/file.bzl`, which name the same file as `//package/path/sub:file.bzl`
 
 - **Symbols** (required): One or more symbols to import from the specified file.
   These can be:

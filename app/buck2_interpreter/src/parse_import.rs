@@ -17,7 +17,7 @@ use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::cell_path_with_allowed_relative_dir::CellPathWithAllowedRelativeDir;
 use buck2_core::pattern::parse_package::parse_cell_path;
 use buck2_fs::paths::RelativePath;
-use buck2_fs::paths::file_name::FileName;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 
 #[derive(buck2_error::Error, Debug)]
 #[buck2(input)]
@@ -37,7 +37,7 @@ enum ImportParseError {
     )]
     CellAliasMissingAtSymbol { import: String, suggestion: String },
     #[error(
-        "Unable to parse import spec. Expected format `(@<cell>)//package/name:filename.bzl` or `:filename.bzl`, but got a path. Got `{0}`"
+        "Unable to parse import spec. Expected format `(@<cell>)//package/name:path/to/filename.bzl` or `:path/to/filename.bzl`, but the part after `:` is not a normalized relative path. Got `{0}`"
     )]
     NotAFileName(String),
 }
@@ -127,7 +127,9 @@ pub fn parse_import_with_config(
                 return Err(ImportParseError::EmptyFileName(import.to_owned()).into());
             }
 
-            let filename = FileName::new(filename)
+            // As in Bazel, the part after `:` may be a path within the package,
+            // e.g. `//pkg:sub/defs.bzl`.
+            let filename = ForwardRelativePath::new(filename)
                 .map_err(|_| ImportParseError::NotAFileName(import.to_owned()))?;
 
             if path.is_empty() {
@@ -235,6 +237,39 @@ mod tests {
                 ":import.bzl"
             )?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn path_after_colon() -> buck2_error::Result<()> {
+        let current_dir =
+            CellPathWithAllowedRelativeDir::new(CellPath::testing_new("cell1//package"), None);
+        let relative = || RelativeImports::Allow {
+            current_dir_with_allowed_relative: &current_dir,
+        };
+        assert_eq!(
+            path("cell1//package/path/import.bzl"),
+            parse_import(&resolver(), relative(), "@cell1//package:path/import.bzl")?
+        );
+        assert_eq!(
+            path("cell1//package/path/import.bzl"),
+            parse_import(&resolver(), relative(), ":path/import.bzl")?
+        );
+        for import in [
+            "//package:../import.bzl",
+            "//package:./import.bzl",
+            "//package:path//import.bzl",
+            "//package:/import.bzl",
+            "//package:path/",
+        ] {
+            match parse_import(&resolver(), relative(), import) {
+                Ok(p) => panic!("Expected parse failure for {import}, got result {p}"),
+                Err(e) => assert_eq!(
+                    format!("{e:#}"),
+                    ImportParseError::NotAFileName(import.to_owned()).to_string()
+                ),
+            }
+        }
         Ok(())
     }
 
