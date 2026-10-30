@@ -3,8 +3,6 @@ name = "buck2-third-party-deps"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "pytest",
-    "pytest-asyncio",
     "decorator",
     "psutil",
     "aiohttp",
