@@ -15,10 +15,14 @@ def _package(
     _values,
     # starlark-lint-disable unused-argument
     overwrite = False,
-):  # @unused
+):
+    # @unused
     pass
 
 def _labels(*args):
+    return []
+
+def _remove_labels(*_args):
     return []
 
 ci = struct(
@@ -33,4 +37,5 @@ ci = struct(
     remove = _lbl,
     labels = _labels,
     modifiers = _lbl,
+    remove_labels = _remove_labels,
 )

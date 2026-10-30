@@ -32,6 +32,7 @@ use starlark::environment::Globals;
 
 use crate::interpreter::configuror::BuildInterpreterConfiguror;
 use crate::interpreter::context::HasInterpreterContext;
+use crate::interpreter::functions::load_visibility::HasCheckLoadVisibility;
 use crate::interpreter::globals::base_globals;
 use crate::interpreter::load_data::LOAD_AS_ALLOWLIST;
 use crate::interpreter::load_data::LoadAsAllowlist;
@@ -51,6 +52,9 @@ pub struct GlobalInterpreterState {
     /// Interpreter Configurer
     pub configuror: Arc<BuildInterpreterConfiguror>,
 
+    /// Whether to enforce load visibility declared via `visibility()`.
+    pub check_load_visibility: bool,
+
     /// Check types in Starlark (or just parse and ignore).
     pub disable_starlark_types: bool,
 
@@ -65,6 +69,7 @@ impl GlobalInterpreterState {
     pub fn new(
         cell_resolver: CellResolver,
         interpreter_configuror: Arc<BuildInterpreterConfiguror>,
+        check_load_visibility: bool,
         disable_starlark_types: bool,
         unstable_typecheck: bool,
         load_as_allowlist: LoadAsAllowlist,
@@ -83,6 +88,7 @@ impl GlobalInterpreterState {
             cell_resolver,
             global_env,
             configuror: interpreter_configuror,
+            check_load_visibility,
             disable_starlark_types,
             unstable_typecheck,
             load_as_allowlist,
@@ -135,6 +141,7 @@ impl<'d> HasGlobalInterpreterState<'d> for DiceComputations<'d> {
             ) -> Self::Value {
                 let interpreter_configuror = ctx.get_interpreter_configuror().await?.dupe();
                 let cell_resolver = ctx.get_cell_resolver().await?.dupe();
+                let check_load_visibility = ctx.get_check_load_visibility().await?;
                 let disable_starlark_types = ctx.get_disable_starlark_types().await?;
                 let unstable_typecheck = ctx.get_unstable_typecheck().await?;
 
@@ -149,6 +156,7 @@ impl<'d> HasGlobalInterpreterState<'d> for DiceComputations<'d> {
                 Ok(Arc::new(GlobalInterpreterState::new(
                     cell_resolver,
                     interpreter_configuror,
+                    check_load_visibility,
                     disable_starlark_types,
                     unstable_typecheck,
                     load_as_allowlist,

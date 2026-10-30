@@ -231,3 +231,16 @@ def _swap_root_dir_for_path(path: str, root_dir: str, new_root_dir) -> str:
         suffix = "/" + suffix
     replace_path = new_root_dir.removesuffix("/") + suffix
     return replace_path.removeprefix("/")
+
+# `oss.python_module_prefix` is prepended to default `base_module` in python
+# rules, so that source files keep the same dotted import path they have inside
+# the internal monorepo (e.g. `fbcode/buck2/tests/foo.py` is imported as
+# `buck2.tests.foo`, but in OSS the package_name is `tests/foo` and would
+# otherwise be `tests.foo`). Read at macro time, not at the top level, so it
+# comes from the build file's cell.
+def default_base_module():
+    prefix = read_config("oss", "python_module_prefix", "")
+    pkg = native.package_name().replace("/", ".")
+    if prefix:
+        return prefix + "." + pkg if pkg else prefix
+    return pkg

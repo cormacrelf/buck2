@@ -1,0 +1,10 @@
+# Same-package loads: always allowed, including the private `priv.bzl`.
+
+# `lib/sub` has no buildfile, so `helper.bzl` is in package `//lib` and can be
+# named as such (Bazel style); this is also a same-package load.
+load("//lib:sub/helper.bzl", "HSYM")
+load(":default.bzl", "DSYM")
+load(":priv.bzl", "PRIVSYM")
+load(":vis.bzl", "SYM")
+
+_all = (PRIVSYM, SYM, DSYM, HSYM)

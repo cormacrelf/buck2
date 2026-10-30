@@ -1,0 +1,2 @@
+# Uses a symbol injected by `buildfile.includes`.
+_ = INCLUDED

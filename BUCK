@@ -42,6 +42,7 @@ pagable_transition_alias(
         ),
     ),
     modifiers = buck2_modifiers(),
+    visibility = ["PUBLIC"],
 )
 
 buck2_bundle(

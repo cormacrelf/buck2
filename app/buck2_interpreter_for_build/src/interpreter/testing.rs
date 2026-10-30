@@ -54,6 +54,7 @@ use crate::interpreter::cell_info::InterpreterCellInfo;
 use crate::interpreter::configuror::AdditionalGlobalsFn;
 use crate::interpreter::configuror::AdditionalGlobalsFnDyn;
 use crate::interpreter::configuror::BuildInterpreterConfiguror;
+use crate::interpreter::functions::load_visibility::GetCheckLoadVisibility;
 
 #[derive(Allocative, PagablePanic)] // test only
 struct FnWrapper(#[allocative(skip)] Box<dyn Fn(&mut GlobalsBuilder) + Sync + Send + 'static>);
@@ -236,6 +237,7 @@ impl Tester {
                         },
                     ))))),
                 )?,
+                (&self.root_config).get_check_load_visibility()?,
                 false,
                 true,
                 LoadAsAllowlist::new(
