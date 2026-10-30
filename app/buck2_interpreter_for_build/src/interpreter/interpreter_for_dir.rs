@@ -92,6 +92,22 @@ enum StarlarkPeakMemoryError {
     ExceedsThreshold(BuildFilePath, HumanizedBytes, HumanizedBytes, String),
 }
 
+#[derive(Debug, buck2_error::Error)]
+#[error(
+    "Implicit import `{0}` is not a `.bzl` file. `buildfile.includes`, `buildfile.package_includes` and the prelude inject a module's symbols into build files, which only a `.bzl` file can provide"
+)]
+#[buck2(input)]
+struct ImplicitImportNotBzl(ImportPath);
+
+/// Implicit imports are always evaluated as Starlark, so anything that isn't a
+/// `.bzl` file would otherwise be parsed as Starlark whatever its extension.
+fn implicit_load_file(import: ImportPath) -> buck2_error::Result<OwnedStarlarkModulePath> {
+    if import.path().path().extension() != Some("bzl") {
+        return Err(ImplicitImportNotBzl(import).into());
+    }
+    Ok(OwnedStarlarkModulePath::LoadFile(import))
+}
+
 /// A ParseData includes the parsed AST and a list of the imported files.
 ///
 /// The imports are under a separate Arc so that that can be shared with
@@ -464,19 +480,30 @@ impl InterpreterForDir {
                 ))));
             }
         };
+        let implicit_imports = match self.implicit_imports(import) {
+            Ok(implicit_imports) => implicit_imports,
+            Err(e) => return Ok(Err(e)),
+        };
+        ParseData::new(ast, implicit_imports, &self.load_resolver(import)).map(Ok)
+    }
+
+    fn implicit_imports(
+        &self,
+        import: StarlarkPath,
+    ) -> buck2_error::Result<Vec<OwnedStarlarkModulePath>> {
         let mut implicit_imports = Vec::new();
         if let Some(i) = self.prelude_import(import) {
-            implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i.import_path().clone()));
+            implicit_imports.push(implicit_load_file(i.import_path().clone())?);
         }
         if let StarlarkPath::BuildFile(build_file) = import {
             if let Some(i) = self.package_import(build_file) {
-                implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i.import().clone()));
+                implicit_imports.push(implicit_load_file(i.import().clone())?);
             }
             if let Some(i) = self.root_import() {
-                implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i));
+                implicit_imports.push(implicit_load_file(i)?);
             }
         }
-        ParseData::new(ast, implicit_imports, &self.load_resolver(import)).map(Ok)
+        Ok(implicit_imports)
     }
 
     pub(crate) fn resolve_path(
