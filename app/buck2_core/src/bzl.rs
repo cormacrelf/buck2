@@ -91,6 +91,12 @@ pub struct ImportPath {
     path: CellPath,
     /// The cell of the top-level build module that this is being loaded
     /// (perhaps transitively) into.
+    ///
+    /// This segments import paths such that each .bzl file is parsed once per importing cell.
+    ///
+    /// This may, if `cell_segmentation` is `false`, be overridden to match `path.cell()`.
+    /// This negates the segmentation. All cells resolve a given load() path to the
+    /// same ImportPath. Hence Buck parses each .bzl file once globally.
     build_file_cell: BuildFileCell,
     /// How the file is parsed, from an `?as=` hint or from the extension. Part
     /// of the path's identity, so the module type is never re-guessed.
@@ -107,14 +113,15 @@ impl ImportPath {
     /// This function is for call sites where we don't care about the build file cell.
     pub fn new_same_cell(path: CellPath) -> buck2_error::Result<Self> {
         let build_file_cell = BuildFileCell::new(path.cell());
-        Self::new_with_build_file_cells(path, build_file_cell)
+        Self::new_with_build_file_cells(path, build_file_cell, false)
     }
 
     pub fn new_with_build_file_cells(
         path: CellPath,
         build_file_cell: BuildFileCell,
+        cell_segmentation: bool,
     ) -> buck2_error::Result<Self> {
-        Self::new_normalized(path, build_file_cell, None)
+        Self::new_normalized(path, build_file_cell, cell_segmentation, None)
     }
 
     /// Create an ImportPath for a file with an explicit format override (e.g. `?as=toml`).
@@ -125,16 +132,18 @@ impl ImportPath {
     pub fn new_with_explicit_format(
         path: CellPath,
         build_file_cell: BuildFileCell,
+        cell_segmentation: bool,
         format: ImportFormat,
     ) -> buck2_error::Result<Self> {
-        Self::new_normalized(path, build_file_cell, Some(format))
+        Self::new_normalized(path, build_file_cell, cell_segmentation, Some(format))
     }
 
     /// The one constructor. `build_file_cell` and `format` are normalized here,
     /// so one file loaded one way is one `ImportPath` however it was spelled.
     fn new_normalized(
         path: CellPath,
-        build_file_cell: BuildFileCell,
+        mut build_file_cell: BuildFileCell,
+        cell_segmentation: bool,
         format: Option<ImportFormat>,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
@@ -151,6 +160,10 @@ impl ImportPath {
             return Err(ImportPathError::Suffix(path).into());
         };
 
+        if !cell_segmentation {
+            build_file_cell = BuildFileCell::new(path.cell());
+        }
+
         Ok(Self {
             path,
             build_file_cell,
@@ -163,8 +176,14 @@ impl ImportPath {
     pub fn new_hack_for_lsp(
         path: CellPath,
         build_file_cell: BuildFileCell,
+        cell_segmentation: bool,
     ) -> buck2_error::Result<Self> {
-        Self::new_normalized(path, build_file_cell, Some(ImportFormat::Bzl))
+        Self::new_normalized(
+            path,
+            build_file_cell,
+            cell_segmentation,
+            Some(ImportFormat::Bzl),
+        )
     }
 
     pub fn testing_new(path: &str) -> Self {
@@ -173,7 +192,7 @@ impl ImportPath {
         Self::testing_new_cross_cell(cell, cell_relative_path, filename, cell)
     }
 
-    pub fn testing_new_cross_cell(
+    fn testing_new_cross_cell(
         cell: &str,
         cell_relative_path: &str,
         filename: &str,
@@ -185,6 +204,9 @@ impl ImportPath {
         Self::new_with_build_file_cells(
             cell_path,
             BuildFileCell::new(CellName::testing_new(build_file_cell)),
+            // At the time of writing, no tests need this function,
+            // but if they did, they'd want cell_segmentation enabled.
+            true,
         )
         .unwrap()
     }
@@ -262,6 +284,7 @@ mod tests {
         ImportPath::new_with_build_file_cells(
             cell_path("root", filename),
             BuildFileCell::new(CellName::testing_new("root")),
+            true,
         )
     }
 
@@ -270,6 +293,7 @@ mod tests {
         ImportPath::new_with_explicit_format(
             cell_path("root", filename),
             BuildFileCell::new(CellName::testing_new("root")),
+            true,
             format,
         )
     }
@@ -318,6 +342,7 @@ mod tests {
             let lsp = ImportPath::new_hack_for_lsp(
                 cell_path("root", filename),
                 BuildFileCell::new(CellName::testing_new("root")),
+                true,
             )
             .unwrap();
             assert_eq!(ImportFormat::Bzl, lsp.format(), "{filename}");
@@ -370,6 +395,7 @@ mod tests {
         let cross_cell = ImportPath::new_with_explicit_format(
             cell_path("root", "Cargo.lock"),
             BuildFileCell::new(CellName::testing_new("other")),
+            true,
             ImportFormat::Toml,
         )
         .unwrap();
@@ -383,5 +409,34 @@ mod tests {
     #[test]
     fn a_path_containing_a_question_mark_is_still_rejected() {
         assert!(import_as("a.bzl?as=toml", ImportFormat::Toml).is_err());
+    }
+
+    #[test]
+    fn an_explicit_format_agrees_with_a_plain_load_on_the_build_file_cell() {
+        // With segmentation off, `build_file_cell` collapses to the path's own
+        // cell. An `?as=` load has to collapse it too, or one data file becomes a
+        // DICE node per importing cell while its plain-`load()` twin stays one.
+        let plain = ImportPath::new_with_build_file_cells(
+            cell_path("root", "a.toml"),
+            BuildFileCell::new(CellName::testing_new("other")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            CellName::testing_new("root"),
+            plain.build_file_cell().name()
+        );
+
+        let hinted = ImportPath::new_with_explicit_format(
+            cell_path("root", "a.lock"),
+            BuildFileCell::new(CellName::testing_new("other")),
+            false,
+            ImportFormat::Toml,
+        )
+        .unwrap();
+        assert_eq!(
+            plain.build_file_cell().name(),
+            hinted.build_file_cell().name()
+        );
     }
 }

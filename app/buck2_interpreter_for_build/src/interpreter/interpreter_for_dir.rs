@@ -171,6 +171,7 @@ struct InterpreterLoadResolver {
     config: Arc<InterpreterForDir>,
     loader_file_type: StarlarkFileType,
     build_file_cell: BuildFileCell,
+    cell_segmentation: bool,
 }
 
 #[derive(Debug, buck2_error::Error)]
@@ -261,15 +262,24 @@ impl LoadResolver for InterpreterLoadResolver {
             .configuror
             .prelude_import()
             .is_some_and(|prelude_import| prelude_import.is_prelude_path(&path));
-        let build_file_cell = if is_prelude {
-            BuildFileCell::new(path.cell())
+        let (build_file_cell, cell_segmentation) = if is_prelude {
+            // Segmentation off collapses the build file cell to the path's own,
+            // which is what makes the prelude a single copy.
+            (BuildFileCell::new(path.cell()), false)
         } else {
-            self.build_file_cell
+            (self.build_file_cell, self.cell_segmentation)
         };
 
         let import_path = match format_hint {
-            Some(format) => ImportPath::new_with_explicit_format(path, build_file_cell, format)?,
-            None => ImportPath::new_with_build_file_cells(path, build_file_cell)?,
+            Some(format) => ImportPath::new_with_explicit_format(
+                path,
+                build_file_cell,
+                cell_segmentation,
+                format,
+            )?,
+            None => {
+                ImportPath::new_with_build_file_cells(path, build_file_cell, cell_segmentation)?
+            }
         };
 
         // A format override needs `buck2.load_as_allowlist` permission. Asking the
@@ -426,6 +436,7 @@ impl InterpreterForDir {
             config: self.dupe(),
             loader_file_type: current_file_path.file_type(),
             build_file_cell: current_file_path.build_file_cell(),
+            cell_segmentation: self.implicit_import_paths.cell_segmentation,
         }
     }
 
