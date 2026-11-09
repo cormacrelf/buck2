@@ -92,10 +92,18 @@ class App:
             ).stdout
         )
         missing = table.pop("missing")
-        if missing:
-            # The new code calls a function that the running binary does not have, for
-            # example a generic function with new type arguments.
-            log("the patch uses %d functions the app does not have" % len(missing))
+        unexported = table.pop("unexported")
+        if missing or unexported:
+            # The new code uses a symbol that the running binary does not have, for example
+            # a generic function with new type arguments, or that it has but does not
+            # export. A new binary has the new code, so the app runs it after a restart.
+            if missing:
+                log("the patch uses %d symbols the app does not have" % len(missing))
+            if unexported:
+                log(
+                    "the patch uses symbols the app does not export: %s"
+                    % ", ".join(unexported)
+                )
             return False
         table["lib"] = lib
         self.process.stdin.write(json.dumps(table) + "\n")

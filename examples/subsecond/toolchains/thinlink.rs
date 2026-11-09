@@ -23,7 +23,9 @@
 //! proc macros.
 //!
 //! `thinlink jump-table EXE PATCH` prints the subsecond jump table for loading PATCH into a
-//! process that runs EXE, as JSON, with the `lib` field left out.
+//! process that runs EXE, as JSON, with the `lib` field left out. Two more fields name the
+//! symbols that PATCH needs and EXE cannot give it: `missing`, which EXE does not have, and
+//! `unexported`, which EXE has but does not export.
 //!
 //! It uses only `std`, so that Buck can build it with `rustc` alone: a `rust_binary` would need
 //! the toolchain that this program is part of.
@@ -64,25 +66,31 @@ fn link(args: Vec<String>) -> Result<ExitCode, Error> {
     if flag != "--driver" {
         return Err("usage: thinlink --driver DRIVER LINKER_ARGS...".into());
     }
-    let args = expand_response_files(rest)?;
     let mode = env::var("SUBSECOND_LINK").unwrap_or_default();
     let args = match mode.as_str() {
-        "fat" => fat_link_args(args)?,
-        "thin" => thin_link_args(args, driver)?,
-        "" => args,
+        "fat" => fat_link_args(expand_response_files(rest)?)?,
+        "thin" => thin_link_args(expand_response_files(rest)?, driver)?,
+        "" => return run(Command::new(driver).args(rest), driver),
         other => return Err(format!("unknown SUBSECOND_LINK `{other}`").into()),
     };
     // The arguments can be too long for one command line.
     let argsfile = scratch_dir()?.join("thinlink.args");
     fs::write(&argsfile, write_response_file(&args))?;
-    let status = Command::new(driver)
-        .arg(format!("@{}", argsfile.display()))
+    run(
+        Command::new(driver).arg(format!("@{}", argsfile.display())),
+        driver,
+    )
+}
+
+/// Run the driver, and exit as it did.
+fn run(command: &mut Command, driver: &str) -> Result<ExitCode, Error> {
+    let status = command
         .status()
         .map_err(|e| format!("could not run `{driver}`: {e}"))?;
-    Ok(match status.code() {
-        Some(0) => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
-    })
+    // A signal that ended the driver has no exit code.
+    Ok(status
+        .code()
+        .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)))
 }
 
 /// The binary: every object of every dependency, and all symbols exported.
@@ -95,8 +103,16 @@ fn fat_link_args(args: Vec<String>) -> Result<Vec<String>, Error> {
         if arg.ends_with(".rlib") && !arg.contains("/lib/rustlib/") {
             let dir = objects_dir.join(i.to_string());
             fs::create_dir_all(&dir)?;
-            for object in extract_objects(Path::new(&arg), &dir)? {
+            let (objects, other_members) = extract_objects(Path::new(&arg), &dir)?;
+            for object in objects {
                 out.push(object.display().to_string());
+            }
+            // Other members, such as the objects of a C library that a `-sys` crate bundles,
+            // stay in the archive: the linker takes the ones that something uses, as it does
+            // without ThinLink. It does not take rustc's objects again, whose symbols are
+            // already defined.
+            if other_members {
+                out.push(arg);
             }
         } else {
             out.push(arg);
@@ -244,14 +260,16 @@ fn write_response_file(args: &[String]) -> String {
     out
 }
 
-/// Write the object files of the GNU `ar` archive `rlib` to `dir`, and return their paths.
-fn extract_objects(rlib: &Path, dir: &Path) -> Result<Vec<PathBuf>, Error> {
+/// Write the object files that rustc made in the GNU `ar` archive `rlib` to `dir`. Returns their
+/// paths, and whether the archive has other members than those and its metadata.
+fn extract_objects(rlib: &Path, dir: &Path) -> Result<(Vec<PathBuf>, bool), Error> {
     let data = fs::read(rlib).map_err(|e| format!("could not read {}: {e}", rlib.display()))?;
     let Some(mut rest) = data.strip_prefix(b"!<arch>\n") else {
         return Err(format!("{} is not an ar archive", rlib.display()).into());
     };
     let mut long_names: &[u8] = &[];
     let mut objects = Vec::new();
+    let mut other_members = false;
     while rest.len() >= 60 {
         let (header, after) = rest.split_at(60);
         let name = std::str::from_utf8(&header[..16])?.trim_end();
@@ -262,6 +280,10 @@ fn extract_objects(rlib: &Path, dir: &Path) -> Result<Vec<PathBuf>, Error> {
         rest = &after[(size + size % 2).min(after.len())..];
         if name == "//" {
             long_names = member;
+            continue;
+        }
+        // The symbol table.
+        if name == "/" || name == "/SYM64/" {
             continue;
         }
         let name = match name.strip_prefix('/').map(str::parse::<usize>) {
@@ -278,13 +300,16 @@ fn extract_objects(rlib: &Path, dir: &Path) -> Result<Vec<PathBuf>, Error> {
             }
             _ => name.trim_end_matches('/').to_owned(),
         };
-        if name.ends_with(".o") {
-            let path = dir.join(&name);
+        if name.ends_with(".rcgu.o") {
+            // Numbered, so that members with the same name do not overwrite each other.
+            let path = dir.join(format!("{}-{name}", objects.len()));
             fs::write(&path, member)?;
             objects.push(path);
+        } else if !name.ends_with(".rmeta") && size > 0 {
+            other_members = true;
         }
     }
-    Ok(objects)
+    Ok((objects, other_members))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -308,16 +333,24 @@ fn jump_table(args: &[String]) -> Result<ExitCode, Error> {
     let aslr_reference = main(&old, "the binary")?;
     let new_base_address = main(&new, "the patch")?;
 
-    // Rust functions that the patch calls but the binary does not export. Loading the patch
-    // would fail, or calling them would crash.
+    // Symbols that the patch needs from the process, and the process does not have: loading the
+    // patch would fail. The binary has them if it exports them, or if it takes them from a
+    // shared library too. Those it defines but does not export are `unexported`.
     let exported = exe.dynamic_symbols(true)?;
-    let missing: BTreeSet<String> = patch
-        .dynamic_symbols(false)?
-        .into_iter()
-        .filter(|name| {
-            (name.starts_with("_R") || name.starts_with("_ZN")) && !exported.contains(name)
-        })
-        .collect();
+    let imported = exe.dynamic_symbols(false)?;
+    let defined = exe.defined_symbols()?;
+    let mut missing = BTreeSet::new();
+    let mut unexported = BTreeSet::new();
+    for name in patch.imports_from_loader()? {
+        if exported.contains(&name) || imported.contains(&name) {
+            continue;
+        }
+        if defined.contains(&name) {
+            unexported.insert(name);
+        } else {
+            missing.insert(name);
+        }
+    }
 
     let mut json = String::from("{\"map\":{");
     let mut first = true;
@@ -331,18 +364,37 @@ fn jump_table(args: &[String]) -> Result<ExitCode, Error> {
         }
     }
     json.push_str(&format!(
-        "}},\"aslr_reference\":{aslr_reference},\"new_base_address\":{new_base_address},\"ifunc_count\":0,\"missing\":["
+        "}},\"aslr_reference\":{aslr_reference},\"new_base_address\":{new_base_address},\"ifunc_count\":0"
     ));
-    for (i, name) in missing.iter().enumerate() {
+    json.push_str(",\"missing\":");
+    json.push_str(&json_strings(&missing));
+    json.push_str(",\"unexported\":");
+    json.push_str(&json_strings(&unexported));
+    json.push('}');
+    println!("{json}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A JSON array of `strings`.
+fn json_strings(strings: &BTreeSet<String>) -> String {
+    let mut json = String::from("[");
+    for (i, s) in strings.iter().enumerate() {
         if i > 0 {
             json.push(',');
         }
-        // Mangled names have no characters that need escaping in JSON.
-        json.push_str(&format!("\"{name}\""));
+        json.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => json.push_str("\\\""),
+                '\\' => json.push_str("\\\\"),
+                c if c < ' ' => json.push_str(&format!("\\u{:04x}", c as u32)),
+                c => json.push(c),
+            }
+        }
+        json.push('"');
     }
-    json.push_str("]}");
-    println!("{json}");
-    Ok(ExitCode::SUCCESS)
+    json.push(']');
+    json
 }
 
 /// An ELF64 little-endian file, read for its symbol tables.
@@ -359,8 +411,17 @@ struct Symbol {
     section: u16,
 }
 
+/// A section header's fields that `Elf` uses.
+struct Section {
+    offset: u64,
+    size: u64,
+    link: u64,
+    entsize: u64,
+}
+
 const SHT_SYMTAB: u32 = 2;
 const SHT_DYNSYM: u32 = 11;
+const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
 const STT_FUNC: u8 = 2;
 const STB_WEAK: u8 = 2;
 const SHN_UNDEF: u16 = 0;
@@ -398,36 +459,60 @@ impl Elf {
         Ok(u64::from_le_bytes(self.bytes(at, 8)?.try_into()?))
     }
 
-    /// The symbols of the first section of type `section_type`.
-    fn symbols(&self, section_type: u32) -> Result<Vec<Symbol>, Error> {
+    /// The section header at `index`.
+    fn section(&self, index: u64) -> Result<Section, Error> {
+        let header = self.u64(0x28)? + index * u64::from(self.u16(0x3a)?);
+        Ok(Section {
+            offset: self.u64(header + 24)?,
+            size: self.u64(header + 32)?,
+            link: u64::from(self.u32(header + 40)?),
+            entsize: self.u64(header + 56)?,
+        })
+    }
+
+    /// The first section of type `section_type`.
+    fn find_section(&self, section_type: u32) -> Result<Option<Section>, Error> {
         let shoff = self.u64(0x28)?;
         let shentsize = u64::from(self.u16(0x3a)?);
-        let shnum = u64::from(self.u16(0x3c)?);
-        for i in 0..shnum {
-            let header = shoff + i * shentsize;
-            if self.u32(header + 4)? != section_type {
-                continue;
+        for i in 0..u64::from(self.u16(0x3c)?) {
+            if self.u32(shoff + i * shentsize + 4)? == section_type {
+                return Ok(Some(self.section(i)?));
             }
-            let offset = self.u64(header + 24)?;
-            let size = self.u64(header + 32)?;
-            let link = u64::from(self.u32(header + 40)?);
-            let entsize = self.u64(header + 56)?.max(24);
-            let strtab = self.u64(shoff + link * shentsize + 24)?;
-            let mut symbols = Vec::new();
-            for j in 0..size / entsize {
-                let sym = offset + j * entsize;
-                let info = self.bytes(sym + 4, 1)?[0];
-                symbols.push(Symbol {
-                    name: self.c_str(strtab + u64::from(self.u32(sym)?))?,
-                    kind: info & 0xf,
-                    binding: info >> 4,
-                    section: self.u16(sym + 6)?,
-                    value: self.u64(sym + 8)?,
-                });
-            }
-            return Ok(symbols);
         }
-        Ok(Vec::new())
+        Ok(None)
+    }
+
+    /// The symbols of the first section of type `section_type`.
+    fn symbols(&self, section_type: u32) -> Result<Vec<Symbol>, Error> {
+        let Some(section) = self.find_section(section_type)? else {
+            return Ok(Vec::new());
+        };
+        let strtab = self.section(section.link)?.offset;
+        let entsize = section.entsize.max(24);
+        let mut symbols = Vec::new();
+        for j in 0..section.size / entsize {
+            let sym = section.offset + j * entsize;
+            let info = self.bytes(sym + 4, 1)?[0];
+            symbols.push(Symbol {
+                name: self.c_str(strtab + u64::from(self.u32(sym)?))?,
+                kind: info & 0xf,
+                binding: info >> 4,
+                section: self.u16(sym + 6)?,
+                value: self.u64(sym + 8)?,
+            });
+        }
+        Ok(symbols)
+    }
+
+    /// The version index of each dynamic symbol, from `.gnu.version`, if there is one.
+    fn symbol_versions(&self) -> Result<Option<Vec<u16>>, Error> {
+        let Some(section) = self.find_section(SHT_GNU_VERSYM)? else {
+            return Ok(None);
+        };
+        (0..section.size / 2)
+            .map(|j| self.u16(section.offset + j * 2))
+            .collect::<Result<_, _>>()
+            .map(Some)
     }
 
     fn c_str(&self, at: u64) -> Result<String, Error> {
@@ -447,6 +532,38 @@ impl Elf {
             .into_iter()
             .filter(|s| s.kind == STT_FUNC && s.section != SHN_UNDEF && !s.name.is_empty())
             .map(|s| (s.name, s.value))
+            .collect())
+    }
+
+    /// Names of the defined symbols in the full symbol table, exported or not.
+    fn defined_symbols(&self) -> Result<BTreeSet<String>, Error> {
+        Ok(self
+            .symbols(SHT_SYMTAB)?
+            .into_iter()
+            .filter(|s| s.section != SHN_UNDEF && !s.name.is_empty())
+            .map(|s| s.name)
+            .collect())
+    }
+
+    /// Names of the undefined non-weak dynamic symbols without a version: those the dynamic
+    /// loader looks for in the process. The linker gave a version to those it found in a shared
+    /// library on the command line, such as `memcpy@GLIBC_2.14`, and the loader finds them
+    /// there.
+    fn imports_from_loader(&self) -> Result<BTreeSet<String>, Error> {
+        let versions = self.symbol_versions()?;
+        Ok(self
+            .symbols(SHT_DYNSYM)?
+            .into_iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                // Index 0 is local, and 1 is global: no version.
+                let unversioned = versions
+                    .as_ref()
+                    .and_then(|v| v.get(*i))
+                    .is_none_or(|v| v & 0x7fff <= 1);
+                s.section == SHN_UNDEF && s.binding != STB_WEAK && !s.name.is_empty() && unversioned
+            })
+            .map(|(_, s)| s.name)
             .collect())
     }
 

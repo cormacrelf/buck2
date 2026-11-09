@@ -63,7 +63,8 @@ The watch sets in `defs.bzl`:
 
 If a patch calls a function that the binary does not have, such as a function
 of the standard library that the binary does not use, or a generic function with
-new type arguments, the server asks for `exe` and starts the app again.
+new type arguments, or one that the binary has but does not export, the server
+asks for `exe` and starts the app again.
 
 ## The third-party crates
 
