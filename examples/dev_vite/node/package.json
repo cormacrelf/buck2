@@ -1,0 +1,8 @@
+{
+  "name": "buck2-dev-vite-example",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "vite": "^7.1.7"
+  }
+}

@@ -1,0 +1,30 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//:defs.bzl", "codegen", "vite_app")
+
+# `buck2 dev //app:app` runs Vite on http://localhost:5173/. Edits to the sources, and to
+# `data/messages.json`, reach the open page through Vite's hot module replacement.
+vite_app(
+    name = "app",
+    srcs = glob(["index.html", "src/**"]),
+    generated = {"src/messages.js": ":messages"},
+    packages = "//node:packages",
+    server = "//server:server.py",
+)
+
+# Vite could import `data/messages.json` itself; this step is here only to show that a file made by a
+# Buck action reaches the page through hot module replacement too. Without a generated file,
+# Vite could run on this directory directly and `buck2 dev` would only install `node_modules`.
+# In a real project the step would be one Vite cannot do, such as building Rust to wasm.
+codegen(
+    name = "messages",
+    src = "data/messages.json",
+    out = "messages.js",
+    script = "gen_messages.py",
+)
