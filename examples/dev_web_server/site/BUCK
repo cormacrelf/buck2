@@ -1,0 +1,18 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//:defs.bzl", "static_site")
+
+# `buck2 dev //site:site` serves the site on http://localhost:8000/ and rebuilds it as the
+# files change. `buck2 run //site:site` serves one build of it.
+static_site(
+    name = "site",
+    pages = glob(["pages/*.html"]),
+    server = "//server:server.py",
+    theme = "//theme:theme",
+)

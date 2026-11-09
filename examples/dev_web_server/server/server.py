@@ -1,0 +1,108 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+"""A web server for a directory that `buck2 dev` rebuilds.
+
+Under `buck2 dev`, the server reads `buck2 dev` messages from stdin, one JSON object per line.
+It asks for the `www` output when it starts, and serves the newest `www` directory it has been
+told about. A browser gets the new pages on its next request.
+
+With `--root DIR` (`buck2 run`), it serves DIR and does not read stdin.
+"""
+
+import argparse
+import functools
+import http.server
+import json
+import os
+import sys
+import threading
+
+
+class Site:
+    """The directory being served. `buck2 dev` replaces it after each build."""
+
+    def __init__(self, root):
+        self._lock = threading.Lock()
+        self._root = root
+
+    def get(self):
+        with self._lock:
+            return self._root
+
+    def set(self, root):
+        with self._lock:
+            self._root = root
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, site, **kwargs):
+        self.site = site
+        super().__init__(*args, **kwargs)
+
+    def translate_path(self, path):
+        # Resolve each request against the current build, not the one at start-up.
+        root = self.site.get()
+        rel = os.path.relpath(super().translate_path(path), os.getcwd())
+        return os.path.join(root, rel)
+
+    def do_GET(self):
+        if self.site.get() is None:
+            self.send_error(503, "The site has not been built yet")
+            return
+        super().do_GET()
+
+    def log_message(self, format, *args):
+        # stdout carries requests to `buck2 dev`, so log to stderr.
+        sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+
+
+def request(message):
+    """Send a request to `buck2 dev`."""
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def follow_buck2_dev(site):
+    for line in sys.stdin:
+        message = json.loads(line)
+        kind = message["type"]
+        if kind == "ready":
+            request({"type": "build", "outputs": ["www"]})
+        elif kind == "building":
+            sys.stderr.write("Building the site...\n")
+        elif kind == "built":
+            www = message["outputs"].get("www")
+            if www is not None:
+                site.set(www["path"])
+                sys.stderr.write("Serving the new site (build %d)\n" % message["gen"])
+        elif kind == "failed":
+            sys.stderr.write("Build failed; still serving the last site\n")
+    # `buck2 dev` closed stdin: it has exited, so stop too.
+    os._exit(0)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--root", help="Serve this directory instead of following buck2 dev")
+    args = parser.parse_args()
+    port = int(os.environ.get("PORT", args.port))
+
+    site = Site(os.path.abspath(args.root) if args.root else None)
+    if args.root is None:
+        threading.Thread(target=follow_buck2_dev, args=(site,), daemon=True).start()
+
+    handler = functools.partial(Handler, site=site)
+    server = http.server.ThreadingHTTPServer(("localhost", port), handler)
+    sys.stderr.write("Serving on http://localhost:%d/\n" % port)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
