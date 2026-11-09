@@ -268,18 +268,48 @@ class DevTest(BuckTestCase):
             await asyncio.sleep(2)
 
             # A build with different files preempts the dev build instead of waiting for it.
-            write(buck, "app/delay.txt", "0\n")
+            # `other.txt` is not a file of the dev target, so buck2 dev does not cancel its
+            # build itself.
             write(buck, "app/other.txt", "other v2\n")
             start = time.monotonic()
             await buck.build("//app:other")
             assert time.monotonic() - start < 30
 
-            # buck2 dev retries, and its build succeeds.
+            # buck2 dev retries. Make its build quick, and it succeeds.
+            write(buck, "app/delay.txt", "0\n")
             built = await dev.wait_for("built")
             assert site(built) == "app v1\n"
             assert all(
                 e["type"] != "failed" for e in dev._events()
             ), dev._events()
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_change_during_a_build_cancels_it(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:slow")
+        try:
+            await dev.wait_for("built")
+
+            # Start a dev build that takes 60 seconds.
+            write(buck, "app/delay.txt", "60\n")
+            first = await dev.wait_for("building")
+            await asyncio.sleep(2)
+
+            # A change during the build cancels it, and the next build starts at once.
+            start = time.monotonic()
+            write(buck, "app/delay.txt", "0\n")
+            write(buck, "app/main.txt", "app v2\n")
+            cancelled = await dev.wait_for("cancelled")
+            assert cancelled["gen"] == first["gen"]
+            building = await dev.wait_for("building")
+            assert path(buck, "app/main.txt") in [
+                os.path.realpath(f) for f in building["files"]
+            ]
+            built = await dev.wait_for("built")
+            assert built["gen"] == building["gen"]
+            assert site(built) == "app v2\n"
+            assert time.monotonic() - start < 30
         finally:
             await dev.stop()
 

@@ -514,6 +514,12 @@ struct Session<'a> {
     /// The graph changed while `pending` was not empty. Resolving builds the server, so it
     /// waits too.
     held_regraph: bool,
+    /// Changed paths that `buck2 dev` read while it was building. They are handled next.
+    queued: BTreeSet<PathBuf>,
+    /// The outputs and files of a build that was cancelled because a file changed. The next
+    /// build builds them too.
+    cancelled_outputs: BTreeSet<String>,
+    cancelled_files: BTreeSet<PathBuf>,
 }
 
 impl<'a> Session<'a> {
@@ -550,36 +556,30 @@ impl<'a> Session<'a> {
             pending: BTreeSet::new(),
             held: BTreeMap::new(),
             held_regraph: false,
+            queued: BTreeSet::new(),
+            cancelled_outputs: BTreeSet::new(),
+            cancelled_files: BTreeSet::new(),
         })
     }
 
     async fn run(mut self) -> buck2_error::Result<ExitResult> {
         loop {
+            if !self.queued.is_empty() {
+                // Files changed during the last build.
+                let paths = std::mem::take(&mut self.queued);
+                let paths = self.debounce(paths).await;
+                self.on_changes(paths).await?;
+                continue;
+            }
             tokio::select! {
                 event = self.events_rx.recv() => {
                     let Some(event) = event else { continue };
                     let mut paths = BTreeSet::new();
-                    self.collect_paths(event, &mut paths);
+                    collect_paths(&self.watched, event, &mut paths);
                     if paths.is_empty() {
                         continue;
                     }
-                    // Wait until the watched files stop changing, but no longer than
-                    // `MAX_DEBOUNCE`, in case they never do.
-                    let deadline = tokio::time::Instant::now() + MAX_DEBOUNCE;
-                    let mut quiet_until = tokio::time::Instant::now() + self.debounce;
-                    loop {
-                        let wait_until = quiet_until.min(deadline);
-                        match tokio::time::timeout_at(wait_until, self.events_rx.recv()).await {
-                            Ok(Some(event)) => {
-                                let before = paths.len();
-                                self.collect_paths(event, &mut paths);
-                                if paths.len() != before {
-                                    quiet_until = tokio::time::Instant::now() + self.debounce;
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
+                    let paths = self.debounce(paths).await;
                     self.on_changes(paths).await?;
                 }
                 line = self.server.stdout.next_line() => {
@@ -599,16 +599,22 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Add the paths of `event` that belong to a watch set, a package or the graph.
-    fn collect_paths(&self, event: notify::Result<notify::Event>, paths: &mut BTreeSet<PathBuf>) {
-        let Ok(event) = event else { return };
-        if matches!(event.kind, EventKind::Access(_)) {
-            return;
-        }
-        for path in event.paths {
-            if self.watched.owners.contains_key(&path) || self.watched.package_set(&path).is_some()
-            {
-                paths.insert(path);
+    /// Add the paths of further events to `paths` until the watched files stop changing, but
+    /// for no longer than `MAX_DEBOUNCE`, in case they never do.
+    async fn debounce(&mut self, mut paths: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+        let deadline = tokio::time::Instant::now() + MAX_DEBOUNCE;
+        let mut quiet_until = tokio::time::Instant::now() + self.debounce;
+        loop {
+            let wait_until = quiet_until.min(deadline);
+            match tokio::time::timeout_at(wait_until, self.events_rx.recv()).await {
+                Ok(Some(event)) => {
+                    let before = paths.len();
+                    collect_paths(&self.watched, event, &mut paths);
+                    if paths.len() != before {
+                        quiet_until = tokio::time::Instant::now() + self.debounce;
+                    }
+                }
+                _ => return paths,
             }
         }
     }
@@ -788,7 +794,7 @@ impl<'a> Session<'a> {
             outputs.extend(set.build.iter().cloned());
             restart |= set.restart;
         }
-        if !outputs.is_empty() {
+        if !outputs.is_empty() || !self.cancelled_outputs.is_empty() {
             self.build(outputs.into_iter().collect(), files).await?;
         }
         if restart {
@@ -797,11 +803,18 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Build `outputs`, and the outputs of a cancelled build. If a file changes that makes the
+    /// build out of date, cancel it: the next build, with the new files, builds its outputs.
     async fn build(
         &mut self,
         outputs: Vec<String>,
         files: Vec<PathBuf>,
     ) -> buck2_error::Result<()> {
+        let mut outputs: BTreeSet<String> = outputs.into_iter().collect();
+        outputs.append(&mut self.cancelled_outputs);
+        let outputs: Vec<String> = outputs.into_iter().collect();
+        let mut files: BTreeSet<PathBuf> = files.into_iter().collect();
+        files.append(&mut self.cancelled_files);
         self.generation += 1;
         let generation = self.generation;
         self.server
@@ -812,7 +825,48 @@ impl<'a> Session<'a> {
                 "files": files,
             }))
             .await?;
-        match self.daemon.build(&outputs).await? {
+
+        // Read file events while the daemon builds. Dropping the request cancels the build in
+        // the daemon, and the next build, which sees different files, preempts it if it has not
+        // stopped yet.
+        let result = {
+            let Session {
+                daemon,
+                events_rx,
+                watched,
+                last_seen,
+                queued,
+                ..
+            } = &mut *self;
+            let request = daemon.build(&outputs);
+            tokio::pin!(request);
+            loop {
+                tokio::select! {
+                    result = &mut request => break Some(result?),
+                    event = events_rx.recv() => {
+                        let Some(event) = event else { continue };
+                        let mut paths = BTreeSet::new();
+                        collect_paths(watched, event, &mut paths);
+                        let interrupt = paths
+                            .iter()
+                            .any(|path| interrupts_build(watched, last_seen, path));
+                        queued.append(&mut paths);
+                        if interrupt {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        let Some(result) = result else {
+            self.cancelled_outputs.extend(outputs);
+            self.cancelled_files.extend(files);
+            self.server
+                .send(json!({"type": "cancelled", "gen": generation}))
+                .await?;
+            return Ok(());
+        };
+        match result {
             Ok(built) => {
                 let mut message = serde_json::Map::new();
                 for (name, output) in built.outputs {
@@ -890,11 +944,42 @@ impl<'a> Session<'a> {
         self.server.stop().await;
         self.server = Server::spawn(&self.watched.resolved)?;
         self.digests.clear();
+        // The new server asks for what it needs.
+        self.cancelled_outputs.clear();
+        self.cancelled_files.clear();
         self.server
             .send(json!({"type": "ready", "outputs": self.watched.resolved.outputs}))
             .await?;
         Ok(())
     }
+}
+
+/// Add the paths of `event` that belong to a watch set, a package or the graph.
+fn collect_paths(
+    watched: &Watched,
+    event: notify::Result<notify::Event>,
+    paths: &mut BTreeSet<PathBuf>,
+) {
+    let Ok(event) = event else { return };
+    if matches!(event.kind, EventKind::Access(_)) {
+        return;
+    }
+    for path in event.paths {
+        if watched.owners.contains_key(&path) || watched.package_set(&path).is_some() {
+            paths.insert(path);
+        }
+    }
+}
+
+/// Whether a change to `path` makes the running build out of date, so that `buck2 dev` should
+/// cancel it and build again: the file has new content, and a change to it does not wait for
+/// the server.
+fn interrupts_build(
+    watched: &Watched,
+    last_seen: &BuckMutMap<PathBuf, Option<blake3::Hash>>,
+    path: &Path,
+) -> bool {
+    !watched.waits(path) && last_seen.get(path) != Some(&hash_file(path))
 }
 
 fn is_build_file(path: &Path) -> bool {

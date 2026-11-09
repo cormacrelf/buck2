@@ -125,11 +125,18 @@ itself exits, for example on Ctrl-C, it closes the server's stdin and sends it
 | `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`       | A build succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. |
 | `failed`        | `gen`, `error`                                            | A build, or the analysis of the target, failed. The errors are also on the terminal.                         |
+| `cancelled`     | `gen`                                                     | A source file changed during the build, so `buck2 dev` stopped it. The next build builds its outputs too.   |
 | `stale`         | `files`: the changed files of `notify` sets               | That list changes. An empty list means that nothing waits.                                                   |
 | `graph_changed` |                                                           | A build file or a `.bzl` file changed, or a package got a new file, and `buck2 dev` analysed the target again. |
 
 `gen` is a number that increases with each build. `building` and `built` for
-the same build have the same `gen`.
+the same build have the same `gen`. A
+`building` is followed by one of `built`, `failed` and `cancelled`.
+
+`buck2 dev` reads file events while it builds. When a file changes that makes
+the build out of date, and whose change does not wait (see
+[Changes that wait](#changes-that-wait)), it cancels the build, and starts a new
+one once the files stop changing.
 
 ### Requests from the server
 
