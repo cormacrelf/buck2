@@ -1,0 +1,53 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//:defs.bzl", "concat", "dev_app")
+
+dev_app(
+    name = "auto",
+    mode = "auto",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "auto_build_on_stale",
+    mode = "auto",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    server = "server.py",
+    server_args = ["--build-on-stale"],
+)
+
+dev_app(
+    name = "pages",
+    mode = "all",
+    srcs = glob(["pages/*.txt"]),
+    server = "server.py",
+)
+
+dev_app(
+    name = "restart",
+    mode = "restart",
+    srcs = ["main.txt"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "slow",
+    mode = "all",
+    srcs = ["main.txt"],
+    delay = "delay.txt",
+    server = "server.py",
+)
+
+concat(
+    name = "other",
+    srcs = ["other.txt"],
+)
