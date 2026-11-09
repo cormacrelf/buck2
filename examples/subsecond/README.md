@@ -18,7 +18,10 @@ for the crates from crates.io.
 
 `//app:app` is the crate that is patched. `//app:main` is the binary; it is
 linked with `-Wl,--export-dynamic`, so its symbols are in its dynamic symbol
-table. `buck2 dev` builds two outputs of `//app:dev`:
+table. `//app:app` includes a module that `//app:slow` makes after a 10 second
+sleep, so each build of the crate is slow: change `src/lib.rs` again during a
+build, and `buck2 dev` cancels the build and starts a new one. `buck2 dev`
+builds two outputs of `//app:dev`:
 
 - `exe`: the binary.
 - `patch`: the object files of `//app:app[static_pic]`, linked into a shared

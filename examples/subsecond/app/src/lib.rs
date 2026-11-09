@@ -10,6 +10,9 @@
 
 //! The part of the app that `buck2 dev` patches while it runs. Edit `tick` and save.
 
+// Empty; its build step makes each build of this crate take 10 seconds. See `BUCK`.
+mod slow;
+
 use std::io::BufRead;
 use std::time::Duration;
 
