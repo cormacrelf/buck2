@@ -208,6 +208,7 @@ fn command_name(start: &buck2_data::CommandStart) -> Option<&'static str> {
         Data::ExpandExternalCell(_) => "expand-external-cell",
         Data::Complete(_) => "complete",
         Data::Hydration(_) => "hydration",
+        Data::Dev(_) => "dev",
     })
 }
 

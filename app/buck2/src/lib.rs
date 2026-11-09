@@ -15,6 +15,7 @@ use buck2_client::commands::bxl::BxlCommand;
 use buck2_client::commands::clean::CleanCommand;
 use buck2_client::commands::cleanall::CleanallCommand;
 use buck2_client::commands::ctargets::ConfiguredTargetsCommand;
+use buck2_client::commands::dev::DevCommand;
 use buck2_client::commands::expand_external_cell::ExpandExternalCellsCommand;
 use buck2_client::commands::explain::ExplainCommand;
 use buck2_client::commands::help_env::HelpEnvCommand;
@@ -429,6 +430,7 @@ pub(crate) enum CommandKind {
     HelpEnv(HelpEnvCommand),
     Test(TestCommand),
     Cquery(CqueryCommand),
+    Dev(DevCommand),
     Init(InitCommand),
     Explain(ExplainCommand),
     ExpandExternalCell(ExpandExternalCellsCommand),
@@ -636,6 +638,7 @@ impl CommandKind {
             CommandKind::Rage(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Init(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Explain(cmd) => command_ctx.exec(cmd, matches, events_ctx),
+            CommandKind::Dev(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Install(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Log(cmd) => cmd.exec(matches, command_ctx, events_ctx),
             CommandKind::Lsp(cmd) => command_ctx.exec(cmd, matches, events_ctx),
@@ -681,6 +684,7 @@ impl CommandKind {
             CommandKind::Rage(_) => "rage",
             CommandKind::Init(_) => "init",
             CommandKind::Explain(cmd) => cmd.logging_name(),
+            CommandKind::Dev(cmd) => cmd.logging_name(),
             CommandKind::Install(cmd) => cmd.logging_name(),
             CommandKind::Log(cmd) => cmd.command_name(),
             CommandKind::Lsp(cmd) => cmd.logging_name(),

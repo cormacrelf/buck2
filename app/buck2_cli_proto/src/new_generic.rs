@@ -25,6 +25,7 @@ pub enum NewGenericRequest {
     ExpandExternalCells(ExpandExternalCellsRequest),
     Complete(CompleteRequest),
     Docs(DocsRequest),
+    Dev(DevRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,6 +36,7 @@ pub enum NewGenericResponse {
     ExpandExternalCells(ExpandExternalCellsResponse),
     Complete(CompleteResponse),
     Docs(DocsResponse),
+    Dev(DevResponse),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,4 +134,67 @@ pub enum DocsResponse {
     NoOutput,
     /// JSON documentation to print on stdout.
     Json(String),
+}
+
+/// A request from `buck2 dev`. Each one is a separate, short daemon command, so `buck2 dev` holds
+/// no daemon state between them.
+#[derive(Serialize, Deserialize)]
+pub struct DevRequest {
+    /// The target whose `DevInfo` to use.
+    pub target: String,
+    pub target_cfg: TargetCfg,
+    pub action: DevAction,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum DevAction {
+    /// Build the server, and expand the watch policy into files.
+    Resolve,
+    /// Build the named `DevInfo.outputs`.
+    Build { outputs: Vec<String> },
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum DevResponse {
+    Resolve(DevResolved),
+    Build(DevBuilt),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevResolved {
+    /// Absolute path of the project root. The server runs in this directory.
+    pub project_root: String,
+    /// The server command line. Paths in it are relative to the project root.
+    pub server: Vec<String>,
+    /// The names of `DevInfo.outputs`.
+    pub outputs: Vec<String>,
+    /// The `DevInfo.watch` sets, in order, with their files.
+    pub watch: Vec<DevWatchSet>,
+    /// Absolute paths of the `.bzl` files that the packages in the dependency graph load.
+    pub graph_files: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevWatchSet {
+    pub build: Vec<String>,
+    pub restart: bool,
+    pub notify: bool,
+    /// Absolute paths of the source files and build files that belong to this set.
+    pub files: Vec<String>,
+    /// Absolute paths of the package directories that belong to this set. A file added to one
+    /// of them may be a new source file of the set.
+    pub dirs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevBuilt {
+    pub outputs: BTreeMap<String, DevBuiltOutput>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevBuiltOutput {
+    /// Absolute path of the output.
+    pub path: String,
+    /// The content digest of the output, if it is a file or a directory.
+    pub digest: Option<String>,
 }

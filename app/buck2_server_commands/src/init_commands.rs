@@ -15,6 +15,8 @@ use buck2_cli_proto::new_generic::CompleteRequest;
 use buck2_cli_proto::new_generic::CompleteResponse;
 use buck2_cli_proto::new_generic::DebugEvalRequest;
 use buck2_cli_proto::new_generic::DebugEvalResponse;
+use buck2_cli_proto::new_generic::DevRequest;
+use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::ExpandExternalCellsRequest;
 use buck2_cli_proto::new_generic::ExpandExternalCellsResponse;
 use buck2_cli_proto::new_generic::ExplainRequest;
@@ -29,6 +31,7 @@ use crate::build::build_command;
 use crate::complete::complete_command;
 use crate::debug_anon_targets::debug_anon_targets_command;
 use crate::debug_eval::debug_eval_command;
+use crate::dev::dev_command;
 use crate::expand_external_cells::expand_external_cells_command;
 use crate::explain::explain_command;
 use crate::install::install_command;
@@ -94,6 +97,15 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         req: ExpandExternalCellsRequest,
     ) -> buck2_error::Result<ExpandExternalCellsResponse> {
         expand_external_cells_command(ctx, partial_result_dispatcher, req).await
+    }
+
+    async fn dev(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        req: DevRequest,
+    ) -> buck2_error::Result<DevResponse> {
+        dev_command(ctx, partial_result_dispatcher, req).await
     }
 }
 

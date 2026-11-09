@@ -15,6 +15,8 @@ use buck2_cli_proto::new_generic::CompleteRequest;
 use buck2_cli_proto::new_generic::CompleteResponse;
 use buck2_cli_proto::new_generic::DebugEvalRequest;
 use buck2_cli_proto::new_generic::DebugEvalResponse;
+use buck2_cli_proto::new_generic::DevRequest;
+use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::ExpandExternalCellsRequest;
 use buck2_cli_proto::new_generic::ExpandExternalCellsResponse;
 use buck2_cli_proto::new_generic::ExplainRequest;
@@ -68,6 +70,12 @@ pub trait OtherServerCommands: Send + Sync + 'static {
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: ExpandExternalCellsRequest,
     ) -> buck2_error::Result<ExpandExternalCellsResponse>;
+    async fn dev(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        req: DevRequest,
+    ) -> buck2_error::Result<DevResponse>;
 }
 
 pub static OTHER_SERVER_COMMANDS: LateBinding<&'static dyn OtherServerCommands> =

@@ -14,6 +14,7 @@ pub mod clean;
 pub mod clean_stale;
 pub mod cleanall;
 pub mod ctargets;
+pub mod dev;
 pub mod expand_external_cell;
 pub mod explain;
 pub mod help_env;

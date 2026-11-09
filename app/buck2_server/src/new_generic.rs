@@ -54,6 +54,12 @@ pub(crate) async fn new_generic_command(
                 .expand_external_cells(context, partial_result_dispatcher, e)
                 .await?,
         ),
+        NewGenericRequest::Dev(d) => NewGenericResponse::Dev(
+            OTHER_SERVER_COMMANDS
+                .get()?
+                .dev(context, partial_result_dispatcher, d)
+                .await?,
+        ),
         NewGenericRequest::Docs(d) => NewGenericResponse::Docs(
             DOCS_SERVER_COMMAND
                 .get()?
