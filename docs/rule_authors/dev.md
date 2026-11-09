@@ -92,7 +92,10 @@ For some tools that is wrong. For example, a tool that loads new code into a
 running program cannot load code built against a changed dependency.
 
 So while a file of a `notify` set differs from what it was at the last build
-that the server asked for, `buck2 dev` builds nothing automatically. It sends
+that the server asked for, `buck2 dev` builds nothing automatically. It does
+not analyse the target again either, because that builds the server. A `.bzl`
+file can change any target, so when there is a `notify` set, a changed `.bzl`
+file waits in the same way. It sends
 the server a `stale` message with the changed files, and remembers the other
 changes. The changes wait until one of these happens:
 
@@ -105,7 +108,8 @@ changes. The changes wait until one of these happens:
 `buck2 dev` starts the server in the project root. It writes messages to the
 server's stdin, one JSON object per line. The server can write requests to its
 stdout, one JSON object per line. `buck2 dev` prints other lines that the
-server writes to stdout. The server's stderr goes to the terminal.
+server writes to stdout, and reports a JSON object with a `type` that is not a
+valid request. The server's stderr goes to the terminal.
 
 To stop the server, before a restart, `buck2 dev` closes the server's stdin and
 waits up to 5 seconds for it to exit, then kills it. A server that starts
@@ -147,6 +151,10 @@ If another command starts while a `buck2 dev` build runs, and it sees different
 files or a different configuration, it does not wait for that build. It stops
 the `buck2 dev` build, and `buck2 dev` starts the build again when the other
 command lets it in.
+
+If the daemon goes away, for example because a client of another buck2 version
+restarted it, `buck2 dev` connects again, starting a daemon if needed, and
+repeats the request.
 
 ## Limits
 

@@ -42,9 +42,13 @@ use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
 use buck2_client_ctx::common::ui::CommonConsoleOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
+use buck2_client_ctx::daemon::client::connect::BuckdConnectOptions;
+use buck2_client_ctx::daemon::client::connect::connect_buckd;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
+use buck2_client_ctx::streaming::connect_options;
+use buck2_common::invocation_paths::InvocationPaths;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
@@ -113,6 +117,8 @@ impl StreamingCommand for DevCommand {
         let daemon = Daemon {
             buckd,
             events_ctx,
+            connect_options: connect_options(&self, ctx)?,
+            paths: ctx.paths()?.clone(),
             context,
             target: self.target.clone(),
             target_cfg: self.target_cfg.target_cfg(),
@@ -145,6 +151,9 @@ impl StreamingCommand for DevCommand {
 struct Daemon<'a> {
     buckd: &'a mut BuckdClientConnector,
     events_ctx: &'a mut EventsCtx,
+    /// To connect again when the daemon goes away, for example when another client restarts it.
+    connect_options: BuckdConnectOptions,
+    paths: InvocationPaths,
     context: ClientContext,
     target: String,
     target_cfg: buck2_cli_proto::TargetCfg,
@@ -158,8 +167,9 @@ impl Daemon<'_> {
         &mut self,
         action: impl Fn() -> DevAction,
     ) -> buck2_error::Result<Result<DevResponse, Failed>> {
+        let mut reconnects = 0;
         loop {
-            let outcome = self
+            let outcome = match self
                 .buckd
                 .with_flushing()
                 .new_generic(
@@ -172,7 +182,24 @@ impl Daemon<'_> {
                     self.events_ctx,
                     None,
                 )
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) if lost_daemon(&e) && reconnects < MAX_RECONNECTS => {
+                    // The daemon went away, perhaps because another client restarted it.
+                    // Connect again, starting a daemon if needed, and ask again.
+                    reconnects += 1;
+                    buck2_client_ctx::eprintln!(
+                        "`buck2 dev` lost its connection to the daemon; connecting again"
+                    )?;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    *self.buckd =
+                        connect_buckd(self.connect_options.clone(), self.events_ctx, &self.paths)
+                            .await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match outcome {
                 CommandOutcome::Success(NewGenericResponse::Dev(response)) => {
                     return Ok(Ok(response));
@@ -237,6 +264,14 @@ impl Daemon<'_> {
             },
         )
     }
+}
+
+/// How many times in a row `buck2 dev` connects to the daemon again for one request.
+const MAX_RECONNECTS: u32 = 3;
+
+/// Whether `e` says that the connection to the daemon was lost, not that the request failed.
+fn lost_daemon(e: &buck2_error::Error) -> bool {
+    e.has_tag(ErrorTag::ClientGrpc) || e.has_tag(ErrorTag::ClientGrpcStream)
 }
 
 /// The running server process.
@@ -396,14 +431,26 @@ impl Watched {
             .find_map(|dir| self.dirs.get(dir).copied())
     }
 
-    fn notify_files(&self) -> Vec<PathBuf> {
+    fn has_notify(&self) -> bool {
+        self.resolved.watch.iter().any(|set| set.notify)
+    }
+
+    /// Whether a change to `path` waits until the server asks for a build: a file of a
+    /// `notify` set, or a `.bzl` file, which may change any target, when there is a `notify` set.
+    fn waits(&self, path: &Path) -> bool {
+        match self.owners.get(path) {
+            Some(Owner::File(i)) => self.resolved.watch[*i].notify,
+            Some(Owner::Graph) => self.has_notify(),
+            None => false,
+        }
+    }
+
+    /// The files whose content `buck2 dev` compares with `Session::baseline`.
+    fn baseline_files(&self) -> Vec<PathBuf> {
         self.owners
-            .iter()
-            .filter(|(_, owner)| match owner {
-                Owner::File(i) => self.resolved.watch[*i].notify,
-                Owner::Graph => false,
-            })
-            .map(|(path, _)| path.clone())
+            .keys()
+            .filter(|path| self.waits(path))
+            .cloned()
             .collect()
     }
 }
@@ -414,19 +461,30 @@ const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest `buck2 dev` waits for files to stop changing before it builds.
 const MAX_DEBOUNCE: Duration = Duration::from_secs(2);
 
-type Hashes = Arc<Mutex<BuckMutMap<PathBuf, Option<blake3::Hash>>>>;
+/// The content of a file that a `notify` set or the graph uses, when the server last asked for a
+/// build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Baseline {
+    /// The file's hash, or `None` if it could not be read.
+    Hash(Option<blake3::Hash>),
+    /// The file changed before it was hashed, so its earlier content is not known.
+    Unknown,
+}
+
+type Hashes = Arc<Mutex<BuckMutMap<PathBuf, Baseline>>>;
 
 fn hash_file(path: &Path) -> Option<blake3::Hash> {
     std::fs::read(path).ok().map(|bytes| blake3::hash(&bytes))
 }
 
-/// Hash `files` on another thread and record them in `hashes`, keeping hashes already there.
+/// Hash `files` on another thread and record them in `hashes`, keeping entries already there:
+/// those of files that changed since, or that the server has built.
 fn hash_in_background(files: Vec<PathBuf>, hashes: Hashes) {
     std::thread::spawn(move || {
         for path in files {
             let hash = hash_file(&path);
             if let Ok(mut hashes) = hashes.lock() {
-                hashes.entry(path).or_insert(hash);
+                hashes.entry(path).or_insert(Baseline::Hash(hash));
             }
         }
     });
@@ -442,15 +500,20 @@ struct Session<'a> {
     generation: u64,
     /// The digest of each output when it was last built.
     digests: BuckMutMap<String, Option<String>>,
-    /// The content of each file of a `notify` set when the server last asked for a build.
+    /// The content of each file of a `notify` set, and of each `.bzl` file of the graph, when
+    /// the server last asked for a build.
     baseline: Hashes,
     /// The content of each changed file when it was last handled.
     last_seen: BuckMutMap<PathBuf, Option<blake3::Hash>>,
-    /// Files of `notify` sets that differ from `baseline`.
+    /// Files of `notify` sets, and `.bzl` files if there is a `notify` set, that differ from
+    /// `baseline`.
     pending: BTreeSet<PathBuf>,
     /// Watch sets with changes that were not built because `pending` is not empty, and the
     /// files that changed in them.
     held: BTreeMap<usize, Vec<PathBuf>>,
+    /// The graph changed while `pending` was not empty. Resolving builds the server, so it
+    /// waits too.
+    held_regraph: bool,
 }
 
 impl<'a> Session<'a> {
@@ -468,7 +531,7 @@ impl<'a> Session<'a> {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let watched = Watched::new(resolved, events_tx.clone())?;
         let baseline: Hashes = Arc::new(Mutex::new(BuckMutMap::default()));
-        hash_in_background(watched.notify_files(), baseline.clone());
+        hash_in_background(watched.baseline_files(), baseline.clone());
         let mut server = Server::spawn(&watched.resolved)?;
         server
             .send(json!({"type": "ready", "outputs": watched.resolved.outputs}))
@@ -486,6 +549,7 @@ impl<'a> Session<'a> {
             last_seen: BuckMutMap::default(),
             pending: BTreeSet::new(),
             held: BTreeMap::new(),
+            held_regraph: false,
         })
     }
 
@@ -558,15 +622,32 @@ impl<'a> Session<'a> {
         }
         match serde_json::from_str::<Request>(&line) {
             Ok(Request::Build { outputs }) => {
+                if std::mem::take(&mut self.held_regraph) {
+                    self.reresolve(true).await?;
+                }
                 self.build(outputs, Vec::new()).await?;
                 self.reset_pending().await?;
             }
             Ok(Request::Restart) => {
+                self.held_regraph = false;
                 self.restart().await?;
                 self.reset_pending().await?;
             }
-            Err(_) => {
-                buck2_client_ctx::println!("{}", line)?;
+            Err(e) => {
+                // A JSON object with a `type` is meant as a request: say what is wrong with it,
+                // rather than print it as output.
+                let is_request = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .is_some_and(|v| v.get("type").is_some_and(|t| t.is_string()));
+                if is_request {
+                    buck2_client_ctx::eprintln!(
+                        "`buck2 dev` ignored a request from the server: {}: {}",
+                        e,
+                        line
+                    )?;
+                } else {
+                    buck2_client_ctx::println!("{}", line)?;
+                }
             }
         }
         Ok(())
@@ -577,7 +658,7 @@ impl<'a> Session<'a> {
     async fn reset_pending(&mut self) -> buck2_error::Result<()> {
         if let Ok(mut baseline) = self.baseline.lock() {
             for path in &self.pending {
-                baseline.insert(path.clone(), hash_file(path));
+                baseline.insert(path.clone(), Baseline::Hash(hash_file(path)));
             }
         }
         self.held.clear();
@@ -593,7 +674,7 @@ impl<'a> Session<'a> {
     async fn on_changes(&mut self, paths: BTreeSet<PathBuf>) -> buck2_error::Result<()> {
         let mut regraph = false;
         let mut changed_sets: BTreeMap<usize, Vec<PathBuf>> = BTreeMap::new();
-        let mut notify_changed: Vec<PathBuf> = Vec::new();
+        let mut waiting: Vec<(PathBuf, Option<blake3::Hash>)> = Vec::new();
         let mut graph_changed: Vec<PathBuf> = Vec::new();
 
         for path in paths {
@@ -603,9 +684,11 @@ impl<'a> Session<'a> {
                 continue;
             }
             let hash = hash_file(&path);
+            if self.watched.waits(&path) {
+                waiting.push((path.clone(), hash));
+            }
             if let Some(Owner::File(i)) = owner {
                 if self.watched.resolved.watch[i].notify {
-                    notify_changed.push(path);
                     continue;
                 }
             }
@@ -635,16 +718,15 @@ impl<'a> Session<'a> {
             }
         }
 
-        // Track files of `notify` sets that differ from what the server last built.
+        // Track the files that differ from what the server last built.
         let before = self.pending.clone();
-        for path in notify_changed {
-            let hash = hash_file(&path);
-            let baseline = self
-                .baseline
-                .lock()
-                .ok()
-                .and_then(|b| b.get(&path).copied());
-            if baseline == Some(hash) {
+        for (path, hash) in waiting {
+            let baseline = match self.baseline.lock() {
+                // A file not hashed yet changed before `buck2 dev` saw its old content.
+                Ok(mut baseline) => *baseline.entry(path.clone()).or_insert(Baseline::Unknown),
+                Err(_) => Baseline::Unknown,
+            };
+            if baseline == Baseline::Hash(hash) {
                 self.pending.remove(&path);
             } else {
                 self.pending.insert(path);
@@ -656,37 +738,31 @@ impl<'a> Session<'a> {
                 .await?;
         }
 
-        if regraph {
-            self.reresolve(true).await?;
-        }
-
-        // A changed `.bzl` file may change any target, so it counts as a change to every set.
+        // A changed `.bzl` file may change any target, so it counts as a change to every set
+        // that builds. For `notify` sets it is in `pending`.
         if !graph_changed.is_empty() {
-            for i in 0..self.watched.resolved.watch.len() {
-                let set = &self.watched.resolved.watch[i];
-                if set.notify {
-                    self.pending.extend(graph_changed.iter().cloned());
-                } else {
+            for (i, set) in self.watched.resolved.watch.iter().enumerate() {
+                if !set.notify {
                     changed_sets
                         .entry(i)
                         .or_default()
                         .extend(graph_changed.iter().cloned());
                 }
             }
-            if self.pending != before {
-                self.server
-                    .send(json!({"type": "stale", "files": self.pending}))
-                    .await?;
-            }
         }
 
         if !self.pending.is_empty() {
-            // Building now would build the changed files of the `notify` sets too. Wait until
-            // the server asks for a build, or the files go back to what they were.
+            // Building now would build the changed files of the `notify` sets too, and so would
+            // resolving, which builds the server. Wait until the server asks for a build, or
+            // the files go back to what they were.
+            self.held_regraph |= regraph;
             for (set, files) in changed_sets {
                 self.held.entry(set).or_default().extend(files);
             }
             return Ok(());
+        }
+        if regraph | std::mem::take(&mut self.held_regraph) {
+            self.reresolve(true).await?;
         }
         let mut all = std::mem::take(&mut self.held);
         for (set, files) in changed_sets {
@@ -775,16 +851,8 @@ impl<'a> Session<'a> {
         match self.daemon.resolve().await? {
             Ok(resolved) => {
                 let server_changed = resolved.server != self.server.argv;
-                hash_in_background(
-                    resolved
-                        .watch
-                        .iter()
-                        .filter(|s| s.notify)
-                        .flat_map(|s| s.files.iter().map(PathBuf::from))
-                        .collect(),
-                    self.baseline.clone(),
-                );
                 self.watched = Watched::new(resolved, self.events_tx.clone())?;
+                hash_in_background(self.watched.baseline_files(), self.baseline.clone());
                 if graph_changed {
                     self.server.send(json!({"type": "graph_changed"})).await?;
                 }

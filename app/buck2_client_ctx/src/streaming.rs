@@ -226,6 +226,34 @@ pub trait StreamingCommand: Sized + Send + Sync {
     }
 }
 
+/// How a streaming command connects to the daemon: to one that meets its constraints, starting
+/// it if needed. A command that runs for a long time, such as `buck2 dev`, uses this to connect
+/// again after the daemon it used went away.
+pub fn connect_options<T: StreamingCommand>(
+    command: &T,
+    ctx: &ClientCommandContext<'_>,
+) -> buck2_error::Result<BuckdConnectOptions> {
+    if T::existing_only() {
+        return Ok(BuckdConnectOptions::ExistingOnly);
+    }
+    let mut req = DaemonConstraintsRequest::new(ctx.immediate_config, command.trace_io())?;
+    ctx.restarter.apply_to_constraints(&mut req);
+    Ok(BuckdConnectOptions::Options(BuckdConnectDaemonOptions {
+        constraints: req,
+        daemon_startup_mode: T::daemon_startup_mode(),
+        new_isolation_dir_advice: if ctx.paths()?.isolation.as_str() == DEFAULT_ISOLATION_DIR {
+            Decision::Inactive
+        } else {
+            ctx.agent_advice(Advice::NewIsolationDir)?
+        },
+        trace_id: ctx.trace_id.dupe(),
+        #[cfg(all(fbcode_build, target_os = "linux"))]
+        allow_daemon_start_unsandboxed_via_wrapper: ctx
+            .immediate_config
+            .allow_daemon_start_unsandboxed_via_wrapper()?,
+    }))
+}
+
 impl<T: StreamingCommand> BuckSubcommand for T {
     const COMMAND_NAME: &'static str = T::COMMAND_NAME;
 
@@ -238,29 +266,7 @@ impl<T: StreamingCommand> BuckSubcommand for T {
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let work = async {
-            let mut connect_options = if T::existing_only() {
-                BuckdConnectOptions::ExistingOnly
-            } else {
-                let mut req =
-                    DaemonConstraintsRequest::new(ctx.immediate_config, T::trace_io(&self))?;
-                ctx.restarter.apply_to_constraints(&mut req);
-                BuckdConnectOptions::Options(BuckdConnectDaemonOptions {
-                    constraints: req,
-                    daemon_startup_mode: T::daemon_startup_mode(),
-                    new_isolation_dir_advice: if ctx.paths()?.isolation.as_str()
-                        == DEFAULT_ISOLATION_DIR
-                    {
-                        Decision::Inactive
-                    } else {
-                        ctx.agent_advice(Advice::NewIsolationDir)?
-                    },
-                    trace_id: ctx.trace_id.dupe(),
-                    #[cfg(all(fbcode_build, target_os = "linux"))]
-                    allow_daemon_start_unsandboxed_via_wrapper: ctx
-                        .immediate_config
-                        .allow_daemon_start_unsandboxed_via_wrapper()?,
-                })
-            };
+            let mut connect_options = connect_options(&self, &ctx)?;
             let buckd = match ctx.start_in_process_daemon.take() {
                 None => connect_buckd(connect_options, events_ctx, ctx.paths()?).await,
                 Some(start_in_process_daemon) => {

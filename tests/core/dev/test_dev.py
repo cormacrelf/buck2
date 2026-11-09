@@ -176,6 +176,57 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @buck_test()
+    async def test_bzl_change_waits_with_a_notify_set(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:auto")
+        try:
+            await dev.wait_for("built")
+            defs = (buck.cwd / "defs.bzl").read_text()
+
+            # A `.bzl` file may change any target, so with a `notify` set it waits like a
+            # file of that set: no resolve, which would build the server, and no build.
+            write(buck, "defs.bzl", defs + "# changed\n")
+            stale = await dev.wait_for("stale")
+            assert [os.path.realpath(f) for f in stale["files"]] == [
+                path(buck, "defs.bzl")
+            ]
+            await dev.assert_none("graph_changed", 3)
+            await dev.assert_none("building", 0)
+
+            # Undoing it clears `stale`, and the held resolve and build run.
+            write(buck, "defs.bzl", defs)
+            stale = await dev.wait_for("stale")
+            assert stale["files"] == []
+            await dev.wait_for("graph_changed")
+            await dev.wait_for("built")
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_unknown_request_is_reported(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:bad_request")
+        try:
+            await dev.wait_for("built")
+        finally:
+            output = await dev.stop()
+        assert "ignored a request from the server" in output, output
+        assert '"type": "bulid"' in output, output
+
+    @buck_test()
+    async def test_reconnects_after_the_daemon_restarts(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:all")
+        try:
+            await dev.wait_for("built")
+
+            # Another client may kill or restart the daemon. buck2 dev connects again.
+            await buck.kill()
+            write(buck, "app/main.txt", "app v2\n")
+            built = await dev.wait_for("built")
+            assert site(built) == "app v2\n"
+        finally:
+            output = await dev.stop()
+        assert "connecting again" in output, output
+
+    @buck_test()
     async def test_new_source_file_changes_the_graph(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:pages")
         try:
