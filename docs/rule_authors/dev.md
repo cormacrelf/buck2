@@ -107,8 +107,11 @@ server's stdin, one JSON object per line. The server can write requests to its
 stdout, one JSON object per line. `buck2 dev` prints other lines that the
 server writes to stdout. The server's stderr goes to the terminal.
 
-When `buck2 dev` exits, it closes the server's stdin and kills the server. A
-server that starts processes of its own should stop them when its stdin closes.
+To stop the server, before a restart, `buck2 dev` closes the server's stdin and
+waits up to 5 seconds for it to exit, then kills it. A server that starts
+processes of its own should stop them when its stdin closes. When `buck2 dev`
+itself exits, for example on Ctrl-C, it closes the server's stdin and sends it
+`SIGTERM`.
 
 ### Messages to the server
 

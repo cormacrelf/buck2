@@ -243,7 +243,8 @@ impl Daemon<'_> {
 struct Server {
     argv: Vec<String>,
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once `buck2 dev` has closed it to stop the server.
+    stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
 }
 
@@ -261,7 +262,6 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
             .spawn()
             .with_buck_error_context(|| {
                 format!("Failed to start the `buck2 dev` server `{program}`")
@@ -271,7 +271,7 @@ impl Server {
         Ok(Server {
             argv: resolved.server.clone(),
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
         })
     }
@@ -280,14 +280,43 @@ impl Server {
         let mut line = serde_json::to_vec(&message)?;
         line.push(b'\n');
         // A server that stopped reading is noticed when it exits.
-        if self.stdin.write_all(&line).await.is_ok() {
-            let _ignored = self.stdin.flush().await;
+        if let Some(stdin) = &mut self.stdin {
+            if stdin.write_all(&line).await.is_ok() {
+                let _ignored = stdin.flush().await;
+            }
         }
         Ok(())
     }
 
+    /// Close the server's stdin, so that it can stop what it started, and kill it if it has not
+    /// exited after `SERVER_STOP_TIMEOUT`.
     async fn stop(&mut self) {
-        let _ignored = self.child.kill().await;
+        self.stdin = None;
+        if tokio::time::timeout(SERVER_STOP_TIMEOUT, self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ignored = self.child.kill().await;
+        }
+    }
+}
+
+impl Drop for Server {
+    /// `buck2 dev` is exiting, perhaps on Ctrl-C. Close the server's stdin and ask it to stop;
+    /// there is no time to wait for it.
+    fn drop(&mut self) {
+        self.stdin = None;
+        if matches!(self.child.try_wait(), Ok(None)) {
+            #[cfg(unix)]
+            if let Some(pid) = self.child.id() {
+                // SAFETY: sending a signal to a child process we have not yet waited for.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                return;
+            }
+            let _ignored = self.child.start_kill();
+        }
     }
 }
 
@@ -378,6 +407,9 @@ impl Watched {
             .collect()
     }
 }
+
+/// How long `buck2 dev` waits for a server to exit after closing its stdin.
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest `buck2 dev` waits for files to stop changing before it builds.
 const MAX_DEBOUNCE: Duration = Duration::from_secs(2);
