@@ -314,6 +314,105 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @buck_test()
+    async def test_inputs_set_takes_a_source_file_of_the_target(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:inputs")
+        try:
+            first = await dev.wait_for("ready")
+            await dev.wait_for("built")
+
+            # The server script and `main.txt` are both source files of `:inputs`. The
+            # `inputs` set takes the server script, so `main.txt` only builds the site.
+            write(buck, "app/main.txt", "app v2\n")
+            built = await dev.wait_for("built")
+            assert site(built) == "app v2\n"
+            await dev.assert_none("ready", 0)
+
+            server = (buck.cwd / "app/server.py").read_text()
+            write(buck, "app/server.py", server + "# changed\n")
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_inputs_set_follows_dynamic_actions_and_transitive_sets(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:deep")
+        try:
+            first = await dev.wait_for("ready")
+            await dev.wait_for("built")
+
+            # `lib.txt` is only reachable from `deep` through a dynamic action and a
+            # transitive set, and the `inputs` set that has it restarts the server.
+            write(buck, "lib/lib.txt", "lib v2\n")
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
+
+            # The app's own file is not below `deep`: it only builds the site.
+            await dev.wait_for("built")
+            write(buck, "app/main.txt", "app v2\n")
+            built = await dev.wait_for("built")
+            assert site(built) == "lib v2\napp v2\n"
+            await dev.assert_none("ready", 0)
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_build_file_change_acts_for_the_targets_it_changed(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:split")
+        try:
+            first = await dev.wait_for("ready")
+            built = await dev.wait_for("built")
+            assert site(built) == "part v1\napp v1\n"
+            targets = (buck.cwd / "app/TARGETS.fixture").read_text()
+
+            # `:split` is in the set that builds: changing it builds the site.
+            targets = targets.replace(
+                'mode = "split",\n    srcs = ["main.txt"],',
+                'mode = "split",\n    srcs = ["main.txt", "other.txt"],',
+            )
+            write(buck, "app/TARGETS.fixture", targets)
+            await dev.wait_for("graph_changed")
+            built = await dev.wait_for("built")
+            assert site(built) == "part v1\napp v1\nother v1\n"
+            await dev.assert_none("ready", 0)
+
+            # `:part` is in the set that restarts, though it is in the same build file.
+            targets = targets.replace(
+                'srcs = ["part.txt"]', 'srcs = ["part.txt", "main.txt"]'
+            )
+            write(buck, "app/TARGETS.fixture", targets)
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
+            built = await dev.wait_for("built")
+            assert site(built) == "part v1\napp v1\napp v1\nother v1\n"
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_failed_analysis_runs_again_after_any_change(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:built_server")
+        try:
+            await dev.wait_for("built")
+
+            # Break the server's build, and change the build file, so that `buck2 dev`
+            # analyses the target and builds the server again.
+            write(buck, "app/check.txt", "broken\n")
+            await dev.wait_for("built")
+            targets = (buck.cwd / "app/TARGETS.fixture").read_text()
+            write(buck, "app/TARGETS.fixture", targets + "# changed\n")
+            await dev.wait_for("failed")
+
+            # Fixing it does not change the graph, but the analysis runs again.
+            write(buck, "app/check.txt", "ok\n")
+            await dev.wait_for("graph_changed")
+        finally:
+            await dev.stop()
+
+    @buck_test()
     async def test_target_without_dev_info(self, buck: Buck) -> None:
         await expect_failure(
             buck.run_buck_command("dev", "//app:other"),

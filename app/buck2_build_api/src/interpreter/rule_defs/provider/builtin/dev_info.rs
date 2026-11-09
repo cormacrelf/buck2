@@ -91,8 +91,8 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     /// * `server`: a `RunInfo` or command line that `buck2 dev` starts and keeps running. It
     ///   reads JSON lines from stdin and may write requests to stdout as JSON lines.
     /// * `outputs`: artifacts that `buck2 dev` builds by name.
-    /// * `watch`: a list of `DevWatch`. For a changed file, the first `DevWatch` whose targets
-    ///   use it decides what happens.
+    /// * `watch`: a list of `DevWatch`. For a changed file, the first `DevWatch` whose files
+    ///   include it decides what happens.
     #[starlark(as_type = DevInfo<'static>)]
     fn DevInfo<'v>(
         #[starlark(require = named)] server: Value<'v>,
@@ -182,7 +182,7 @@ impl<'v> DevInfo<'v> {
             .watch_values()?
             .into_iter()
             .map(|w| w.as_ref().spec())
-            .collect())
+            .collect::<buck2_error::Result<_>>()?)
     }
 }
 

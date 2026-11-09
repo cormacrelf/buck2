@@ -56,7 +56,8 @@ makes it, not a build action.
 
 The watch sets in `defs.bzl`:
 
-1. A change to `server/server.py` restarts the server and the app.
+1. A change to `server/server.py` or to ThinLink restarts the server and the
+   app.
 2. A change to `//app:app` builds `patch`.
 3. Any other change builds `exe`. The server starts the app again if the binary
    changed.

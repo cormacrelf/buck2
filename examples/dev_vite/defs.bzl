@@ -88,10 +88,10 @@ def _vite_app_impl(ctx):
             outputs = {"app": app, "packages": packages},
             watch = [
                 # A change to the server script restarts it, and so Vite too.
-                DevWatch(targets = [ctx.attrs.server.label], restart = True),
+                DevWatch(inputs = server, restart = True),
                 # A new `package.json` or lockfile installs the packages again. The server
                 # restarts Vite when they change.
-                DevWatch(targets = [ctx.attrs.packages.label], build = ["packages"]),
+                DevWatch(inputs = packages, build = ["packages"]),
                 # Everything else builds the app files again. The server copies the changed
                 # files to where Vite serves them, and Vite updates the browser.
                 DevWatch(targets = None, build = ["app"]),

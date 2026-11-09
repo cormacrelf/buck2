@@ -78,7 +78,7 @@ def _static_site_impl(ctx):
             outputs = {"www": www},
             watch = [
                 # A change to the server restarts it.
-                DevWatch(targets = [ctx.attrs.server.label], restart = True),
+                DevWatch(inputs = server, restart = True),
                 # Any other change, to a page or to the theme, builds the site again.
                 DevWatch(targets = None, build = ["www"]),
             ],

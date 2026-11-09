@@ -18,19 +18,21 @@ def _subsecond_app_impl(ctx):
     # the crate sets `SUBSECOND_LINK = "thin"` in its `env`.
     patch = ctx.attrs.lib[DefaultInfo].sub_targets["cdylib"][DefaultInfo].default_outputs[0]
 
+    server = cmd_args(
+        "python3",
+        ctx.attrs.server,
+        "--thinlink",
+        ctx.attrs._thinlink[RunInfo],
+    )
     return [
         DefaultInfo(default_output = exe, other_outputs = [patch]),
         DevInfo(
-            server = cmd_args(
-                "python3",
-                ctx.attrs.server,
-                "--thinlink",
-                ctx.attrs._thinlink[RunInfo],
-            ),
+            server = server,
             outputs = {"exe": exe, "patch": patch},
             watch = [
-                # A change to the server script restarts it, and so the app.
-                DevWatch(targets = [ctx.attrs.server.owner.raw_target()], restart = True),
+                # A change to the server script or to ThinLink restarts the server, and so the
+                # app, which the new server builds again.
+                DevWatch(inputs = server, restart = True),
                 # A change to the patched crate builds a patch. The patch does not depend on
                 # the binary, so the binary stays the one that is running.
                 DevWatch(targets = [ctx.attrs.lib.label], build = ["patch"]),

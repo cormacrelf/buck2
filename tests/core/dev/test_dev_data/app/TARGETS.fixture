@@ -62,6 +62,42 @@ dev_app(
     server = "server.py",
 )
 
+dev_app(
+    name = "inputs",
+    mode = "inputs",
+    srcs = ["main.txt"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "deep",
+    mode = "deep",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "split",
+    mode = "split",
+    srcs = ["main.txt"],
+    deps = [":part"],
+    server = "server.py",
+)
+
+concat(
+    name = "part",
+    srcs = ["part.txt"],
+)
+
+dev_app(
+    name = "built_server",
+    mode = "all",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_check = "check.txt",
+)
+
 concat(
     name = "other",
     srcs = ["other.txt"],

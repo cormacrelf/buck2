@@ -148,30 +148,56 @@ pub struct DevRequest {
 
 #[derive(Serialize, Deserialize)]
 pub enum DevAction {
-    /// Build the server, and expand the watch policy into files.
-    Resolve,
+    /// Analyse the target and build the server.
+    Server,
+    /// Expand the watch policy into files. Expanding `DevWatch.inputs` may build what dynamic
+    /// actions need.
+    Watch,
     /// Build the named `DevInfo.outputs`.
     Build { outputs: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum DevResponse {
-    Resolve(DevResolved),
+    Server(DevServer),
+    Watch(DevWatched),
     Build(DevBuilt),
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DevResolved {
+pub struct DevServer {
     /// Absolute path of the project root. The server runs in this directory.
     pub project_root: String,
     /// The server command line. Paths in it are relative to the project root.
     pub server: Vec<String>,
     /// The names of `DevInfo.outputs`.
     pub outputs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevWatched {
     /// The `DevInfo.watch` sets, in order, with their files.
     pub watch: Vec<DevWatchSet>,
     /// Absolute paths of the `.bzl` files that the packages in the dependency graph load.
-    pub graph_files: Vec<String>,
+    pub bzl_files: Vec<String>,
+    /// The build files of the packages in the dependency graph.
+    pub build_files: Vec<DevBuildFile>,
+    /// Absolute paths of the package directories of the dependency graph. A file added to or
+    /// removed from one may change a target.
+    pub dirs: Vec<String>,
+    /// Why some `inputs` could not be expanded, for example because building what a dynamic
+    /// action needs failed. Their sets have the source files of the targets that own those
+    /// inputs and of their dependencies instead. Empty when every input was expanded.
+    pub incomplete: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevBuildFile {
+    /// Absolute path.
+    pub path: String,
+    /// A target of this package belongs to a `notify` set, so a change waits like a change to a
+    /// file of that set.
+    pub waits: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -179,11 +205,11 @@ pub struct DevWatchSet {
     pub build: Vec<String>,
     pub restart: bool,
     pub notify: bool,
-    /// Absolute paths of the source files and build files that belong to this set.
+    /// Absolute paths of the source files that belong to this set.
     pub files: Vec<String>,
-    /// Absolute paths of the package directories that belong to this set. A file added to one
-    /// of them may be a new source file of the set.
-    pub dirs: Vec<String>,
+    /// A digest of the targets that belong to this set. When a build file changes, the sets
+    /// whose digest changed are the ones it changed.
+    pub targets_digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
