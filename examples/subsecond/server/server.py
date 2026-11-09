@@ -10,18 +10,21 @@
 
 `buck2 dev` builds two outputs:
 
-- `exe`: the app's binary. This server starts it, and starts it again when it changes.
-- `patch`: a shared library with the newest code of the patched crate.
+- `exe`: the app's binary. This server starts a copy of it, and starts it again when it
+  changes.
+- `patch`: a shared library with the newest code of the patched crate, linked by ThinLink.
 
 For each new `patch`, this server writes a subsecond jump table to the app's stdin: the
 address of each function in the running binary, and the address of the same function in
-the patch. The app loads the patch, and `subsecond::call` then runs the new code.
+the patch. `thinlink jump-table` makes the table. The app loads the patch, and subsecond
+then runs the new code.
 
 The table is made here, not in a build action, because it must use the binary that is
 running. Building `patch` builds the patched crate again, and Buck would build a new `exe`
 with it if the patch depended on the binary.
 """
 
+import argparse
 import json
 import os
 import shutil
@@ -29,9 +32,9 @@ import signal
 import subprocess
 import sys
 
-# Where this server keeps a copy of each patch. The dynamic loader returns the library it
-# already loaded for a path it has seen, so each patch needs a new path.
-PATCHES = os.path.join("buck-out", "subsecond")
+# Where this server keeps the running binary and each patch. Buck may replace its outputs, and
+# the dynamic loader returns the library it already loaded for a path it has seen.
+STATE = os.path.join("buck-out", "subsecond")
 
 
 def log(message):
@@ -45,48 +48,29 @@ def request(message):
     sys.stdout.flush()
 
 
-def symbols(path, *flags):
-    """The symbols that `nm` lists for `path`, as name to (type, address)."""
-    out = subprocess.run(
-        ["nm", "--format=posix", *flags, path],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    result = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 3:
-            result[parts[0]] = (parts[1], int(parts[2], 16))
-        elif len(parts) == 2:
-            result[parts[0]] = (parts[1], None)
-    return result
-
-
-def is_rust(name):
-    return name.startswith("_R") or name.startswith("_ZN")
+def copy(src, name):
+    os.makedirs(STATE, exist_ok=True)
+    dst = os.path.abspath(os.path.join(STATE, name))
+    shutil.copy2(src, dst)
+    return dst
 
 
 class App:
-    def __init__(self):
+    def __init__(self, thinlink):
+        self.thinlink = thinlink
         self.process = None
-        self.functions = {}
-        self.exported = set()
+        self.exe = None
+        self.runs = 0
         self.patches = 0
 
     def start(self, exe):
         self.stop()
-        # Read the symbols before the app starts: Buck may replace the file at `exe` later.
-        self.functions = {
-            name: address
-            for name, (kind, address) in symbols(exe, "--defined-only").items()
-            if kind in "tT"
-        }
-        self.exported = set(symbols(exe, "--dynamic", "--defined-only"))
+        self.runs += 1
+        self.exe = copy(exe, "app-%d" % self.runs)
         log("starting %s" % exe)
         # The app's stdout must not reach `buck2 dev`, which reads requests from ours.
         self.process = subprocess.Popen(
-            [exe], stdin=subprocess.PIPE, stdout=sys.stderr, text=True
+            [self.exe], stdin=subprocess.PIPE, stdout=sys.stderr, text=True
         )
 
     def stop(self):
@@ -97,44 +81,37 @@ class App:
 
     def patch(self, path):
         """Send the patch at `path` to the app. Returns False if the app needs a new binary."""
-        new = symbols(path, "--defined-only")
-        missing = [
-            name
-            for name in symbols(path, "--dynamic", "--undefined-only")
-            if is_rust(name) and name not in self.exported
-        ]
+        self.patches += 1
+        lib = copy(path, "patch-%d.so" % self.patches)
+        table = json.loads(
+            subprocess.run(
+                [self.thinlink, "jump-table", self.exe, lib],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        missing = table.pop("missing")
         if missing:
             # The new code calls a function that the running binary does not have, for
             # example a generic function with new type arguments.
             log("the patch uses %d functions the app does not have" % len(missing))
             return False
-
-        table = {}
-        for name, (kind, address) in new.items():
-            if kind in "tT" and name in self.functions:
-                table[str(self.functions[name])] = address
-
-        self.patches += 1
-        os.makedirs(PATCHES, exist_ok=True)
-        lib = os.path.abspath(os.path.join(PATCHES, "patch-%d.so" % self.patches))
-        shutil.copyfile(path, lib)
-        message = {
-            "lib": lib,
-            "map": table,
-            "aslr_reference": self.functions["main"],
-            "new_base_address": new["main"][1],
-            "ifunc_count": 0,
-        }
-        self.process.stdin.write(json.dumps(message) + "\n")
+        table["lib"] = lib
+        self.process.stdin.write(json.dumps(table) + "\n")
         self.process.stdin.flush()
-        log("sent patch %d with %d functions" % (self.patches, len(table)))
+        log("sent patch %d with %d functions" % (self.patches, len(table["map"])))
         return True
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--thinlink", required=True)
+    args = parser.parse_args()
+
     # `buck2 dev` sends SIGTERM when it exits. Exit through the `finally` below.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    app = App()
+    app = App(os.path.abspath(args.thinlink))
     try:
         for line in sys.stdin:
             message = json.loads(line)

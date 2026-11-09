@@ -23,20 +23,25 @@ rust_library(
     name = "app",
     srcs = ["src/lib.rs"],
     crate_root = "src/lib.rs",
+    # `:app[cdylib]` is the patch. When rustc links it, ThinLink (see `toolchains/thinlink.rs`)
+    # links only this crate's objects, and leaves the dependencies to the running binary.
+    env = {"SUBSECOND_LINK": "thin"},
     mapped_srcs = {":slow": "src/slow.rs"},
+    # The patch exports nothing, so without this rustc would generate no code for it.
+    rustc_flags = ["-Clink-dead-code"],
     deps = [
         "//third-party:serde_json",
         "//third-party:subsecond",
     ],
 )
 
-# The binary that `buck2 dev` starts. `--export-dynamic` puts its symbols in the dynamic symbol
-# table, so a patch's references to the dependencies resolve to the copies in this binary.
+# The binary that `buck2 dev` starts. ThinLink links all of the dependencies' code into it, and
+# exports their symbols, so that a patch can call any of them.
 rust_binary(
     name = "main",
     srcs = ["main.rs"],
     crate_root = "main.rs",
-    rustc_flags = ["-Clink-arg=-Wl,--export-dynamic"],
+    env = {"SUBSECOND_LINK": "fat"},
     deps = [":app"],
 )
 

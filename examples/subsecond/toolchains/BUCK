@@ -6,7 +6,48 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+load("@prelude//toolchains:cxx.bzl", "cxx_tools_info_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
+load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
+load(":thinlink.bzl", "thinlink_cxx_tools")
 
-# The prelude refers to a `toolchains` cell. This example's rules use none of them.
-system_demo_toolchains()
+# ThinLink, the linker for subsecond. It is built with `rustc` from your `PATH`, not with
+# `rust_binary`, which would need the C++ toolchain below, of which it is a part.
+genrule(
+    name = "thinlink",
+    srcs = ["thinlink.rs"],
+    out = "thinlink",
+    cmd = "rustc --edition=2021 -O -o $OUT $SRCS",
+    executable = True,
+    visibility = ["PUBLIC"],
+)
+
+thinlink_cxx_tools(
+    name = "thinlink_clang_tools",
+    base = "prelude//toolchains/cxx/clang:path_clang_tools",
+    thinlink = ":thinlink",
+)
+
+# Clang from your `PATH`, with ThinLink around the linker. The Rust rules link with it.
+cxx_tools_info_toolchain(
+    name = "cxx",
+    cxx_tools_info = ":thinlink_clang_tools",
+    visibility = ["PUBLIC"],
+)
+
+system_rust_toolchain(
+    name = "rust",
+    default_edition = "2021",
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
