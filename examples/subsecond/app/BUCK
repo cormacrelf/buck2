@@ -1,0 +1,38 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//:defs.bzl", "subsecond_app")
+
+# The crate that `buck2 dev` patches while the app runs.
+rust_library(
+    name = "app",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//third-party:serde_json",
+        "//third-party:subsecond",
+    ],
+)
+
+# The binary that `buck2 dev` starts. `--export-dynamic` puts its symbols in the dynamic symbol
+# table, so a patch's references to the dependencies resolve to the copies in this binary.
+rust_binary(
+    name = "main",
+    srcs = ["main.rs"],
+    crate_root = "main.rs",
+    rustc_flags = ["-Clink-arg=-Wl,--export-dynamic"],
+    deps = [":app"],
+)
+
+# `buck2 dev //app:dev` runs `:main`, and patches `:app` into it.
+subsecond_app(
+    name = "dev",
+    binary = ":main",
+    lib = ":app",
+    server = "//server:server.py",
+)
