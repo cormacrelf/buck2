@@ -67,7 +67,7 @@ changes.
 | Argument  | Meaning                                                                                                                         |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `targets` | Target patterns (`"root//lib/..."`) or labels (`ctx.label`, `dep.label`). Their own source files belong to the set, not those of their dependencies. `None` means all targets in the dependency graph. |
-| `inputs`  | Artifacts, or anything else `cmd_args` takes, such as a `RunInfo`. The source files they are built from belong to the set, all the way down the action graph. |
+| `inputs`  | Artifacts, or anything else `cmd_args` takes, such as a `RunInfo`. The targets they are built from belong to the set, with their source files. See [What `inputs` claim](#what-inputs-claim). |
 | `build`   | Names of `DevInfo.outputs` to build after a change. `buck2 dev` then sends the server a `built` message.                       |
 | `restart` | Build the server again, stop it, and start it again.                                                                             |
 | `notify`  | Tell the server about the change, and build nothing. See [Changes that wait](#changes-that-wait).                                |
@@ -82,7 +82,8 @@ program loads a new build of. Its patch is built from the crate's own source
 files and from the libraries it uses, but only a change to the crate's own
 files can go into a patch. `targets = [crate.label]` claims those. In contrast,
 a server is out of date when anything it is built from changes, so
-`inputs = server` suits it.
+`inputs = server`, which also claims the targets that the server depends on,
+suits it.
 
 For each file, the **first** `DevWatch` whose files include it decides. Put
 the narrow sets first, and a `targets = None` set last for the rest of the
@@ -138,15 +139,32 @@ and, if there is a `notify` set, sends `stale` with the project root (see
 The daemon finds what the sets claim once, and again only when the graph
 changes: a target, a build file or a `.bzl` file. A change to a source file is
 looked up in what it found, so what a change costs does not grow with the
-graph. It keeps no list of the files: a set claims most files as the source
-files of its targets, which the targets already have.
+graph. What it finds is which set has which target: it lists no source files,
+since the targets already have them.
 
-To find the files of `inputs`, the daemon walks the action graph below them.
-An action that a [dynamic action](dynamic_dependencies.md) creates is only
-known once the dynamic action has run, so the walk builds what dynamic actions
-need, with the files as they are then, and is done again when what they read
-changes. If that build fails, the set gets the source files of the targets
-that own those inputs and of their dependencies instead.
+### What `inputs` claim
+
+A set claims the source files of `inputs` target by target, not file by file:
+
+- Of the target that owns an input, the set claims the source files that the
+  target's actions build the input from, and no others. So a rule that builds
+  the server and other outputs in one target can give the server's source files
+  to one set and leave the rest to another.
+- What those actions take from other targets gives the set those targets and
+  all their dependencies, with all of their source files, whether or not the
+  input is built from each one.
+
+So a set with `inputs` may claim a file that its input is not built from: a
+source file of a dependency that only another output of that dependency uses.
+A change to it then builds or restarts although nothing is new. That keeps
+`buck2 dev` from walking the action graph below the input, which takes far
+longer than walking the targets.
+
+An action that a [dynamic action](dynamic_dependencies.md) of the owning target
+creates is only known once the dynamic action has run, so finding the claims
+builds what such dynamic actions need, with the files as they are then, and is
+done again when what they read changes. If that build fails, the set gets the
+source files of the owning target and of its dependencies instead.
 
 ### Changes to the graph
 
@@ -156,8 +174,8 @@ The daemon also compares the build files of the packages in the graph, the
 
 - A changed build file, or a file added to or removed from a package, counts
   as a change to the sets whose targets it changed. The targets of a set are
-  those its `targets` match, and the targets that own the actions below its
-  `inputs`. Each target belongs to the first set that has it.
+  those its `targets` match, and the targets that its `inputs` are built from.
+  Each target belongs to the first set that has it.
 - A changed `.bzl` file may change what any rule does, so it counts as a
   change to every set.
 - If the server's command line changed, `buck2 dev` starts the server again.
@@ -249,8 +267,9 @@ By default the server stays in the background. Its stdin is empty, and Ctrl-C
 reaches only `buck2 dev`, which stops the server and exits.
 
 When `buck2 dev` uses the superconsole, it keeps it for the whole session. Each
-build shows its progress there, and between builds one line says how many files
-`buck2 dev` watches, whether the server runs, and how the last build went. The
+build shows its progress there, and between builds one line says how many
+targets `buck2 dev` watches, whether the server runs, and how the last build
+went. The
 server's stdout and stderr are one pseudo-terminal that `buck2 dev` reads, so
 the server still writes to a terminal and keeps its colours and line buffering.
 Its lines appear above the superconsole. Other terminal control, such as moving

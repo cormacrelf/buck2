@@ -793,9 +793,9 @@ struct Watched {
 }
 
 impl Watched {
-    /// The number of files that the watch sets claim.
-    fn files(&self) -> usize {
-        self.sets.iter().map(|set| set.files).sum()
+    /// The number of targets that the watch sets have.
+    fn targets(&self) -> usize {
+        self.sets.iter().map(|set| set.targets).sum()
     }
 }
 
@@ -1031,8 +1031,8 @@ impl<'a> Session<'a> {
             None => "the server starts again after the next change",
         };
         let mut status = format!(
-            "buck2 dev: watching {} files, {server}",
-            self.watched.files()
+            "buck2 dev: watching {} targets, {server}",
+            self.watched.targets()
         );
         if let Some((result, took)) = &self.last_build {
             status.push_str(&format!(

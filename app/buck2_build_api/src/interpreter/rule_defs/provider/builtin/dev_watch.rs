@@ -55,7 +55,8 @@ pub struct DevWatchSpec {
     /// Target patterns whose own source files belong to this set. `None` means every target in
     /// the dependency graph that an earlier set did not claim.
     pub targets: Option<Vec<String>>,
-    /// Artifacts whose source files, all the way down the action graph, belong to this set.
+    /// Artifacts. The targets that they are built from belong to this set, with their source
+    /// files.
     pub inputs: Vec<ArtifactGroup>,
     /// Names of the `DevInfo.outputs` to build when a file of this set changes.
     pub build: Vec<String>,
@@ -130,7 +131,9 @@ fn dev_watch_creator(globals: &mut GlobalsBuilder) {
     ///   to the set, not those of their dependencies. `None` stands for every target in the
     ///   dependency graph that an earlier `DevWatch` did not claim.
     /// * `inputs`: artifacts, or anything else `cmd_args` takes, such as a `RunInfo`. The
-    ///   source files they are built from belong to the set, all the way down the action graph.
+    ///   targets that they are built from belong to the set, with their source files: of the
+    ///   target that owns an input, the files that its actions build the input from, and all the
+    ///   source files of the other targets that those actions use, and of their dependencies.
     /// * `build`: names of `DevInfo.outputs` to build after a change.
     /// * `restart`: rebuild the server and start it again after a change.
     /// * `notify`: only tell the server; build nothing until it asks.

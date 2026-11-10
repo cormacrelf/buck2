@@ -85,6 +85,12 @@ impl PackageListing {
         }
     }
 
+    /// The directories under this package, except for subpackages and their contents. The
+    /// directory of the package itself is not one of them.
+    pub fn directories(&self) -> impl Iterator<Item = &PackageRelativePath> {
+        self.listing.directories.iter()
+    }
+
     pub fn files_within<'a>(
         &'a self,
         dir: &PackageRelativePath,

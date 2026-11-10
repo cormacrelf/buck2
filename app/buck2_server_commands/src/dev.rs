@@ -20,11 +20,12 @@
 //! The client runs the server, and acts on the file changes that the daemon's file watcher pushes
 //! to it through a subscription, so no daemon command lasts longer than one build.
 //!
-//! What the watch sets claim is a DICE key, `DevClaimsKey`. Finding it walks the graph of the
-//! target, and the action graph below `DevWatch.inputs`, which builds what dynamic actions need
-//! to say what they do. It reads the contents of no source file, so DICE keeps it while only
-//! source files change: a `Watch` or a `Build` then looks up the changed paths in it, and what
-//! that costs does not grow with the graph. Its value has no file by name; see `DevClaims`.
+//! What the watch sets claim is a DICE key, `DevClaimsKey`. Finding it walks the targets of the
+//! graph, and the actions of the targets that own `DevWatch.inputs`, which builds what dynamic
+//! actions of those targets need to say what they do. It reads the contents of no source file,
+//! so DICE keeps it while only source files change: a `Watch` or a `Build` then looks up the
+//! changed paths in it, and what that costs does not grow with the graph. Its value says which
+//! set has which target, and lists no source files; see `DevClaims`.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -73,6 +74,8 @@ use buck2_common::file_ops::metadata::FileType;
 use buck2_common::file_ops::metadata::RawPathMetadata;
 use buck2_common::file_ops::metadata::RawSymlink;
 use buck2_common::io::IoProvider;
+use buck2_common::package_listing::dice::DicePackageListingResolver;
+use buck2_common::package_listing::resolver::PackageListingResolver;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::CellResolver;
@@ -93,6 +96,7 @@ use buck2_data::BuildResult;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_execute::artifact::fs::ExecutorFs;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::load_module::InterpreterCalculation;
@@ -553,16 +557,48 @@ fn tail(stream: &str) -> String {
     format!("[{start} bytes left out]\n{}", &stream[start..])
 }
 
-/// What the watch sets claim, with every file by name. Finding it walks the whole graph, so it
-/// is only done when the graph changed, to make a `DevClaims`, and when `buck2 dev` asks for
-/// every file that is compared by its contents.
-struct FullClaims {
-    /// Each source file, with the set that claims it.
+/// Logs how long the steps of finding the claims take, at the `debug` level: run the daemon
+/// with `BUCK_LOG=buck2_server_commands::dev=debug`. `tests/dev_bench/bench.py` shows them.
+struct Timer {
+    start: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl Timer {
+    fn new() -> Timer {
+        let now = std::time::Instant::now();
+        Timer {
+            start: now,
+            last: now,
+        }
+    }
+
+    /// Log that `step` is done, how long it took, and how long everything took so far.
+    fn step(&mut self, step: &str) {
+        let now = std::time::Instant::now();
+        tracing::debug!(
+            "buck2 dev: {step}: {:.1}ms ({:.1}ms so far)",
+            (now - self.last).as_secs_f64() * 1000.0,
+            (now - self.start).as_secs_f64() * 1000.0,
+        );
+        self.last = now;
+    }
+}
+
+/// What the watch sets claim, before it is made small enough to keep.
+///
+/// Finding it walks the targets of the graph, not their source files and not the action graph:
+/// a set claims the targets that its `targets` match, and the targets that its `inputs` are
+/// built from, with all their source files. Which file that is comes from the targets when a
+/// file changes; see `DevClaims::classify`. Only the actions of the targets that own the
+/// `inputs` are looked at, so that a target that builds an input and other things does not give
+/// the set the source files of the other things.
+struct GraphClaims {
+    /// The targets of the graph.
+    nodes: Vec<ConfiguredTargetNode>,
+    /// The source files that a set claims by name: those that the actions of the targets that
+    /// own its `inputs` use, and those that claimed symlinks point at.
     files: BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)>,
-    /// The set that claims each source file as a source file of one of the set's targets. A file
-    /// of `files` that is not here with the same set is claimed in another way: it is below the
-    /// `inputs` of the set, or a claimed symlink points at it.
-    own_files: BuckMutMap<ProjectRelativePathBuf, usize>,
     /// The set of each target of the graph that a set has.
     targets: BuckMutMap<ConfiguredTargetLabel, usize>,
     /// The set that claims the own source files of each target.
@@ -580,17 +616,31 @@ struct FullClaims {
     incomplete: Vec<String>,
 }
 
-/// Walk the configured dependency graph of `label`, and the action graph below the `inputs` of
-/// each watch set. Give each source file, and each target, to the first watch set that claims
-/// it.
+impl GraphClaims {
+    /// The set that claims the source file `path` of a target whose own source files `own`
+    /// claims: the lower of that set and the one that claims the file by name.
+    fn set_of_own_file(&self, cell_resolver: &CellResolver, path: CellPath, own: usize) -> usize {
+        match project_path(cell_resolver, path) {
+            Ok(Some(rel)) => match self.files.get(&rel) {
+                Some((set, _)) => own.min(*set),
+                None => own,
+            },
+            _ => own,
+        }
+    }
+}
+
+/// Walk the configured dependency graph of `label`. Give each target to the first watch set
+/// that claims it.
 ///
 /// This reads the contents of no source file, so that a `DevClaims` made from it stays valid
 /// when one changes.
-async fn full_claims(
+async fn graph_claims(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
     watch: &[DevWatchSpec],
-) -> buck2_error::Result<FullClaims> {
+) -> buck2_error::Result<GraphClaims> {
+    let mut timer = Timer::new();
     let cell_resolver = dice.get_cell_resolver().await?;
     let cell = label.target().pkg().cell_name();
     let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?;
@@ -620,19 +670,20 @@ async fn full_claims(
         .get_configured_target_node(label.target())
         .await
         .require_compatible()?;
-    let nodes = dependency_closure(root);
+    let nodes = dependency_closure([root.dupe()]);
     let by_label: BuckMutMap<ConfiguredTargetLabel, ConfiguredTargetNode> = nodes
         .iter()
         .map(|node| (node.label().dupe(), node.dupe()))
         .collect();
+    timer.step(&format!("the {} targets of the graph", nodes.len()));
 
-    // The lowest watch set index that claims each source file, and each target. A set claims
-    // the targets that its `targets` match, with their own source files. It also claims the
-    // targets that own the actions below its `inputs`, but not their other source files: only
-    // the ones those actions use. The targets of a set say which sets a build file change
-    // changed.
+    // The lowest watch set index that claims each target, and each source file that a set
+    // claims by name. A set claims the targets that its `targets` match, with their own source
+    // files. Of the targets that own its `inputs`, it claims only the source files that their
+    // actions use. What those actions take from other targets gives it those targets and their
+    // dependencies, with their own source files. The targets of a set say which sets a build
+    // file change changed.
     let mut files: BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)> = BuckMutMap::default();
-    let mut own_files: BuckMutMap<ProjectRelativePathBuf, usize> = BuckMutMap::default();
     let mut targets: BuckMutMap<ConfiguredTargetLabel, usize> = BuckMutMap::default();
     let mut with_own_files: BuckMutMap<ConfiguredTargetLabel, usize> = BuckMutMap::default();
     let mut incomplete = Vec::new();
@@ -659,18 +710,29 @@ async fn full_claims(
                 claim(&mut targets, owner, set);
             }
         }
+        // What the inputs take from other targets can only be built from the source files of
+        // those targets and their dependencies. So can an input that could not be expanded,
+        // from those of its owner.
+        let mut beyond: Vec<ConfiguredTargetNode> = walk
+            .beyond
+            .iter()
+            .filter_map(|target| by_label.get(target))
+            .map(|node| node.dupe())
+            .collect();
         for (owner, error) in walk.failed {
             incomplete.push(format!("`DevInfo.watch[{set}].inputs`: {error:#}"));
-            // The input comes from the owner's analysis, so it can only be built from the
-            // source files of the owner and its dependencies.
-            if let Some(node) = owner.and_then(|owner| by_label.get(&owner)) {
-                for node in dependency_closure(node) {
-                    claim(&mut targets, node.label().dupe(), set);
-                    claim(&mut with_own_files, node.label().dupe(), set);
-                }
-            }
+            beyond.extend(
+                owner
+                    .and_then(|owner| by_label.get(&owner))
+                    .map(|node| node.dupe()),
+            );
+        }
+        for node in dependency_closure(beyond) {
+            claim(&mut targets, node.label().dupe(), set);
+            claim(&mut with_own_files, node.label().dupe(), set);
         }
     }
+    timer.step("the targets of each set");
 
     let notify_sets = watch.iter().any(|spec| spec.notify);
     let mut set_targets: Vec<Vec<ConfiguredTargetNode>> = vec![Vec::new(); watch.len()];
@@ -679,13 +741,6 @@ async fn full_claims(
     let mut packages = BTreeSet::new();
     let mut package_dirs = BTreeSet::new();
     for node in &nodes {
-        if let Some(&set) = with_own_files.get(node.label()) {
-            for input in node.inputs() {
-                if let Some(rel) = claim_file(&mut files, cell_resolver, input, set)? {
-                    claim(&mut own_files, rel, set);
-                }
-            }
-        }
         let set = targets.get(node.label()).copied();
         if let Some(set) = set {
             set_targets[set].push(node.dupe());
@@ -701,20 +756,108 @@ async fn full_claims(
                 set.is_some_and(|set| watch[set].notify);
         }
     }
-    // A source file that is a symlink is built from the file that it points at, which the set
-    // claims too. Whether a path is a symlink, or is behind one, comes from the listings of the
-    // directories above it, so this depends on the contents of no file, and on the listing of
-    // a directory only for which of its entries are symlinks.
+    timer.step(&format!("the {} packages of the graph", packages.len()));
+
+    let mut claims = GraphClaims {
+        nodes,
+        files,
+        targets,
+        with_own_files,
+        set_targets,
+        package_dirs,
+        build_files,
+        bzl_files: BTreeMap::new(),
+        notify_sets,
+        incomplete,
+    };
+    claim_symlink_targets(dice, cell_resolver, &packages, &mut claims).await?;
+    timer.step("the symlinks in the packages");
+
+    claims.bzl_files = loaded_files(dice, cell_resolver, packages).await?;
+    // A build file changes the graph, even when a target also uses it as a source file.
+    for path in claims.build_files.keys() {
+        claims.files.remove(path);
+    }
+    timer.step("the `.bzl` files that the packages load");
+    Ok(claims)
+}
+
+/// A source file that is a symlink is built from the file that it points at, which the set
+/// claims too, by name.
+///
+/// The symlinks come from the listings of the directories of the packages, and not from the
+/// source files of the targets: there are few symlinks, and many source files. Whether an entry
+/// of a directory is a symlink depends on the contents of no file, and on the listing of the
+/// directory only for which of its entries are symlinks.
+async fn claim_symlink_targets(
+    dice: &mut DiceComputations<'_>,
+    cell_resolver: &CellResolver,
+    packages: &BTreeSet<PackageLabel>,
+    claims: &mut GraphClaims,
+) -> buck2_error::Result<()> {
+    let listings = dice
+        .try_compute_join(packages.iter().copied(), async |dice, package| {
+            buck2_error::Ok((
+                package,
+                DicePackageListingResolver(dice).resolve(package).await?,
+            ))
+        })
+        .await?;
+    // The directories of each package.
+    let mut package_of: BuckMutMap<ProjectRelativePathBuf, PackageLabel> = BuckMutMap::default();
+    for (package, listing) in &listings {
+        let root = package.as_cell_path();
+        if let Some(dir) = project_path(cell_resolver, root)? {
+            package_of.insert(dir, *package);
+        }
+        for dir in listing.directories() {
+            if let Some(dir) = project_path(cell_resolver, root.join(dir))? {
+                package_of.insert(dir, *package);
+            }
+        }
+    }
     let mut symlinks = Symlinks::default();
     symlinks
-        .fill(dice, cell_resolver, files.keys().map(|path| &**path))
+        .fill(dice, cell_resolver, package_of.keys().map(|dir| &**dir))
         .await?;
+
+    // The source files that are symlinks, or behind one, with the set that claims them.
     let mut links: Vec<(usize, CellPath)> = Vec::new();
-    for (path, (set, cell_path)) in &files {
+    // Those that a set claims by name.
+    for (path, (set, cell_path)) in &claims.files {
         if symlinks.is_behind(dice, cell_resolver, path).await? {
             links.push((*set, cell_path.dupe()));
         }
     }
+    // Those of the targets whose own source files a set claims: the symlinks in a package are
+    // source files of the targets of that package.
+    let mut linked: BTreeMap<PackageLabel, Vec<CellPath>> = BTreeMap::new();
+    for (dir, names) in &symlinks.links {
+        let Some(package) = package_of.get(dir) else {
+            continue;
+        };
+        for name in names.iter() {
+            let link = dir.join(ForwardRelativePath::new(name)?);
+            linked
+                .entry(*package)
+                .or_default()
+                .push(cell_resolver.get_cell_path(&link));
+        }
+    }
+    for node in &claims.nodes {
+        let (Some(linked), Some(own)) = (
+            linked.get(&node.label().pkg()),
+            claims.with_own_files.get(node.label()),
+        ) else {
+            continue;
+        };
+        for input in node.inputs() {
+            if linked.iter().any(|link| input.starts_with(*link)) {
+                links.push((claims.set_of_own_file(cell_resolver, input, *own), input));
+            }
+        }
+    }
+
     for _ in 0..MAX_SYMLINK_HOPS {
         if links.is_empty() {
             break;
@@ -737,31 +880,15 @@ async fn full_claims(
             let Some(rel) = project_path(cell_resolver, target.dupe())? else {
                 continue;
             };
-            let new = !files.contains_key(&rel);
-            claim_file(&mut files, cell_resolver, target.dupe(), set)?;
+            let new = !claims.files.contains_key(&rel);
+            claim_file(&mut claims.files, cell_resolver, target.dupe(), set)?;
             // Only a symlink is read again: reading a file would depend on its contents.
             if new && symlinks.is_behind(dice, cell_resolver, &rel).await? {
                 links.push((set, target));
             }
         }
     }
-    let bzl_files = loaded_files(dice, cell_resolver, packages).await?;
-    // A build file changes the graph, even when a target also uses it as a source file.
-    for path in build_files.keys() {
-        files.remove(path);
-    }
-    Ok(FullClaims {
-        files,
-        own_files,
-        targets,
-        with_own_files,
-        set_targets,
-        package_dirs,
-        build_files,
-        bzl_files,
-        notify_sets,
-        incomplete,
-    })
+    Ok(())
 }
 
 /// Which paths are symlinks, or are behind one, from the listings of the directories above them.
@@ -774,19 +901,19 @@ struct Symlinks {
 }
 
 impl Symlinks {
-    /// Find which of the directories above `paths` are symlinks or behind one, and the symlinks
-    /// in the others. The directories of one depth are looked at together, after those above
-    /// them, so that no directory behind a symlink is listed.
+    /// Find which of `dirs`, and of the directories above them, are symlinks or behind one, and
+    /// the symlinks in the others. The directories of one depth are looked at together, after
+    /// those above them, so that no directory behind a symlink is listed.
     async fn fill<'a>(
         &mut self,
         dice: &mut DiceComputations<'_>,
         cell_resolver: &CellResolver,
-        paths: impl Iterator<Item = &'a ProjectRelativePath>,
+        dirs: impl Iterator<Item = &'a ProjectRelativePath>,
     ) -> buck2_error::Result<()> {
         let mut seen: BuckMutSet<&ProjectRelativePath> = BuckMutSet::default();
         let mut by_depth: Vec<Vec<&ProjectRelativePath>> = Vec::new();
-        for path in paths {
-            let mut above = path.parent();
+        for dir in dirs {
+            let mut above = Some(dir);
             while let Some(dir) = above {
                 if self.behind.contains_key(dir) || !seen.insert(dir) {
                     break;
@@ -972,19 +1099,20 @@ enum Claimed {
 /// A set claims most files as the source files of its targets, and the targets already have
 /// those, so this only says which set has which target. To find the set of a path, `classify`
 /// looks at the targets of the packages that the path is in, as the `owner()` query does. Only
-/// the files that a set claims in another way are kept, as hashes of their paths.
+/// the few files that a set claims by name are kept, as hashes of their paths: those that the
+/// actions of the targets that own its `inputs` use, and those that claimed symlinks point at.
 ///
 /// This depends on the graph and not on the contents of source files, so DICE keeps it while
 /// only those change, and makes it again when a target, a build file or a `.bzl` file does.
-/// The exceptions are sets whose `inputs` are made by dynamic actions, which depend on what
-/// those read.
+/// The exceptions are sets whose `inputs` are made by dynamic actions of the targets that own
+/// them, which depend on what those read.
 #[derive(Allocative, Debug, PartialEq, Eq)]
 struct DevClaims {
     /// For each target of the graph, by the hash of its unconfigured label: the set that has it,
     /// and the set that claims its own source files. Sorted.
     targets: Vec<(u64, u32, u32)>,
-    /// The source files that a set claims other than as a source file of one of its targets, by
-    /// the hash of their project-relative path, with the set. Sorted.
+    /// The source files that a set claims by name, by the hash of their project-relative path,
+    /// with the set. Sorted.
     files: Vec<(u64, u32)>,
     /// The packages of the graph, and the files that matter outside them: what the session's
     /// file change subscription needs to drop the changes that cannot matter.
@@ -995,8 +1123,8 @@ struct DevClaims {
     bzl_files: Vec<u64>,
     /// For each set, a digest of its targets.
     targets_digests: Vec<String>,
-    /// For each set, how many source files it claims.
-    file_counts: Vec<usize>,
+    /// For each set, how many targets it has.
+    target_counts: Vec<usize>,
     /// The `.bzl` files that the graph loads, and their contents.
     bzl_digest: String,
     /// The build files of the graph and the `.bzl` files, and their contents.
@@ -1006,10 +1134,14 @@ struct DevClaims {
 }
 
 impl DevClaims {
-    async fn new(dice: &mut DiceComputations<'_>, full: FullClaims) -> buck2_error::Result<Self> {
-        let FullClaims {
+    async fn new(
+        dice: &mut DiceComputations<'_>,
+        claims: GraphClaims,
+    ) -> buck2_error::Result<Self> {
+        let mut timer = Timer::new();
+        let GraphClaims {
+            nodes: _,
             files,
-            own_files,
             targets,
             with_own_files,
             set_targets,
@@ -1018,7 +1150,7 @@ impl DevClaims {
             bzl_files,
             notify_sets,
             incomplete,
-        } = full;
+        } = claims;
 
         let mut by_label: BTreeMap<u64, (u32, u32)> = BTreeMap::new();
         for (label, set) in &targets {
@@ -1034,14 +1166,10 @@ impl DevClaims {
             entry.1 = entry.1.min(*set as u32);
         }
 
-        let mut file_counts = vec![0; set_targets.len()];
-        let mut other_files: Vec<(u64, u32)> = Vec::new();
-        for (path, (set, _)) in &files {
-            file_counts[*set] += 1;
-            if own_files.get(path) != Some(set) {
-                other_files.push((stable_hash(path.as_str()), *set as u32));
-            }
-        }
+        let mut other_files: Vec<(u64, u32)> = files
+            .iter()
+            .map(|(path, (set, _))| (stable_hash(path.as_str()), *set as u32))
+            .collect();
         other_files.sort_unstable();
         // The lowest set of a hash comes first, and is the one found.
         other_files.dedup_by_key(|(hash, _)| *hash);
@@ -1074,6 +1202,7 @@ impl DevClaims {
                 .map(|(path, cell_path)| (path, digest_of(cell_path))),
         );
         let graph_digest = files_digest(&mut graph_files);
+        timer.step("the contents of the build files and `.bzl` files");
 
         let mut build_file_hashes: Vec<(u64, bool)> = build_files
             .iter()
@@ -1086,6 +1215,11 @@ impl DevClaims {
             .collect();
         bzl_hashes.sort_unstable();
 
+        let targets_digests: Vec<String> = set_targets
+            .iter()
+            .map(|nodes| targets_digest(nodes.iter().collect()))
+            .collect();
+        timer.step("the digests of the targets of each set");
         let interest = Arc::new(FileInterest::new(
             package_dirs.iter().map(|dir| &**dir),
             other_files
@@ -1103,11 +1237,8 @@ impl DevClaims {
             interest,
             build_files: build_file_hashes,
             bzl_files: bzl_hashes,
-            targets_digests: set_targets
-                .iter()
-                .map(|nodes| targets_digest(nodes.iter().collect()))
-                .collect(),
-            file_counts,
+            targets_digests,
+            target_counts: set_targets.iter().map(|nodes| nodes.len()).collect(),
             bzl_digest,
             graph_digest,
             notify_sets,
@@ -1210,8 +1341,8 @@ impl Key for DevClaimsKey {
         _cancellations: &CancellationContext,
     ) -> Self::Value {
         let watch = dev_watch(ctx, &self.0).await?;
-        let full = full_claims(ctx, &self.0, &watch).await?;
-        Ok(Arc::new(DevClaims::new(ctx, full).await?))
+        let claims = graph_claims(ctx, &self.0, &watch).await?;
+        Ok(Arc::new(DevClaims::new(ctx, claims).await?))
     }
 
     fn equality_behavior() -> EqualityBehavior<Self::Value> {
@@ -1301,15 +1432,33 @@ async fn watch_files(
     // too, without their contents, for when the analysis fails and cannot say what a path is.
     let mut compared = Vec::new();
     if request.all_compared && watch.iter().any(|spec| spec.restart || spec.notify) {
-        let full = full_claims(dice, label, watch).await?;
-        let restarts: Vec<(&ProjectRelativePathBuf, usize, CellPath)> = full
-            .files
-            .iter()
-            .filter(|(_, (set, _))| watch[*set].restart)
-            .map(|(path, (set, cell_path))| (path, *set, cell_path.dupe()))
-            .collect();
+        let graph = graph_claims(dice, label, watch).await?;
+        // The files of the sets that restart: those they claim by name, and the source files of
+        // the targets whose own source files they claim.
+        let mut restarts: BTreeMap<ProjectRelativePathBuf, (usize, CellPath)> = BTreeMap::new();
+        for (path, (set, cell_path)) in &graph.files {
+            if watch[*set].restart {
+                restarts.insert(path.clone(), (*set, cell_path.dupe()));
+            }
+        }
+        for node in &graph.nodes {
+            let Some(own) = graph.with_own_files.get(node.label()) else {
+                continue;
+            };
+            for input in node.inputs() {
+                let set = graph.set_of_own_file(cell_resolver, input, *own);
+                if !watch[set].restart {
+                    continue;
+                }
+                if let Some(path) = project_path(cell_resolver, input)? {
+                    if !graph.build_files.contains_key(&path) {
+                        restarts.entry(path).or_insert((set, input));
+                    }
+                }
+            }
+        }
         compared = dice
-            .try_compute_join(restarts, async |dice, (path, set, cell_path)| {
+            .try_compute_join(restarts, async |dice, (path, (set, cell_path))| {
                 buck2_error::Ok(DevPath {
                     path: path.to_string(),
                     set: Some(set),
@@ -1318,12 +1467,12 @@ async fn watch_files(
                 })
             })
             .await?;
-        let waiting = full
+        let waiting = graph
             .build_files
             .iter()
             .filter(|(_, (waits, _))| *waits)
             .map(|(path, _)| path)
-            .chain(full.bzl_files.keys().filter(|_| full.notify_sets));
+            .chain(graph.bzl_files.keys().filter(|_| graph.notify_sets));
         compared.extend(waiting.map(|path| DevPath {
             path: path.to_string(),
             set: None,
@@ -1360,12 +1509,12 @@ async fn watch_files(
     Ok(DevWatched {
         watch: watch
             .iter()
-            .zip(&claims.file_counts)
-            .map(|(spec, files)| DevWatchSet {
+            .zip(&claims.target_counts)
+            .map(|(spec, targets)| DevWatchSet {
                 build: spec.build.clone(),
                 restart: spec.restart,
                 notify: spec.notify,
-                files: *files,
+                targets: *targets,
             })
             .collect(),
         state,
@@ -1438,13 +1587,15 @@ fn targets_digest(mut nodes: Vec<&ConfiguredTargetNode>) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// What the `inputs` of a watch set lead to in the action graph.
+/// What the `inputs` of a watch set lead to, in the actions of the targets that own them.
 #[derive(Default)]
 struct InputsWalk {
-    /// The source files that the inputs are built from.
+    /// The source files that those actions use.
     sources: Vec<CellPath>,
-    /// The targets that own the actions and transitive sets on the way.
+    /// The targets that own the inputs.
     owners: BuckMutSet<ConfiguredTargetLabel>,
+    /// The other targets that own what those actions use.
+    beyond: BuckMutSet<ConfiguredTargetLabel>,
     /// Inputs that could not be expanded, with the target that owns them.
     failed: Vec<(Option<ConfiguredTargetLabel>, buck2_error::Error)>,
 }
@@ -1497,50 +1648,72 @@ impl WalkStep {
     }
 }
 
-/// Find the source files that `inputs` are built from. The walk goes one level of the graph at a
-/// time, so that each level is computed concurrently, and so that deep transitive sets do not
-/// need deep recursion.
+/// Find the source files that the actions of the targets that own `inputs` use, and the other
+/// targets that own what those actions use. The walk stops there: what it would find in the
+/// action graph below is built from the source files of those targets and their dependencies,
+/// which is all that the caller needs to know, and the action graph of a large target takes
+/// far longer to walk than its targets.
+///
+/// The walk goes one level of the graph at a time, so that each level is computed concurrently.
 async fn walk_inputs(dice: &mut DiceComputations<'_>, inputs: &[ArtifactGroup]) -> InputsWalk {
     let mut walk = InputsWalk::default();
     let mut seen_sources: BuckMutSet<CellPath> = BuckMutSet::default();
     let mut seen_actions: BuckMutSet<ActionKey> = BuckMutSet::default();
     let mut seen_projections: BuckMutSet<TransitiveSetProjectionKey> = BuckMutSet::default();
-    let mut frontier: Vec<ArtifactGroup> = inputs.to_vec();
+    // Each with whether it is one of `inputs`, whose owner the walk stays in.
+    let mut frontier: Vec<(ArtifactGroup, bool)> =
+        inputs.iter().map(|input| (input.dupe(), true)).collect();
     while !frontier.is_empty() {
         let mut steps = Vec::new();
-        for input in std::mem::take(&mut frontier) {
-            match &input {
+        for (input, is_input) in std::mem::take(&mut frontier) {
+            let step = match &input {
                 ArtifactGroup::Artifact(artifact) => {
                     if let Some(source) = artifact.get_source() {
                         let path = source.get_path().to_cell_path();
                         if seen_sources.insert(path.clone()) {
                             walk.sources.push(path);
                         }
-                    } else if let Some(key) = artifact.action_key() {
-                        if seen_actions.insert(key.dupe()) {
-                            steps.push(WalkStep::Action(key.dupe()));
-                        }
+                        continue;
+                    }
+                    match artifact.action_key() {
+                        Some(key) => WalkStep::Action(key.dupe()),
+                        None => continue,
                     }
                 }
                 ArtifactGroup::TransitiveSetProjection(projection) => {
-                    if seen_projections.insert(projection.key.dupe()) {
-                        steps.push(WalkStep::Projection(projection.key.dupe()));
-                    }
+                    WalkStep::Projection(projection.key.dupe())
                 }
-                ArtifactGroup::Promise(_) => steps.push(WalkStep::Promise(input.dupe())),
+                ArtifactGroup::Promise(_) => WalkStep::Promise(input.dupe()),
+            };
+            // What a target does not own, such as an anonymous target, is walked like the
+            // owners of the inputs: it has no source files of its own to fall back on.
+            if let Some(owner) = step.owner() {
+                if is_input {
+                    walk.owners.insert(owner);
+                } else if !walk.owners.contains(&owner) {
+                    walk.beyond.insert(owner);
+                    continue;
+                }
+            }
+            let new = match &step {
+                WalkStep::Action(key) => seen_actions.insert(key.dupe()),
+                WalkStep::Projection(key) => seen_projections.insert(key.dupe()),
+                WalkStep::Promise(_) => true,
+            };
+            if new {
+                steps.push((step, is_input));
             }
         }
         let expanded = dice
-            .compute_join(steps, async |dice, step| {
-                (step.owner(), step.expand(dice).await)
+            .compute_join(steps, async |dice, (step, is_input)| {
+                // What a promise resolves to is an input if the promise was.
+                let is_input = is_input && matches!(step, WalkStep::Promise(_));
+                (step.owner(), is_input, step.expand(dice).await)
             })
             .await;
-        for (owner, result) in expanded {
+        for (owner, is_input, result) in expanded {
             match result {
-                Ok(inputs) => {
-                    walk.owners.extend(owner);
-                    frontier.extend(inputs);
-                }
+                Ok(inputs) => frontier.extend(inputs.into_iter().map(|input| (input, is_input))),
                 Err(e) => walk.failed.push((owner, e)),
             }
         }
@@ -1548,12 +1721,18 @@ async fn walk_inputs(dice: &mut DiceComputations<'_>, inputs: &[ArtifactGroup]) 
     walk
 }
 
-fn dependency_closure(root: &ConfiguredTargetNode) -> Vec<ConfiguredTargetNode> {
+/// The targets `roots` and their dependencies.
+fn dependency_closure(
+    roots: impl IntoIterator<Item = ConfiguredTargetNode>,
+) -> Vec<ConfiguredTargetNode> {
     let mut seen = BuckMutSet::default();
     let mut queue = VecDeque::new();
     let mut nodes = Vec::new();
-    seen.insert(root.label().dupe());
-    queue.push_back(root.dupe());
+    for root in roots {
+        if seen.insert(root.label().dupe()) {
+            queue.push_back(root);
+        }
+    }
     while let Some(node) = queue.pop_front() {
         for dep in node.deps() {
             if seen.insert(dep.label().dupe()) {

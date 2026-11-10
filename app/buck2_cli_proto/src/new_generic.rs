@@ -249,8 +249,8 @@ pub struct DevWatchSet {
     pub build: Vec<String>,
     pub restart: bool,
     pub notify: bool,
-    /// How many source files the set claims.
-    pub files: usize,
+    /// How many targets the set has.
+    pub targets: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
