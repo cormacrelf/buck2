@@ -87,6 +87,11 @@ impl FsHashCrawler {
 
 #[async_trait]
 impl FileWatcher for FsHashCrawler {
+    /// It hashes files at each sync, and so has nothing to push in between.
+    async fn subscribe(&self) -> buck2_error::Result<crate::file_watcher::FileChangeSubscription> {
+        Err(crate::file_watcher::cannot_push("fs_hash_crawler"))
+    }
+
     async fn sync(
         &self,
         dice: DiceTransactionUpdater,

@@ -104,6 +104,13 @@ dev_app(
 )
 
 dev_app(
+    name = "tree",
+    mode = "all",
+    srcs = glob(["tree/**/*.txt"]),
+    server = "server.py",
+)
+
+dev_app(
     name = "inputs",
     mode = "inputs",
     srcs = ["main.txt"],

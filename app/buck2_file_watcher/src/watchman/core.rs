@@ -17,10 +17,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use buck2_certs::validate::validate_certs;
+use buck2_common::invocation_paths::InvocationPaths;
 use buck2_common::manifold::Bucket;
 use buck2_common::manifold::ManifoldClient;
 use buck2_common::manifold::Ttl;
 use buck2_core::buck2_env;
+use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
@@ -31,7 +34,15 @@ use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use watchman_client::SubscriptionData;
 use watchman_client::prelude::*;
+
+use crate::file_watcher::ChangeKind;
+use crate::file_watcher::ChangePublisher;
+use crate::file_watcher::FileChangeSubscription;
+use crate::file_watcher::PushedChanges;
+use crate::ignores::FileWatcherIgnores;
+use crate::watchman::utils::find_first_valid_parent;
 
 fn watchman_error_tag(e: &watchman_client::Error) -> ErrorTag {
     match e {
@@ -705,4 +716,96 @@ where
 
         Ok(Self { control_tx })
     }
+}
+
+/// What `sync` records for `event`, as a pushed change. The entries of a directory that changed
+/// have events of their own, so a directory's own change pushes nothing.
+fn push_event(pushed: &mut PushedChanges, event: &WatchmanEvent, ignores: &FileWatcherIgnores) {
+    let (path, kind) = match ProjectRelativePath::new(&event.path) {
+        Ok(path) => {
+            let kind = match (&event.kind, &event.event) {
+                (WatchmanKind::Directory, WatchmanEventType::Modify) => return,
+                (WatchmanKind::Directory, _) => ChangeKind::DirAddedOrRemoved,
+                (_, WatchmanEventType::Modify) => ChangeKind::Contents,
+                (_, WatchmanEventType::Create | WatchmanEventType::Delete) => {
+                    ChangeKind::FileAddedOrRemoved
+                }
+            };
+            (path, kind)
+        }
+        // As `sync` does, a path that is not valid changes its first valid parent directory.
+        Err(_) => match find_first_valid_parent(&event.path) {
+            Some(parent) => (parent, ChangeKind::DirAddedOrRemoved),
+            None => return,
+        },
+    };
+    if crate::is_watchman_cookie(path)
+        || path.starts_with(InvocationPaths::buck_out_dir_prefix())
+        || ignores.is_ignored(IProjectRelativePath::intern_directly(path))
+    {
+        return;
+    }
+    pushed.changes.push((path.to_buf(), kind));
+}
+
+/// A watchman subscription to the changes under `path` that match `expr`, for
+/// `FileWatcher::subscribe`. It returns once watchman has the subscription, so every change from
+/// then on is pushed. Each subscriber has its own, which ends at the first change after the
+/// subscriber is gone.
+pub(crate) async fn subscribe_to_changes(
+    path: &Path,
+    expr: Expr,
+    ignores: FileWatcherIgnores,
+) -> buck2_error::Result<FileChangeSubscription> {
+    let path = CanonicalPath::canonicalize(path)
+        .with_buck_error_context(|| format!("Error canonicalizing: `{}`", path.display()))?;
+    let client = WatchmanClient::connect(&Connector::new(), path).await?;
+    let publisher = ChangePublisher::new();
+    let subscription = publisher.subscribe();
+    let (mut watchman, _) = with_timeout(client.client().subscribe::<BuckQueryResult>(
+        client.root(),
+        SubscribeRequest {
+            expression: Some(expr),
+            // A fresh instance would otherwise list every file. It means that changes were
+            // missed, which `missed` says.
+            empty_on_fresh_instance: true,
+            case_sensitive: true,
+            ..SubscribeRequest::default()
+        },
+    ))
+    .await
+    .buck_error_context("Subscribing to watchman")?;
+    tokio::spawn(async move {
+        // The subscription lives as long as the connection.
+        let _client = client;
+        // Watchman starts a subscription with a fresh instance: the files as they are.
+        let mut first = true;
+        loop {
+            let mut pushed = PushedChanges::default();
+            let ended = match watchman.next().await {
+                Ok(SubscriptionData::FilesChanged(result)) => {
+                    pushed.missed = result.is_fresh_instance && !first;
+                    first = false;
+                    for file in result.files.unwrap_or_default() {
+                        if let Some(event) = file.into_event() {
+                            push_event(&mut pushed, &event, &ignores);
+                        }
+                    }
+                    false
+                }
+                Ok(SubscriptionData::StateEnter { .. } | SubscriptionData::StateLeave { .. }) => {
+                    false
+                }
+                Ok(SubscriptionData::Canceled) | Err(_) => {
+                    pushed.missed = true;
+                    true
+                }
+            };
+            publisher.publish(pushed);
+            if ended || !publisher.has_subscribers() {
+                return;
+            }
+        }
+    });
+    Ok(subscription)
 }

@@ -22,6 +22,7 @@ message SubscriptionRequest {
   oneof request {
     Disconnect disconnect = 1;
     SubscribeToActiveCommands subscribe_to_active_commands = 4;
+    SubscribeToFileChanges subscribe_to_file_changes = 5;
   }
 }
 
@@ -35,6 +36,13 @@ message Disconnect {
 
 message SubscribeToActiveCommands {}
 
+// Ask for the changes that the daemon's file watcher sees in the project, as it
+// sees them. The daemon answers with an empty `FileChanges`, and then sends
+// one for each batch of changes. If the file watcher cannot report changes as
+// they happen, the command fails. Every change sent is also seen by the next
+// command that the daemon runs.
+message SubscribeToFileChanges {}
+
 // Daemon to client interaction in a subscription. This is what the client will
 // receive via the `stdout` of the `subscribe` command.
 message SubscriptionResponse {
@@ -45,7 +53,31 @@ message SubscriptionResponse {
   oneof response {
     ActiveCommandsSnapshot active_commands_snapshot = 2;
     Goodbye goodbye = 3;
+    FileChanges file_changes = 4;
   }
+}
+
+// Changes to files in the project. See `SubscribeToFileChanges`.
+message FileChanges {
+  repeated FileChange changes = 1;
+  // Changes were missed, by the file watcher or because the client fell
+  // behind: anything in the project may have changed.
+  bool missed = 2;
+}
+
+message FileChange {
+  // Relative to the project root.
+  string path = 1;
+  FileChangeKind kind = 2;
+}
+
+enum FileChangeKind {
+  // The contents or metadata of a file changed.
+  CONTENTS = 0;
+  // A file was added or removed, or renamed, which is both.
+  FILE_ADDED_OR_REMOVED = 1;
+  // A directory was added or removed, or renamed.
+  DIR_ADDED_OR_REMOVED = 2;
 }
 
 message ActiveCommandsSnapshot {

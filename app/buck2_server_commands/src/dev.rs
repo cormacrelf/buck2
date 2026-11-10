@@ -17,8 +17,8 @@
 //!   graph, which builds what dynamic actions need to say what they do.
 //! - `Build` builds named `DevInfo` outputs.
 //!
-//! The client does the file watching and runs the server, so no daemon command lasts longer than
-//! one build.
+//! The client runs the server, and acts on the file changes that the daemon's file watcher pushes
+//! to it through a subscription, so no daemon command lasts longer than one build.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

@@ -38,7 +38,11 @@ use notify::event::RemoveKind;
 use tracing::debug;
 use tracing::info;
 
+use crate::file_watcher::ChangeKind;
+use crate::file_watcher::ChangePublisher;
+use crate::file_watcher::FileChangeSubscription;
 use crate::file_watcher::FileWatcher;
+use crate::file_watcher::PushedChanges;
 use crate::file_watcher::SyncOutcome;
 use crate::ignores::FileWatcherIgnores;
 use crate::mergebase::Mergebase;
@@ -51,6 +55,25 @@ fn ignore_event_kind(event_kind: EventKind) -> bool {
         // as `Metadata(Any)` from every notify backend, never as `Permissions`.
         EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => true,
         _ => false,
+    }
+}
+
+/// What `sync` records for an event, as pushed changes. Kinds that `sync` ignores push nothing.
+fn change_kinds(event_kind: EventKind) -> &'static [ChangeKind] {
+    const FILE: &[ChangeKind] = &[ChangeKind::FileAddedOrRemoved];
+    const DIR: &[ChangeKind] = &[ChangeKind::DirAddedOrRemoved];
+    const BOTH: &[ChangeKind] = &[
+        ChangeKind::FileAddedOrRemoved,
+        ChangeKind::DirAddedOrRemoved,
+    ];
+    match event_kind {
+        EventKind::Create(CreateKind::File) | EventKind::Remove(RemoveKind::File) => FILE,
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => DIR,
+        EventKind::Create(CreateKind::Any | CreateKind::Other)
+        | EventKind::Remove(RemoveKind::Any | RemoveKind::Other)
+        | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other) => BOTH,
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_)) => &[ChangeKind::Contents],
+        EventKind::Any | EventKind::Access(_) | EventKind::Other => &[],
     }
 }
 
@@ -74,11 +97,13 @@ impl NotifyFileData {
         }
     }
 
+    /// Record `event` for the next sync, and, for subscribers, in `pushed`.
     fn process(
         &mut self,
         event: notify::Result<notify::Event>,
         root: &ProjectRoot,
         ignores: &FileWatcherIgnores,
+        mut pushed: Option<&mut PushedChanges>,
     ) -> buck2_error::Result<()> {
         let event =
             event.map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
@@ -88,6 +113,9 @@ impl NotifyFileData {
         // answering from a stale graph.
         if event.need_rescan() {
             self.missed_events = true;
+            if let Some(pushed) = &mut pushed {
+                pushed.missed = true;
+            }
             debug!("FileWatcher: File change events were missed");
         }
 
@@ -118,6 +146,13 @@ impl NotifyFileData {
                 self.ignored += 1;
             } else {
                 self.events.insert((path, event.kind));
+                if let Some(pushed) = &mut pushed {
+                    for kind in change_kinds(event.kind) {
+                        pushed
+                            .changes
+                            .push((path.as_project_relative_path().to_buf(), *kind));
+                    }
+                }
             }
         }
         Ok(())
@@ -244,6 +279,8 @@ pub struct NotifyFileWatcher {
     data: Arc<Mutex<buck2_error::Result<NotifyFileData>>>,
     /// What the changes recorded on the updater are relative to.
     baseline: Mutex<FileSystemBaseline>,
+    #[allocative(skip)]
+    publisher: Arc<ChangePublisher>,
 }
 
 impl NotifyFileWatcher {
@@ -251,11 +288,28 @@ impl NotifyFileWatcher {
         let data = Arc::new(Mutex::new(Ok(NotifyFileData::new())));
         let data2 = data.dupe();
         let root2 = root.dupe();
+        let publisher = Arc::new(ChangePublisher::new());
+        let publisher2 = publisher.dupe();
         let mut watcher = notify::recommended_watcher(move |event| {
             let mut guard = data2.lock().unwrap();
             if let Ok(state) = &mut *guard {
-                if let Err(e) = state.process(event, &root2, &ignores) {
-                    *guard = Err(e);
+                // Pushed while the lock is held, after the event is recorded, so that a sync
+                // that starts after a subscriber sees a change records it too.
+                let mut pushed = publisher2.has_subscribers().then(PushedChanges::default);
+                match state.process(event, &root2, &ignores, pushed.as_mut()) {
+                    Ok(()) => {
+                        if let Some(pushed) = pushed {
+                            publisher2.publish(pushed);
+                        }
+                    }
+                    Err(e) => {
+                        *guard = Err(e);
+                        // Nothing is recorded from now on, until the sync reports the error.
+                        publisher2.publish(PushedChanges {
+                            changes: Vec::new(),
+                            missed: true,
+                        });
+                    }
                 }
             }
         })
@@ -267,6 +321,7 @@ impl NotifyFileWatcher {
             watcher,
             data,
             baseline: Mutex::new(FileSystemBaseline::unique()),
+            publisher,
         })
     }
 
@@ -316,6 +371,10 @@ impl FileWatcher for NotifyFileWatcher {
         )
         .await
     }
+
+    async fn subscribe(&self) -> buck2_error::Result<FileChangeSubscription> {
+        Ok(self.publisher.subscribe())
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +415,7 @@ mod tests {
         let (root, ignores, _t) = fixture();
         let mut state = NotifyFileData::new();
         let event = notify::Event::new(EventKind::Any).set_flag(Flag::Rescan);
-        state.process(Ok(event), &root, &ignores).unwrap();
+        state.process(Ok(event), &root, &ignores, None).unwrap();
         assert!(
             state.missed_events,
             "a pathless rescan event must set missed_events"
@@ -371,7 +430,7 @@ mod tests {
         let event = notify::Event::new(EventKind::Create(CreateKind::File))
             .add_path(path.into_abs_path_buf().into_path_buf())
             .set_flag(Flag::Rescan);
-        state.process(Ok(event), &root, &ignores).unwrap();
+        state.process(Ok(event), &root, &ignores, None).unwrap();
         assert!(state.missed_events);
     }
 
@@ -400,6 +459,95 @@ mod tests {
         );
         assert!(!stats.fresh_instance);
         assert!(stats.incomplete_events_reason.is_none());
+    }
+
+    /// A subscriber gets the same changes the next sync records, and nothing that it ignores.
+    #[test]
+    fn process_pushes_what_it_records() {
+        let (root, ignores, _t) = fixture();
+        let mut state = NotifyFileData::new();
+        let mut pushed = PushedChanges::default();
+        let file = root.resolve(ProjectRelativePath::new("dir/f").unwrap());
+        let buck_out = root.resolve(ProjectRelativePath::new("buck-out/v2/x").unwrap());
+        for (kind, path) in [
+            (
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                &file,
+            ),
+            (EventKind::Create(CreateKind::Folder), &file),
+            (EventKind::Access(notify::event::AccessKind::Read), &file),
+            (EventKind::Create(CreateKind::File), &buck_out),
+        ] {
+            let event =
+                notify::Event::new(kind).add_path(path.clone().into_abs_path_buf().into_path_buf());
+            state
+                .process(Ok(event), &root, &ignores, Some(&mut pushed))
+                .unwrap();
+        }
+        let dir_f = ProjectRelativePath::new("dir/f").unwrap().to_buf();
+        assert_eq!(
+            pushed.changes,
+            vec![
+                (dir_f.clone(), ChangeKind::Contents),
+                (dir_f, ChangeKind::DirAddedOrRemoved),
+            ]
+        );
+        assert!(!pushed.missed);
+        assert_eq!(state.events.len(), 2);
+    }
+
+    #[test]
+    fn change_kinds_follow_sync() {
+        use notify::event::RenameMode;
+        assert_eq!(
+            change_kinds(EventKind::Create(CreateKind::File)),
+            &[ChangeKind::FileAddedOrRemoved]
+        );
+        assert_eq!(
+            change_kinds(EventKind::Remove(RemoveKind::Folder)),
+            &[ChangeKind::DirAddedOrRemoved]
+        );
+        assert_eq!(
+            change_kinds(EventKind::Modify(ModifyKind::Name(RenameMode::Any))),
+            &[
+                ChangeKind::FileAddedOrRemoved,
+                ChangeKind::DirAddedOrRemoved
+            ]
+        );
+        assert_eq!(
+            change_kinds(EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))),
+            &[ChangeKind::Contents]
+        );
+        assert_eq!(change_kinds(EventKind::Any), &[] as &[ChangeKind]);
+    }
+
+    /// Against the real watcher: a subscriber gets a change once it is recorded for the next
+    /// sync.
+    #[tokio::test]
+    async fn subscriber_gets_changes_after_they_are_recorded() {
+        let (root, ignores, _t) = fixture();
+        let watcher = NotifyFileWatcher::new(&root, ignores).unwrap();
+        let mut subscription = watcher.subscribe().await.unwrap();
+        let path = root.resolve(ProjectRelativePath::new("new.txt").unwrap());
+        std::fs::write(path.as_path(), "x").unwrap();
+        let pushed = tokio::time::timeout(std::time::Duration::from_secs(10), subscription.next())
+            .await
+            .expect("a change is pushed")
+            .expect("the watcher is alive");
+        let new_txt = ProjectRelativePath::new("new.txt").unwrap().to_buf();
+        assert!(
+            pushed.changes.iter().any(|(path, _)| *path == new_txt),
+            "{pushed:?}"
+        );
+        let data = watcher.data.lock().unwrap();
+        let recorded = data.as_ref().unwrap();
+        assert!(
+            recorded
+                .events
+                .iter()
+                .any(|(path, _)| path.as_project_relative_path() == &*new_txt),
+            "pushed before it was recorded"
+        );
     }
 
     /// `chmod` arrives from every notify backend as `Modify(Metadata(Any))` (inotify

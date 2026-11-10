@@ -23,6 +23,7 @@ use buck2_core::rollout_percentage::RolloutPercentage;
 use buck2_error::internal_error;
 use buck2_events::dispatch::span_async;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
+use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_util::process::async_background_command;
 use dice::DiceTransactionUpdater;
 use dupe::Dupe;
@@ -339,6 +340,18 @@ impl SyncableQueryProcessor for WatchmanQueryProcessor {
 pub(crate) struct WatchmanFileWatcher {
     #[allocative(skip)]
     query: SyncableQuery<buck2_data::FileWatcherStats, DiceTransactionUpdater>,
+    /// For subscriptions.
+    project_root: AbsNormPathBuf,
+    ignores: FileWatcherIgnores,
+}
+
+/// What the watcher watches: an unfiltered query, which `.watchmanconfig` still filters.
+fn query_expr() -> Expr {
+    Expr::Any(vec![
+        Expr::FileType(FileType::Regular),
+        Expr::FileType(FileType::Directory),
+        Expr::FileType(FileType::Symlink),
+    ])
 }
 
 /// The watchman query is constructed once on daemon startup. It is an unfiltered watchman query
@@ -390,13 +403,9 @@ impl WatchmanFileWatcher {
         let query = SyncableQuery::new(
             Connector::new(),
             project_root,
-            Expr::Any(vec![
-                Expr::FileType(FileType::Regular),
-                Expr::FileType(FileType::Directory),
-                Expr::FileType(FileType::Symlink),
-            ]),
+            query_expr(),
             Box::new(WatchmanQueryProcessor {
-                ignores,
+                ignores: ignores.clone(),
                 empty_on_fresh_instance,
                 report_global_rev,
                 last_mergebase: None,
@@ -410,12 +419,25 @@ impl WatchmanFileWatcher {
             dice_clear_on_mergebase_change,
         )?;
 
-        Ok(Self { query })
+        Ok(Self {
+            query,
+            project_root: project_root.to_buf(),
+            ignores,
+        })
     }
 }
 
 #[async_trait]
 impl FileWatcher for WatchmanFileWatcher {
+    async fn subscribe(&self) -> buck2_error::Result<crate::file_watcher::FileChangeSubscription> {
+        crate::watchman::core::subscribe_to_changes(
+            self.project_root.as_path(),
+            query_expr(),
+            self.ignores.clone(),
+        )
+        .await
+    }
+
     async fn sync(
         &self,
         dice: DiceTransactionUpdater,

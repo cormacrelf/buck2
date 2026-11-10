@@ -134,8 +134,14 @@ def alive(pid: int) -> bool:
     return True
 
 
+def dev_test() -> Any:
+    """`buck2 dev` needs a file watcher that reports changes as they happen. The tests use
+    `fs_hash_crawler` otherwise."""
+    return buck_test(extra_buck_config={"buck2": {"file_watcher": "notify"}})
+
+
 class DevTest(BuckTestCase):
-    @buck_test()
+    @dev_test()
     async def test_builds_when_a_watched_file_changes(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:auto")
         try:
@@ -157,7 +163,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_notify_set_holds_builds_until_undone(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:auto")
         try:
@@ -187,7 +193,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_server_build_request_clears_stale(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:auto_build_on_stale")
         try:
@@ -209,7 +215,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_bzl_change_waits_with_a_notify_set(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:auto")
         try:
@@ -235,7 +241,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_unknown_request_is_reported(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:bad_request")
         try:
@@ -247,7 +253,7 @@ class DevTest(BuckTestCase):
         # The server's own output goes to the terminal.
         assert "server started" in output, output
 
-    @buck_test()
+    @dev_test()
     async def test_reconnects_after_the_daemon_restarts(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:all")
         try:
@@ -262,7 +268,7 @@ class DevTest(BuckTestCase):
             output = await dev.stop()
         assert "connecting again" in output, output
 
-    @buck_test()
+    @dev_test()
     async def test_new_source_file_changes_the_graph(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:pages")
         try:
@@ -277,7 +283,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_restart_set_restarts_the_server(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:restart")
         try:
@@ -299,7 +305,7 @@ class DevTest(BuckTestCase):
         assert not alive(second["pid"])
         assert dev._events()[-1]["type"] == "shutdown", dev._events()
 
-    @buck_test()
+    @dev_test()
     async def test_other_commands_do_not_wait_for_dev_builds(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow")
         try:
@@ -328,7 +334,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_change_during_a_build_cancels_it(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow")
         try:
@@ -356,7 +362,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_server_is_read_during_a_build(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow_flood")
         try:
@@ -382,7 +388,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_server_that_never_connects_is_restarted(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:no_connect")
         try:
@@ -396,7 +402,7 @@ class DevTest(BuckTestCase):
             await dev.stop()
         assert not alive(second["pid"])
 
-    @buck_test()
+    @dev_test()
     async def test_ctrl_z_stops_the_server_too(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:no_connect")
         try:
@@ -420,7 +426,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_crashed_server_starts_again_after_a_change(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:crash")
         try:
@@ -443,7 +449,7 @@ class DevTest(BuckTestCase):
             output = await dev.stop()
         assert "starts it again after the next change" in output, output
 
-    @buck_test()
+    @dev_test()
     async def test_server_that_exits_successfully_starts_again_after_a_change(
         self, buck: Buck
     ) -> None:
@@ -467,7 +473,7 @@ class DevTest(BuckTestCase):
             output = await dev.stop()
         assert "server exited. `buck2 dev` starts it again" in output, output
 
-    @buck_test()
+    @dev_test()
     async def test_files_that_cannot_change_the_graph_are_ignored(
         self, buck: Buck
     ) -> None:
@@ -493,7 +499,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_too_long_line_closes_the_connection(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:too_long")
         try:
@@ -507,7 +513,7 @@ class DevTest(BuckTestCase):
             output = await dev.stop()
         assert "longer than any request" in output, output
 
-    @buck_test()
+    @dev_test()
     async def test_superconsole_shows_the_server_output(self, buck: Buck) -> None:
         # `super` forces the superconsole, though stderr is not a terminal here.
         dev = await start_dev(buck, "//app:all", console="super")
@@ -525,7 +531,7 @@ class DevTest(BuckTestCase):
         assert "server started" in dev.stderr, dev.stderr
         assert "server started" not in dev.stdout, dev.stdout
 
-    @buck_test()
+    @dev_test()
     async def test_simple_console_leaves_out_what_each_build_prints(
         self, buck: Buck
     ) -> None:
@@ -542,7 +548,7 @@ class DevTest(BuckTestCase):
         # The server writes to stdout itself.
         assert "server started" in output, output
 
-    @buck_test()
+    @dev_test()
     async def test_inputs_set_takes_a_source_file_of_the_target(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:inputs")
         try:
@@ -563,7 +569,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_inputs_set_follows_dynamic_actions_and_transitive_sets(
         self, buck: Buck
     ) -> None:
@@ -587,7 +593,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_build_file_change_acts_for_the_targets_it_changed(
         self, buck: Buck
     ) -> None:
@@ -621,7 +627,7 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
 
-    @buck_test()
+    @dev_test()
     async def test_failed_analysis_runs_again_after_any_change(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:built_server")
         try:
@@ -642,13 +648,38 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @buck_test()
+    async def test_needs_a_file_watcher_that_reports_changes(self, buck: Buck) -> None:
+        await expect_failure(
+            buck.run_buck_command("dev", "//app:all"),
+            stderr_regex="The `fs_hash_crawler` file watcher cannot report file changes",
+        )
+
+    @dev_test()
+    async def test_new_directory_in_a_package_is_watched(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:tree")
+        try:
+            built = await dev.wait_for("built")
+            assert site(built) == "tree a\n"
+
+            # The daemon watches the whole project, so a file in a directory that did not
+            # exist when `buck2 dev` analysed the target is seen too.
+            (buck.cwd / "app/tree/new").mkdir()
+            await dev.wait_for("graph_changed")
+            write(buck, "app/tree/new/b.txt", "tree b\n")
+            await dev.wait_for("graph_changed")
+            built = await dev.wait_for("built")
+            assert site(built) == "tree a\ntree b\n"
+        finally:
+            await dev.stop()
+
+    @dev_test()
     async def test_target_without_dev_info(self, buck: Buck) -> None:
         await expect_failure(
             buck.run_buck_command("dev", "//app:other"),
             stderr_regex="has no `DevInfo` provider",
         )
 
-    @buck_test()
+    @dev_test()
     async def test_dev_watch_rejects_unknown_output(self, buck: Buck) -> None:
         write(
             buck,

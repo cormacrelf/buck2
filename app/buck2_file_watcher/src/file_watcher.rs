@@ -16,6 +16,7 @@ use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::buck2_env;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 #[cfg(fbcode_build)]
 use buck2_core::soft_error;
 use buck2_error::BuckErrorContext;
@@ -23,6 +24,7 @@ use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use dice::DiceTransactionUpdater;
 use dupe::Dupe;
+use tokio::sync::broadcast;
 
 use crate::dep_files::DepFileCache;
 #[cfg(fbcode_build)]
@@ -40,6 +42,103 @@ pub trait FileWatcher: Allocative + Send + Sync + 'static {
         &self,
         dice: DiceTransactionUpdater,
     ) -> buck2_error::Result<(DiceTransactionUpdater, Mergebase, SyncOutcome)>;
+
+    /// The changes this watcher sees from now on, as it sees them, for a client that reacts to
+    /// them, such as `buck2 dev`: every change after this returns. This does not change what
+    /// `sync` records: a change is recorded for the next sync before it is pushed, so a sync that
+    /// starts after a subscriber gets a change sees it too.
+    async fn subscribe(&self) -> buck2_error::Result<FileChangeSubscription> {
+        Err(cannot_push("this"))
+    }
+}
+
+/// The error of a watcher that cannot push changes.
+pub(crate) fn cannot_push(watcher: &str) -> buck2_error::Error {
+    buck2_error!(
+        ErrorTag::Input,
+        "The `{watcher}` file watcher cannot report file changes as they happen. \
+         Set `file_watcher = notify` in the `[buck2]` section of `.buckconfig` to use one that can."
+    )
+}
+
+/// What changed about a path, told apart as `FileChangeTracker` does.
+#[derive(Copy, Clone, Dupe, Debug, PartialEq, Eq, Hash)]
+pub enum ChangeKind {
+    /// The contents or metadata of a file changed.
+    Contents,
+    /// A file was added or removed, or renamed, which is both.
+    FileAddedOrRemoved,
+    /// A directory was added or removed, or renamed.
+    DirAddedOrRemoved,
+}
+
+/// Changes that a watcher pushed. See `FileWatcher::subscribe`.
+#[derive(Clone, Debug, Default)]
+pub struct PushedChanges {
+    pub changes: Vec<(ProjectRelativePathBuf, ChangeKind)>,
+    /// The watcher missed changes, or the subscriber fell behind: anything may have changed.
+    pub missed: bool,
+}
+
+impl PushedChanges {
+    fn is_empty(&self) -> bool {
+        self.changes.is_empty() && !self.missed
+    }
+}
+
+/// How many batches a subscriber may fall behind before it gets `missed` instead.
+const PUSHED_BATCHES: usize = 4096;
+
+/// A subscription to a watcher's changes.
+pub struct FileChangeSubscription {
+    receiver: broadcast::Receiver<Arc<PushedChanges>>,
+}
+
+impl FileChangeSubscription {
+    /// The next batch of changes, or `None` once the watcher is gone. A subscriber that fell so
+    /// far behind that batches were dropped gets one with `missed` instead.
+    pub async fn next(&mut self) -> Option<Arc<PushedChanges>> {
+        match self.receiver.recv().await {
+            Ok(changes) => Some(changes),
+            Err(broadcast::error::RecvError::Lagged(_)) => Some(Arc::new(PushedChanges {
+                changes: Vec::new(),
+                missed: true,
+            })),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+}
+
+/// Sends a watcher's changes to its subscribers. Sending never waits, and the channel holds at
+/// most `PUSHED_BATCHES`.
+pub(crate) struct ChangePublisher {
+    sender: broadcast::Sender<Arc<PushedChanges>>,
+}
+
+impl ChangePublisher {
+    pub(crate) fn new() -> Self {
+        let (sender, _) = broadcast::channel(PUSHED_BATCHES);
+        Self { sender }
+    }
+
+    /// Whether anyone subscribed. Without subscribers, the watcher does not collect changes to
+    /// push.
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.sender.receiver_count() > 0
+    }
+
+    pub(crate) fn publish(&self, changes: PushedChanges) {
+        if !changes.is_empty() {
+            // Fails only when no one is subscribed.
+            let _ignored = self.sender.send(Arc::new(changes));
+        }
+    }
+
+    pub(crate) fn subscribe(&self) -> FileChangeSubscription {
+        FileChangeSubscription {
+            receiver: self.sender.subscribe(),
+        }
+    }
 }
 
 /// Whether a sync accounted for everything that changed since the previous one.

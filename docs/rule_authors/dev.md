@@ -99,10 +99,20 @@ watch = [
 ]
 ```
 
-`buck2 dev` watches only the files that a set claims, and a set claims only
-files of the configured dependency graph of the `buck2 dev` target: `targets`
-match only targets in that graph. Without a `targets = None` set, the files of
-targets that no set matches are ignored.
+`buck2 dev` does not watch files itself: the daemon's file watcher reports
+every change in the project to it, and `buck2 dev` acts on the changes to the
+files that a set claims. A set claims only files of the configured dependency
+graph of the `buck2 dev` target: `targets` match only targets in that graph.
+Without a `targets = None` set, the files of targets that no set matches are
+ignored.
+
+The file watcher must report changes as they happen. The `notify` watcher,
+the default outside Meta, does; `buck2 dev` stops with an error if the
+`file_watcher` in the `[buck2]` section of `.buckconfig` names one that does
+not, such as `fs_hash_crawler`. Files that the project's ignore rules exclude,
+and `buck-out`, are never reported. If the file watcher misses changes, or the
+daemon restarts, `buck2 dev` looks at every file again, builds what the sets ask
+for, and analyses the target again.
 
 To find the files of `inputs`, `buck2 dev` walks the action graph below them.
 An action that a [dynamic action](dynamic_dependencies.md) creates is only
@@ -113,10 +123,10 @@ after the next change.
 
 ### Changes to the graph
 
-`buck2 dev` also watches the build files of the packages in the graph, the
-`.bzl` files that they load, and the package directories. When one of them
-changes, or a file is added to or removed from a package, it analyses the
-target again and finds the files of each set again.
+`buck2 dev` also acts on changes to the build files of the packages in the
+graph and the `.bzl` files that they load, and on files and directories added
+to or removed from a package directory, at any depth. When one of them changes,
+it analyses the target again and finds the files of each set again.
 
 - A changed build file, or a file added to or removed from a package, counts
   as a change to the sets whose targets it changed. The targets of a set are
@@ -295,8 +305,6 @@ repeats the request.
 ## Limits
 
 - `buck2 dev` takes one target.
-- A new directory inside a package is not watched until `buck2 dev` analyses
-  the target again. That happens after a change to a build file or to a `.bzl`
-  file, or when a file is added to a directory that is already watched.
-- Changes to `.buckconfig` files are not watched. The next build uses them.
+- `buck2 dev` does not act on changes to `.buckconfig` files. The next build
+  uses them.
 - `buck2 dev` runs only on Unix so far.

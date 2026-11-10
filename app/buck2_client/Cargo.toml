@@ -33,7 +33,6 @@ humantime.workspace = true
 jiff.workspace = true
 libc.workspace = true
 lsp-server.workspace = true
-notify.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true

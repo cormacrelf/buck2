@@ -10,8 +10,9 @@
 
 //! `buck2 dev`: run a target's `DevInfo` server, and rebuild its outputs as files change.
 //!
-//! The client watches the files and runs the server. Every build is a separate, short daemon
-//! command, marked preemptible, so `buck2 dev` never keeps other commands waiting.
+//! The client acts on the file changes that the daemon's file watcher reports to it, and runs the
+//! server. Every build is a separate, short daemon command, marked preemptible, so `buck2 dev`
+//! never keeps other commands waiting.
 //!
 //! `buck2 dev` runs only on Unix so far. Elsewhere the command only says so, and the parts that
 //! do not depend on Unix are unused.
@@ -62,13 +63,14 @@ use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
-use notify::EventKind;
-use notify::RecursiveMode;
-use notify::Watcher;
-use notify::event::ModifyKind;
+use buck2_subscription_proto::FileChangeKind;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+#[cfg(unix)]
+use self::changes::FileChange;
+#[cfg(unix)]
+use self::changes::FileChanges;
 #[cfg(unix)]
 use self::channel::Connection;
 #[cfg(unix)]
@@ -78,6 +80,8 @@ use self::channel::ServerEvent;
 #[cfg(unix)]
 use self::process::ServerProcess;
 
+#[cfg(unix)]
+mod changes;
 #[cfg(unix)]
 mod channel;
 #[cfg(unix)]
@@ -167,6 +171,20 @@ impl StreamingCommand for DevCommand {
         let (server_tx, server_rx) = mpsc::unbounded_channel();
         // Listen before the server starts, so that it can connect at once.
         let listener = Listener::bind(&paths, server_tx)?;
+        // The daemon's file watcher reports the changes to the project's files. Subscribe before
+        // anything else, so that `buck2 dev` stops at once if it cannot.
+        let changes = FileChanges::subscribe(
+            paths
+                .project_root()
+                .root()
+                .as_path()
+                .to_str()
+                .unwrap_or_default(),
+            connect_options(&self, ctx)?,
+            paths.clone(),
+            &context,
+        )
+        .await?;
         let daemon = Daemon {
             buckd,
             events_ctx,
@@ -184,6 +202,7 @@ impl StreamingCommand for DevCommand {
             server_rx,
             signals,
             console,
+            changes,
         )
         .await?
         {
@@ -773,13 +792,13 @@ enum Owner {
     Bzl,
 }
 
-/// The files of the current watch sets, and the file watcher for them.
+/// The files of the current watch sets. The daemon's file watcher reports the changes.
 struct Watched {
     info: DevWatched,
     owners: BuckMutMap<PathBuf, Owner>,
-    /// Package directories. A file added to or removed from one may change a target.
+    /// Package directories. A file added to or removed from one, or a directory inside one, may
+    /// change a target.
     dirs: BuckMutSet<PathBuf>,
-    _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl Watched {
@@ -795,14 +814,10 @@ impl Watched {
             },
             owners: BuckMutMap::default(),
             dirs: BuckMutSet::default(),
-            _watcher: None,
         }
     }
 
-    fn new(
-        info: DevWatched,
-        events: mpsc::UnboundedSender<notify::Result<notify::Event>>,
-    ) -> buck2_error::Result<Watched> {
+    fn new(info: DevWatched) -> Watched {
         let mut owners = BuckMutMap::default();
         for (i, set) in info.watch.iter().enumerate() {
             for f in &set.files {
@@ -817,37 +832,15 @@ impl Watched {
             owners.entry(PathBuf::from(f)).or_insert(Owner::Bzl);
         }
         let dirs: BuckMutSet<PathBuf> = info.dirs.iter().map(PathBuf::from).collect();
-        let mut watch_dirs = BTreeSet::new();
-        for path in owners.keys() {
-            if let Some(parent) = path.parent() {
-                watch_dirs.insert(parent.to_path_buf());
-            }
-        }
-        watch_dirs.extend(dirs.iter().cloned());
+        Watched { info, owners, dirs }
+    }
 
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ignored = events.send(event);
-        })
-        .map_err(|e| buck2_error!(ErrorTag::Environment, "Failed to start watching files: {e}"))?;
-        for dir in &watch_dirs {
-            if dir.is_dir() {
-                watcher
-                    .watch(dir, RecursiveMode::NonRecursive)
-                    .map_err(|e| {
-                        buck2_error!(
-                            ErrorTag::Environment,
-                            "Failed to watch `{}`: {e}",
-                            dir.display()
-                        )
-                    })?;
-            }
-        }
-        Ok(Watched {
-            info,
-            owners,
-            dirs,
-            _watcher: Some(watcher),
-        })
+    /// The number of files that the watch sets claim.
+    fn files(&self) -> usize {
+        self.owners
+            .values()
+            .filter(|owner| matches!(owner, Owner::File(_)))
+            .count()
     }
 
     /// Whether `path` is inside a package directory, so that adding or removing it may change a
@@ -971,8 +964,10 @@ fn hash_in_background(files: Vec<PathBuf>, hashes: Hashes) {
 struct Session<'a> {
     daemon: Daemon<'a>,
     debounce: Duration,
-    events_tx: mpsc::UnboundedSender<notify::Result<notify::Event>>,
-    events_rx: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    /// The changes the daemon's file watcher reports.
+    changes: FileChanges,
+    /// The file watcher missed changes: anything may have changed.
+    missed: bool,
     watched: Watched,
     /// The server's command line and the names of the outputs, from the last analysis.
     server_info: DevServer,
@@ -1045,6 +1040,7 @@ impl<'a> Session<'a> {
         server_rx: mpsc::UnboundedReceiver<ServerEvent>,
         mut signals: Signals,
         console: Console,
+        changes: FileChanges,
     ) -> buck2_error::Result<Result<Session<'a>, ExitResult>> {
         let response = {
             let request = daemon.request(|| DevAction::Server);
@@ -1066,12 +1062,11 @@ impl<'a> Session<'a> {
             Ok(_) => return Err(unexpected_response()),
             Err(Failed(messages)) => return Err(could_not_start(messages)),
         };
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
         let mut session = Session {
             daemon,
             debounce,
-            events_tx,
-            events_rx,
+            changes,
+            missed: false,
             watched: Watched::empty(),
             server_info,
             listener,
@@ -1122,7 +1117,7 @@ impl<'a> Session<'a> {
                 self.on_request(request).await?;
                 continue;
             }
-            if !self.queued.is_empty() {
+            if !self.queued.is_empty() || self.missed {
                 // Files changed during the last build.
                 let paths = std::mem::take(&mut self.queued);
                 let paths = self.debounce(paths).await;
@@ -1130,11 +1125,10 @@ impl<'a> Session<'a> {
                 continue;
             }
             tokio::select! {
-                event = self.events_rx.recv() => {
-                    let Some(event) = event else { continue };
+                change = self.changes.next() => {
                     let mut paths = BTreeSet::new();
-                    collect_paths(&self.watched, event, &mut paths);
-                    if paths.is_empty() {
+                    self.missed |= collect_paths(&self.watched, change, &mut paths);
+                    if paths.is_empty() && !self.missed {
                         continue;
                     }
                     let paths = self.debounce(paths).await;
@@ -1164,7 +1158,7 @@ impl<'a> Session<'a> {
         };
         let mut status = format!(
             "buck2 dev: watching {} files, {server}",
-            self.watched.owners.len()
+            self.watched.files()
         );
         if let Some((result, took)) = &self.last_build {
             status.push_str(&format!(
@@ -1210,15 +1204,16 @@ impl<'a> Session<'a> {
         let mut quiet_until = tokio::time::Instant::now() + self.debounce;
         loop {
             let wait_until = quiet_until.min(deadline);
-            match tokio::time::timeout_at(wait_until, self.events_rx.recv()).await {
-                Ok(Some(event)) => {
+            match tokio::time::timeout_at(wait_until, self.changes.next()).await {
+                Ok(change) => {
                     let before = paths.len();
-                    collect_paths(&self.watched, event, &mut paths);
-                    if paths.len() != before {
+                    let missed = collect_paths(&self.watched, change, &mut paths);
+                    if paths.len() != before || (missed && !self.missed) {
                         quiet_until = tokio::time::Instant::now() + self.debounce;
                     }
+                    self.missed |= missed;
                 }
-                _ => return paths,
+                Err(_) => return paths,
             }
         }
     }
@@ -1260,11 +1255,19 @@ impl<'a> Session<'a> {
         }
     }
 
-    async fn on_changes(&mut self, paths: BTreeSet<PathBuf>) -> buck2_error::Result<()> {
+    async fn on_changes(&mut self, mut paths: BTreeSet<PathBuf>) -> buck2_error::Result<()> {
         let mut changed_sets: BTreeMap<usize, Vec<PathBuf>> = BTreeMap::new();
         let mut waiting: Vec<(PathBuf, Option<blake3::Hash>)> = Vec::new();
         let mut bzl_changed: Vec<PathBuf> = Vec::new();
         let mut graph_changed = false;
+
+        if std::mem::take(&mut self.missed) {
+            // The file watcher missed changes, or the daemon restarted. Look at every file again,
+            // which builds what the sets ask for, and analyse the target again, for files added
+            // or removed.
+            paths.extend(self.watched.owners.keys().cloned());
+            graph_changed = true;
+        }
 
         let paths = paths
             .into_iter()
@@ -1409,7 +1412,8 @@ impl<'a> Session<'a> {
         }
         let Session {
             daemon,
-            events_rx,
+            changes,
+            missed,
             watched,
             last_seen,
             queued,
@@ -1448,10 +1452,13 @@ impl<'a> Session<'a> {
                         return Ok(Outcome::Interrupted);
                     }
                 }
-                event = events_rx.recv() => {
-                    let Some(event) = event else { continue };
+                change = changes.next() => {
                     let mut paths = BTreeSet::new();
-                    collect_paths(watched, event, &mut paths);
+                    if collect_paths(watched, change, &mut paths) {
+                        // Anything may have changed, so the request may be out of date.
+                        *missed = true;
+                        return Ok(Outcome::Interrupted);
+                    }
                     let interrupt = interrupts(watched, last_seen, &paths).await;
                     queued.append(&mut paths);
                     if interrupt {
@@ -1580,7 +1587,7 @@ impl<'a> Session<'a> {
             ))?;
         }
         self.resolve_due = !info.incomplete.is_empty();
-        self.watched = Watched::new(info, self.events_tx.clone())?;
+        self.watched = Watched::new(info);
         hash_in_background(self.watched.baseline_files(), self.baseline.clone());
         Ok(())
     }
@@ -1661,27 +1668,21 @@ impl<'a> Session<'a> {
     }
 }
 
-/// Add the paths of `event` that belong to a watch set, a package or the graph.
-fn collect_paths(
-    watched: &Watched,
-    event: notify::Result<notify::Event>,
-    paths: &mut BTreeSet<PathBuf>,
-) {
-    let Ok(event) = event else { return };
-    if matches!(event.kind, EventKind::Access(_)) {
-        return;
+/// Add the path of `change` if it belongs to a watch set, a package or the graph. Returns
+/// whether changes were missed instead.
+#[cfg(unix)]
+fn collect_paths(watched: &Watched, change: FileChange, paths: &mut BTreeSet<PathBuf>) -> bool {
+    let (path, kind) = match change {
+        FileChange::Path(path, kind) => (path, kind),
+        FileChange::Missed => return true,
+    };
+    // A file that no watch set owns matters only when it, or a directory, is added to or removed
+    // from a package. Writing to one, such as an editor's swap file, cannot change a target.
+    let only_content = kind == FileChangeKind::Contents;
+    if watched.owners.contains_key(&path) || (!only_content && watched.in_package(&path)) {
+        paths.insert(path);
     }
-    // A file that no watch set owns matters only when it is added to or removed from a package.
-    // Writing to one, such as an editor's swap file, cannot change a target.
-    let only_content = matches!(
-        event.kind,
-        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
-    );
-    for path in event.paths {
-        if watched.owners.contains_key(&path) || (!only_content && watched.in_package(&path)) {
-            paths.insert(path);
-        }
-    }
+    false
 }
 
 /// Whether a change to one of `paths` makes the running request out of date, so that
