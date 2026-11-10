@@ -111,6 +111,8 @@ changed. A set claims only files of the configured dependency graph of the
 Because the daemon compares contents, saving a file without changing it, a
 file that is created and removed again, such as the temporary files some
 editors make when they save, and a file that no set claims change nothing.
+A source file that is a symlink to another file in the project is built from
+that file, so the set that claims the symlink claims that file too.
 
 The file watcher must report changes as they happen. The `notify` watcher,
 the default outside Meta, does; `buck2 dev` stops with an error if the
@@ -266,8 +268,8 @@ console, and prints only errors and that the server exited or restarts.
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`   | The server sent `hello`.                                                                                     |
 | `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
-| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`       | A build succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. |
-| `failed`        | `gen`, `error`                                            | A build, or the analysis of the target, failed. The errors are also on the terminal.                         |
+| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
+| `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
 | `stale`         | `files`: the changed files of `notify` sets               | That list changes. An empty list means that nothing waits.                                                   |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
@@ -336,6 +338,10 @@ repeats the request.
 - Every change in the project, even to a file that no set claims, costs a short
   daemon command, in which the daemon walks the graph of the target again. A
   server that keeps writing files in the project keeps `buck2 dev` asking.
-- `buck2 dev` does not act on changes to `.buckconfig` files. The next build
-  uses them.
+- A `.buckconfig` change is not a change of any watch set, but `buck2 dev` asks
+  the daemon about it as about any other file, and the daemon reads the
+  configuration again. If that changes the targets of the graph, such as a
+  source file that `read_config` names, it is a change to them, as in
+  [Changes to the graph](#changes-to-the-graph). Other configuration changes
+  are used by the next build.
 - `buck2 dev` runs only on Unix so far.

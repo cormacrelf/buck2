@@ -63,6 +63,7 @@ use buck2_cli_proto::new_generic::DevWatched;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::metadata::RawPathMetadata;
+use buck2_common::file_ops::metadata::RawSymlink;
 use buck2_common::io::IoProvider;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
 use buck2_core::bzl::ImportPath;
@@ -390,6 +391,7 @@ async fn configured_label(
         .await
 }
 
+/// Build each output on its own: one that fails does not keep the others from the server.
 async fn build(
     project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
@@ -397,7 +399,7 @@ async fn build(
 ) -> buck2_error::Result<DevBuilt> {
     let artifact_fs = dice.get_artifact_fs().await?;
     let built = dice
-        .try_compute_join(wanted, async |dice, (name, artifact)| {
+        .compute_join(wanted, async |dice, (name, artifact)| {
             let values = materialize_and_upload_artifact_group(
                 dice,
                 &ArtifactGroup::Artifact(artifact.dupe()),
@@ -406,12 +408,20 @@ async fn build(
                     .per_transaction_data()
                     .get_materialization_queue_tracker(),
             )
-            .await?;
-            buck2_error::Ok((name, values))
+            .await;
+            (name, values)
         })
-        .await?;
+        .await;
     let mut outputs = BTreeMap::new();
+    let mut failed = BTreeMap::new();
     for (name, values) in built {
+        let values = match values {
+            Ok(values) => values,
+            Err(e) => {
+                failed.insert(name, output_error(&e));
+                continue;
+            }
+        };
         let (artifact, value) = values
             .iter()
             .next()
@@ -425,7 +435,46 @@ async fn build(
             },
         );
     }
-    Ok(DevBuilt { outputs })
+    Ok(DevBuilt { outputs, failed })
+}
+
+/// The most of an action's stdout or stderr that `output_error` keeps: the end, where the
+/// errors usually are.
+const MAX_ERROR_STREAM: usize = 16 << 10;
+
+/// Why an output failed to build. For an action, that is what the console shows for it, with
+/// its command, exit code and output, rather than only which target failed to build.
+fn output_error(e: &buck2_error::Error) -> String {
+    if let Some(action_error) = e.action_error() {
+        let mut action_error = action_error.clone();
+        if let Some(details) = action_error
+            .last_command
+            .as_mut()
+            .and_then(|command| command.details.as_mut())
+        {
+            details.cmd_stdout = tail(&details.cmd_stdout);
+            details.cmd_stderr = tail(&details.cmd_stderr);
+        }
+        if let Ok(display) = buck2_event_observer::display::display_action_error(
+            &action_error,
+            buck2_event_observer::display::TargetDisplayOptions::for_build_report(),
+        ) {
+            return display.simple_format_for_build_report();
+        }
+    }
+    format!("{e:#}")
+}
+
+/// The end of `stream`, at most `MAX_ERROR_STREAM` bytes, saying how much it leaves out.
+fn tail(stream: &str) -> String {
+    if stream.len() <= MAX_ERROR_STREAM {
+        return stream.to_owned();
+    }
+    let mut start = stream.len() - MAX_ERROR_STREAM;
+    while !stream.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[{start} bytes left out]\n{}", &stream[start..])
 }
 
 /// What the watch sets claim.
@@ -574,6 +623,39 @@ async fn claims(
         if let Some(path) = project_path(cell_resolver, buildfile.dupe())? {
             build_files.entry(path).or_insert((false, buildfile)).0 |=
                 set.is_some_and(|set| watch[set].notify);
+        }
+    }
+    // A source file that is a symlink is built from the file that it points at, which the set
+    // claims too.
+    let mut links: Vec<(usize, CellPath)> = files
+        .values()
+        .map(|(set, path)| (*set, path.dupe()))
+        .collect();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        if links.is_empty() {
+            break;
+        }
+        let targets = dice
+            .try_compute_join(links, async |dice, (set, path)| {
+                let target =
+                    match DiceFileComputations::read_path_metadata_if_exists(dice, path).await? {
+                        Some(RawPathMetadata::Symlink {
+                            to: RawSymlink::Relative(target, _),
+                            ..
+                        }) => Some((set, target)),
+                        _ => None,
+                    };
+                buck2_error::Ok(target)
+            })
+            .await?;
+        links = Vec::new();
+        for (set, target) in targets.into_iter().flatten() {
+            let new = project_path(cell_resolver, target.dupe())?
+                .is_some_and(|rel| !files.contains_key(&rel));
+            claim_file(&mut files, cell_resolver, target.dupe(), set)?;
+            if new {
+                links.push((set, target));
+            }
         }
     }
     let bzl_files = loaded_files(dice, cell_resolver, packages).await?;
@@ -791,6 +873,9 @@ fn files_digest(files: &mut Vec<(&ProjectRelativePathBuf, Option<String>)>) -> S
     files.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
+
+/// How many symlinks in a row `claims` follows from a source file.
+const MAX_SYMLINK_HOPS: usize = 8;
 
 fn claim<K: Hash + Eq>(map: &mut BuckMutMap<K, usize>, key: K, set: usize) {
     let entry = map.entry(key).or_insert(set);

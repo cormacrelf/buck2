@@ -1459,6 +1459,22 @@ impl<'a> Session<'a> {
             })
             .await?;
         match outcome {
+            Outcome::Done(DevResponse::Build(built))
+                if built.outputs.is_empty() && !built.failed.is_empty() =>
+            {
+                // Nothing built.
+                let error: Vec<String> = built.failed.into_values().collect();
+                self.link.send_result(
+                    generation,
+                    json!({
+                        "type": "failed",
+                        "gen": generation,
+                        "error": error.join("\n"),
+                    }),
+                );
+                self.last_build = Some(("failed", started.elapsed()));
+                return Ok(false);
+            }
             Outcome::Done(DevResponse::Build(built)) => {
                 let mut message = serde_json::Map::new();
                 for (name, output) in built.outputs {
@@ -1474,11 +1490,27 @@ impl<'a> Session<'a> {
                         }),
                     );
                 }
-                self.link.send_result(
-                    generation,
-                    json!({"type": "built", "gen": generation, "outputs": message}),
-                );
-                self.last_build = Some(("succeeded", started.elapsed()));
+                if built.failed.is_empty() {
+                    self.link.send_result(
+                        generation,
+                        json!({"type": "built", "gen": generation, "outputs": message}),
+                    );
+                    self.last_build = Some(("succeeded", started.elapsed()));
+                } else {
+                    // Some outputs built: the server gets them, and the errors of the others,
+                    // whose digests stay those of the last time they built.
+                    self.link.send_result(
+                        generation,
+                        json!({
+                            "type": "built",
+                            "gen": generation,
+                            "outputs": message,
+                            "failed": built.failed,
+                        }),
+                    );
+                    self.last_build = Some(("partly failed", started.elapsed()));
+                    return Ok(false);
+                }
             }
             Outcome::Done(DevResponse::Interrupted(interrupted)) => {
                 self.cancelled_outputs.extend(outputs);

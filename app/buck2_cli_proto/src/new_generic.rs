@@ -264,6 +264,9 @@ pub struct DevPath {
 #[derive(Serialize, Deserialize)]
 pub struct DevBuilt {
     pub outputs: BTreeMap<String, DevBuiltOutput>,
+    /// The outputs that failed to build, with their errors.
+    #[serde(default)]
+    pub failed: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
