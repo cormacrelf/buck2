@@ -187,6 +187,27 @@ def _dev_app(ctx):
         extra["exe"] = _concat_output(ctx, "exe.txt")
         extra["patch"] = _concat_output(ctx, "patch.txt")
         watch = None
+    elif ctx.attrs.mode == "flood":
+        # No watch list. The action of `flood` writes many files under `buck-out` at once,
+        # as the actions of a large build do together, before it concatenates `srcs`.
+        flood = ctx.actions.declare_output("flood.txt")
+        ctx.actions.run(
+            cmd_args(
+                "sh",
+                "-c",
+                'out="$1"; shift; dir="$BUCK_SCRATCH_PATH/flood"; mkdir -p "$dir"; sleep 1; '
+                + "for p in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do "
+                + '( i=0; while [ $i -lt 6000 ]; do : > "$dir/$p.$i"; i=$((i+1)); done ) & '
+                + 'done; wait; cat "$@" > "$out"',
+                "--",
+                flood.as_output(),
+                ctx.attrs.srcs,
+            ),
+            category = "flood",
+            local_only = True,
+        )
+        extra["flood"] = flood
+        watch = None
     elif ctx.attrs.mode == "sidecars":
         # No watch list, and one output. The extra outputs are its sidecars, and so is its
         # first source file.

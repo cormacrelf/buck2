@@ -311,3 +311,11 @@ dev_app(
     },
     server = "server.py",
 )
+
+dev_app(
+    name = "flood",
+    mode = "flood",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)

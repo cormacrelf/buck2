@@ -9,8 +9,11 @@
  */
 
 use std::mem;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::mpsc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -270,12 +273,74 @@ impl NotifyFileData {
     }
 }
 
+/// Whether the watcher leaves out what is under `buck-out`.
+///
+/// On Linux the kernel keeps the events of every watched directory of the project in one
+/// queue of limited length, and drops events when it is full. `process` ignores the events
+/// from `buck-out`, but they fill the queue all the same: a build that writes many files
+/// there has the kernel drop events, the watcher then says that it missed changes, and the
+/// daemon starts over. For `buck2 dev` that stops the build and starts it again, which writes
+/// the same files again, without end.
+///
+/// So there the root of the project is watched by itself, and each directory in it but
+/// `buck-out` with all that is below it.
+const SKIP_BUCK_OUT: bool = cfg!(target_os = "linux");
+
+/// Whether `path`, an entry of the root of the project, is a directory to watch with all that
+/// is below it. A symlink to a directory is one, as it is when the root is watched with all
+/// that is below it.
+fn is_watched_dir(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name != InvocationPaths::buck_out_dir_prefix().as_str())
+        && path.is_dir()
+}
+
+/// Watch the project.
+fn watch_project(watcher: &mut RecommendedWatcher, root: &Path) -> notify::Result<()> {
+    if !SKIP_BUCK_OUT {
+        return watcher.watch(root, notify::RecursiveMode::Recursive);
+    }
+    // The root first, so that a directory that is made while the others are listed is
+    // reported, and `new_dirs` has it watched.
+    watcher.watch(root, notify::RecursiveMode::NonRecursive)?;
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if is_watched_dir(&path) {
+            watcher.watch(&path, notify::RecursiveMode::Recursive)?;
+        }
+    }
+    Ok(())
+}
+
+/// The directories to start watching after `event`: those that were made in the root of the
+/// project, or moved there.
+fn new_dirs(event: &notify::Result<notify::Event>, root: &Path) -> Vec<PathBuf> {
+    let Ok(event) = event else {
+        return Vec::new();
+    };
+    if !SKIP_BUCK_OUT
+        || !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+        )
+    {
+        return Vec::new();
+    }
+    event
+        .paths
+        .iter()
+        .filter(|path| path.parent() == Some(root) && is_watched_dir(path))
+        .cloned()
+        .collect()
+}
+
 #[derive(Allocative)]
 pub struct NotifyFileWatcher {
     #[allocative(skip)]
     #[expect(unused)]
-    // FIXME(JakobDegen): Clarify if this just needs to be kept alive or can be removed?
-    watcher: RecommendedWatcher,
+    // Kept alive, and shared with the thread that has it watch the directories that are made
+    // in the root of the project.
+    watcher: Arc<Mutex<RecommendedWatcher>>,
     data: Arc<Mutex<buck2_error::Result<NotifyFileData>>>,
     /// What the changes recorded on the updater are relative to.
     baseline: Mutex<FileSystemBaseline>,
@@ -290,7 +355,14 @@ impl NotifyFileWatcher {
         let root2 = root.dupe();
         let publisher = Arc::new(ChangePublisher::new());
         let publisher2 = publisher.dupe();
+        let root_path = root.root().as_path().to_owned();
+        let (new_dirs_tx, new_dirs_rx) = mpsc::channel::<PathBuf>();
         let mut watcher = notify::recommended_watcher(move |event| {
+            // The watcher cannot be told to watch more from here, the thread that it calls
+            // this on: it would wait for itself.
+            for dir in new_dirs(&event, &root_path) {
+                let _ignored = new_dirs_tx.send(dir);
+            }
             let mut guard = data2.lock().unwrap();
             if let Ok(state) = &mut *guard {
                 // Pushed while the lock is held, after the event is recorded, so that a sync
@@ -314,8 +386,30 @@ impl NotifyFileWatcher {
             }
         })
         .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
-        watcher
-            .watch(root.root().as_path(), notify::RecursiveMode::Recursive)
+        watch_project(&mut watcher, root.root().as_path())
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
+        let watcher = Arc::new(Mutex::new(watcher));
+        // Ends when the watcher is dropped, and its callback with it.
+        let watcher2 = Arc::downgrade(&watcher);
+        std::thread::Builder::new()
+            .name("buck2-notify-dirs".to_owned())
+            .spawn(move || {
+                for dir in new_dirs_rx {
+                    let Some(watcher) = watcher2.upgrade() else {
+                        break;
+                    };
+                    // What was made in the directory before this is not reported, as for a
+                    // directory that is made anywhere else in a watched one.
+                    let watched = watcher
+                        .lock()
+                        .unwrap()
+                        .watch(&dir, notify::RecursiveMode::Recursive);
+                    if let Err(e) = watched {
+                        // The directory may be gone again.
+                        debug!("FileWatcher: could not watch {}: {}", dir.display(), e);
+                    }
+                }
+            })
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
         Ok(Self {
             watcher,

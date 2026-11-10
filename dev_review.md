@@ -170,7 +170,17 @@ DevInfo(
 - Known: the build that looped was one that `buck2 dev` started by itself. In the prototype a plain output is built again after any change that it may be built from, whether or not the server has asked for it, and after missed changes every plain output is.
 - Known: `files: []` on each `building` is what missed changes give in the prototype. A changed group of targets with no changed build file gives it too.
 - Not known: what started the first build. No file had changed.
-- Guessed, not checked: 10k actions write under `buck-out`, which is inside the project, and overflow the inotify queue, which holds 16384 events here. The notify watcher then says that it missed changes (`notify.rs`, `need_rescan`). That stops the build, and the next sync has the daemon start over, which is why the claims were found again each time. The next build overflows the queue again. The watcher's debug log was not on, so nothing shows that it said so.
+- Guessed at first, and checked since: 10k actions write under `buck-out`, which is inside the project, and overflow the inotify queue, which holds 16384 events here. The notify watcher watched `buck-out` with the rest of the project, and dropped its events only after they arrived. So it said that it missed changes (`notify.rs`, `need_rescan`). That stops the build, and the next sync has the daemon start over, which is why the claims were found again each time. The next build overflows the queue again.
+
+**The check, and the fix.** The fixture has a target, `//app:flood`, whose action writes about a hundred thousand files under `buck-out` at once. With it the loop shows on two targets: `building`, `cancelled`, `building`, `cancelled`, for as long as the test waits. `test_writes_under_buck_out_do_not_start_builds` requires one build and then nothing.
+
+The fix is in the watcher, not in `buck2 dev`. On Linux it now watches the root of the project by itself, and each directory in it but `buck-out` with all that is below it, so what Buck writes cannot fill the queue. A directory that is made in the root later is watched from then on; `test_directory_made_in_the_project_root_is_watched` has a package appear that way. With that the flood test passes, and so do the other `buck2 dev` suites. This also matters outside `buck2 dev`: before it, a build that wrote enough to fill the queue had the next command start the daemon over.
+
+What is still as it was:
+- The bench was not run again, so the 10k-target case itself is not shown fixed, only the small one with the same cause.
+- What started the first build is still not known. It may have been the same overflow: the second run started on a `buck-out` that the first had filled.
+- Directories that the project's ignore rules exclude are still watched, and their events dropped afterwards. One that gets many writes, such as `node_modules` or a Cargo `target`, can still fill the queue.
+- The points under "What it says about the design" below stand. The watcher no longer causes missed changes by itself, but after changes that are missed for another reason `buck2 dev` still builds every plain output, asked for or not, and nothing bounds a build that keeps being stopped.
 
 **Why the tests did not find it.** The fixture has two targets. `test_missed_changes_hold_the_outputs_with_only` has changes missed once, and gets one build.
 
@@ -178,9 +188,8 @@ DevInfo(
 - **Build by itself only what the server has asked for.** The proposal above says "builds every output after any change (or every output the server has asked for)". The prototype did the first, and this is the case against it: an output that no server wants, built after every change and after every missed one. I would take the second. An output that the server has not asked for since it started is then never built by `buck2 dev` itself.
 - **The loop is not the prototype's alone.** With a watch list, `buck2 dev` also builds what every `build` set names after missed changes, and a build also stops when changes are missed. If the guess is right, a watch list whose `build` set names a large enough output loops the same way. I did not test that. The old bench modes never build the large artifact.
 - **Nothing bounds it.** A build that is stopped is started again at once, however often that has happened, and memory grew all the while. `buck2 dev` should give up, or wait longer each time, after some number of builds in a row that were stopped without a file to name, and send `failed`.
-- **The guess should be checked first.** If actions under `buck-out` can make the watcher miss changes, that matters to more than `buck2 dev`: every sync after it starts the daemon over.
 
-**The bench.** The `outputs` and `outputs8` modes are still in `tests/dev_bench`, and reproduce this. They should not be run without a limit on memory.
+**The bench.** The `outputs` and `outputs8` modes are still in `tests/dev_bench`. They looped before the fix to the watcher, and have not been run since. They should not be run without a limit on memory.
 
 ### To think about: a file added after the sets were found
 

@@ -27,6 +27,7 @@ import os
 from typing import Any, Dict, Tuple
 
 from buck2.tests.core.common.dev.dev_util import (
+    APP,
     changed,
     contents,
     dev_test,
@@ -432,6 +433,58 @@ class DevOnlyTest(BuckTestCase):
             dev.request({"type": "build", "outputs": ["extra"]})
             _, failed = await dev.expect("building", "failed")
             assert "no output named `extra`" in failed["error"], failed
+            await dev.quiet()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_writes_under_buck_out_do_not_start_builds(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:flood")
+        try:
+            # The action of `flood` writes about a hundred thousand files under `buck-out`.
+            # They are no changes to the project: the build is not stopped, and nothing is
+            # built after it.
+            _, _, _, built = await dev.expect("started", "ready", "building", "built")
+            assert contents(built) == {"flood": "app v1\n", "site": "app v1\n"}
+            await dev.quiet(5)
+
+            write(buck, "app/main.txt", "app v2\n")
+            building, built = await dev.expect("building", "built")
+            assert files(buck, building) == ["app/main.txt"]
+            assert contents(built) == {"flood": "app v2\n", "site": "app v2\n"}
+            await dev.quiet(5)
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_directory_made_in_the_project_root_is_watched(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:outputs")
+        try:
+            await dev.start()
+
+            # A package in a directory that the root of the project gets after the daemon
+            # started watching, and that `site` is then built from.
+            write(buck, "more/more.txt", "more v1\n")
+            write(
+                buck,
+                "more/TARGETS.fixture",
+                'load("//:defs.bzl", "concat")\n\n'
+                'concat(name = "more", srcs = ["more.txt"], visibility = ["PUBLIC"])\n',
+            )
+            await dev.quiet()
+            edit_target(buck, APP, "outputs", '"//lib:lib"', '"//lib:lib", "//more:more"')
+            # The target of both outputs changed, so both are built.
+            _, building, built = await dev.expect("graph_changed", "building", "built")
+            assert building["outputs"] == ["extra", "site"]
+            assert contents(built)["site"] == "lib v1\nmore v1\napp v1\n"
+
+            # A change to a file in that directory is seen.
+            write(buck, "more/more.txt", "more v2\n")
+            building, built = await dev.expect("building", "built")
+            assert files(buck, building) == ["more/more.txt"]
+            assert contents(built) == {"site": "lib v1\nmore v2\napp v1\n"}
             await dev.quiet()
         finally:
             await dev.stop()

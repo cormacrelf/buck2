@@ -25,9 +25,10 @@ The modes are targets of the project's `app` package, which differ in their watc
 - `outputs8`: the same, with eight outputs that are built from every library.
 
 Do not run `outputs` or `outputs8` without a limit on memory. In them `buck2 dev` builds the
-large output by itself, the build is stopped and started again without end, and the daemon's
-memory grows until the machine runs out. See "a build that `buck2 dev` starts by itself can
-loop" in `dev_review.md`.
+large output by itself. Before the notify watcher left `buck-out` out, that build was stopped
+and started again without end, and the daemon's memory grew until the machine ran out. They
+have not been run since. See "a build that `buck2 dev` starts by itself can loop" in
+`dev_review.md`.
 
 The daemon logs how long each step of finding what the watch sets claim takes, at the `debug`
 level of `buck2_server_commands::dev`. `bench.py` turns that on with `BUCK_LOG` and prints the
