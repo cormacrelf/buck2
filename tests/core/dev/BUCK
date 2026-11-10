@@ -2,4 +2,22 @@ load("@fbcode//buck2/tests:buck_e2e.bzl", "buck2_core_tests")
 
 oncall("build_infra")
 
-buck2_core_tests()
+# The other tests of `buck2 dev` use the fixture of `test_dev`.
+_DEV_FIXTURE = {
+    "env": {"TEST_REPO_DATA": "$(location :test_dev_data)/test_dev_data"},
+    "require_nano_prelude": True,
+}
+
+buck2_core_tests(
+    extra_attrs = {
+        "deps": [
+            "//buck2/tests/core/common:dev",
+        ],
+    },
+    target_extra_attrs = {
+        "test_dev_failures": _DEV_FIXTURE,
+        "test_dev_files": _DEV_FIXTURE,
+        "test_dev_graph": _DEV_FIXTURE,
+        "test_dev_timing": _DEV_FIXTURE,
+    },
+)

@@ -167,3 +167,60 @@ concat(
     name = "other",
     srcs = ["other.txt"],
 )
+
+dev_app(
+    name = "multi",
+    mode = "multi",
+    srcs = ["main.txt"],
+    extra_outputs = {"extra": ["extra.txt"]},
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)
+
+dev_app(
+    name = "with_dep",
+    mode = "all",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "restart_built_server",
+    mode = "restart",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_check = "check.txt",
+)
+
+dev_app(
+    name = "slow_shutdown",
+    mode = "restart",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--slow-shutdown"],
+)
+
+dev_app(
+    name = "configured",
+    mode = "all",
+    srcs = [read_config("dev_test", "src", "main.txt")],
+    server = "server.py",
+)
+
+dev_app(
+    name = "project_log",
+    mode = "all",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--log-in-project"],
+)
+
+dev_app(
+    name = "slow_watch",
+    mode = "deep",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    server = "server.py",
+    watch_delay = "watch_delay.txt",
+)

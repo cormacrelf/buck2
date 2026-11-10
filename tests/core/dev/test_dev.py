@@ -9,135 +9,27 @@
 # pyre-strict
 
 # Tests for `buck2 dev`. The fixture's server (`app/server.py`) connects to `BUCK2_DEV_SOCKET`
-# and appends every message it gets to `dev_events.jsonl` in the project root; the tests read
-# that file.
+# and appends every message it gets to `buck-out/dev_events.jsonl`; the tests read that file.
+# The helpers are in `tests/core/common/dev`, shared with the other tests here.
 
 import asyncio
-import json
 import os
 import signal
 import time
-from asyncio import subprocess
-from pathlib import Path
-from typing import Any, Dict, List
 
+from buck2.tests.core.common.dev.dev_util import (
+    alive,
+    dev_test,
+    path,
+    site,
+    start_dev,
+    stopped,
+    wait_until,
+    write,
+)
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test, BuckTestCase
-
-
-class DevSession:
-    def __init__(self, buck: Buck, process: subprocess.Process) -> None:
-        self.buck = buck
-        self.process = process
-        self.events_path: Path = buck.cwd / "dev_events.jsonl"
-        self.offset = 0
-
-    def _events(self) -> List[Dict[str, Any]]:
-        if not self.events_path.exists():
-            return []
-        lines = self.events_path.read_text().splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
-
-    async def wait_for(self, kind: str, timeout: float = 90) -> Dict[str, Any]:
-        """Wait for the next message of type `kind` after the ones already returned."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            events = self._events()
-            for i in range(self.offset, len(events)):
-                if events[i]["type"] == kind:
-                    self.offset = i + 1
-                    return events[i]
-            if self.process.returncode is not None:
-                output = await self.stop()
-                raise AssertionError(
-                    f"`buck2 dev` exited with {self.process.returncode} "
-                    f"before sending `{kind}`\n{output}"
-                )
-            await asyncio.sleep(0.1)
-        output = await self.stop()
-        raise AssertionError(
-            f"Timed out waiting for `{kind}`: {self._events()}\n{output}"
-        )
-
-    async def assert_none(self, kind: str, seconds: float) -> None:
-        """Assert that no message of type `kind` arrives within `seconds`."""
-        await asyncio.sleep(seconds)
-        later = [e for e in self._events()[self.offset :] if e["type"] == kind]
-        assert later == [], later
-
-    async def process_output_split(self) -> None:
-        """Stop `buck2 dev`, and keep its stdout and stderr apart in `self.stdout` and
-        `self.stderr`."""
-        if self.process.returncode is None:
-            self.process.send_signal(signal.SIGINT)
-        stdout, stderr = await asyncio.wait_for(self.process.communicate(), timeout=60)
-        self.stdout: str = (stdout or b"").decode(errors="replace")
-        self.stderr: str = (stderr or b"").decode(errors="replace")
-
-    async def stop(self) -> str:
-        """Stop `buck2 dev`, and return what it wrote to stdout and stderr."""
-        if self.process.returncode is None:
-            self.process.send_signal(signal.SIGINT)
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                self.process.communicate(), timeout=60
-            )
-        except (asyncio.TimeoutError, ValueError):
-            self.process.kill()
-            return "<buck2 dev did not exit>"
-        out = (stdout or b"").decode(errors="replace")
-        err = (stderr or b"").decode(errors="replace")
-        return f"stdout:\n{out}\nstderr:\n{err}"
-
-
-async def start_dev(buck: Buck, target: str, console: str = "none") -> DevSession:
-    process = await buck.run_buck_command(
-        "dev", target, "--console", console, "--debounce-ms", "200"
-    ).start()
-    return DevSession(buck, process)
-
-
-def path(buck: Buck, rel: str) -> str:
-    return os.path.realpath(buck.cwd / rel)
-
-
-def site(built: Dict[str, Any]) -> str:
-    return built["outputs"]["site"]["content"]
-
-
-def write(buck: Buck, rel: str, content: str) -> None:
-    target = buck.cwd / rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
-
-
-def stopped(pid: int) -> bool:
-    """Whether the process is stopped, as by Ctrl-Z. Linux only."""
-    stat = Path(f"/proc/{pid}/stat").read_text()
-    return stat.rsplit(")", 1)[1].split()[0] == "T"
-
-
-async def wait_until(condition: Any, what: str, timeout: float = 30) -> None:
-    deadline = time.monotonic() + timeout
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(f"Timed out waiting until {what}")
-        await asyncio.sleep(0.1)
-
-
-def alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def dev_test() -> Any:
-    """`buck2 dev` needs a file watcher that reports changes as they happen. The tests use
-    `fs_hash_crawler` otherwise."""
-    return buck_test(extra_buck_config={"buck2": {"file_watcher": "notify"}})
 
 
 class DevTest(BuckTestCase):
