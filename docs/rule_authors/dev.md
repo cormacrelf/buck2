@@ -317,6 +317,35 @@ A sidecar is built by an action, and an action does not know the last build.
 So a sidecar can say what an output is, but not how it differs from the last
 one, except through `changed`.
 
+## Outputs that run with other files
+
+Some programs run only together with other files: a dynamically linked
+executable and its shared libraries, a Python binary and its link tree, a
+binary and its resources. Give such an output as an artifact with associated
+artifacts, from `artifact.with_associated_artifacts([...])` or
+`ctx.actions.write(..., with_inputs = True)`:
+
+```python
+launcher = ctx.actions.write(
+    "app.sh",
+    cmd_args("#!/bin/sh", cmd_args("exec ", exe, ' "$@"', delimiter = "")),
+    is_executable = True,
+    with_inputs = True,
+)
+DevInfo(server = server, outputs = {"app": launcher})
+```
+
+`buck2 dev` builds the associated artifacts with the output, in the same
+build, and materialises them. `path` in `built` is the path of the artifact
+itself. The paths that `write` puts into the script are relative to the
+project root, which is the server's working directory.
+
+The associated artifacts are part of the output. What they are built from
+counts as what the output may be built from. A new associated artifact is a
+new output, also when the artifact itself is the same: `changed` is true, and
+the `digest` covers the associated artifacts too. A sidecar may have associated
+artifacts as well, and they belong to the sidecar in the same way.
+
 ## The server protocol
 
 `buck2 dev` starts the server in the project root, with the environment

@@ -44,17 +44,18 @@ use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_artifact::actions::key::ActionKey;
 use buck2_artifact::artifact::artifact_dyn::ArtifactDyn;
-use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::actions::calculation::ActionCalculation;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::artifact_groups::ArtifactGroup;
+use buck2_build_api::artifact_groups::ArtifactGroupValues;
 use buck2_build_api::artifact_groups::ResolvedArtifactGroup;
 use buck2_build_api::artifact_groups::TransitiveSetProjectionKey;
 use buck2_build_api::interpreter::rule_defs::cmd_args::ArtifactPathMapperImpl;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevArtifact;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::OwnedDevInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::OwnedRunInfo;
@@ -89,6 +90,7 @@ use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
+use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
@@ -226,14 +228,16 @@ impl<'a> DevView<'a> {
         }
     }
 
-    fn outputs(self) -> buck2_error::Result<BuckMutInsertionMap<String, Artifact>> {
+    fn outputs(self) -> buck2_error::Result<BuckMutInsertionMap<String, DevArtifact>> {
         match self {
             DevView::Dev(info) => info.outputs(),
             DevView::Run(_) => Ok(BuckMutInsertionMap::default()),
         }
     }
 
-    fn sidecars(self) -> buck2_error::Result<BuckMutInsertionMap<String, Vec<(String, Artifact)>>> {
+    fn sidecars(
+        self,
+    ) -> buck2_error::Result<BuckMutInsertionMap<String, Vec<(String, DevArtifact)>>> {
         match self {
             DevView::Dev(info) => info.sidecars(),
             DevView::Run(_) => Ok(BuckMutInsertionMap::default()),
@@ -272,11 +276,12 @@ fn dev_policy(info: DevView<'_>) -> buck2_error::Result<(Vec<String>, Vec<Slot>)
         only: None,
     }];
     let mut names = Vec::new();
-    for (name, artifact) in outputs.iter() {
-        // What a sidecar is built from counts as what the output is built from.
-        let mut inputs = vec![ArtifactGroup::Artifact(artifact.dupe())];
+    for (name, output) in outputs.iter() {
+        // What a sidecar, or an associated artifact, is built from counts as what the output is
+        // built from.
+        let mut inputs = output.groups();
         for (_, sidecar) in sidecars.get(name).into_iter().flatten() {
-            inputs.push(ArtifactGroup::Artifact(sidecar.dupe()));
+            inputs.extend(sidecar.groups());
         }
         slots.push(Slot {
             what: format!("Output `{name}`"),
@@ -404,7 +409,7 @@ async fn dev(
                 })?;
                 wanted.push(Wanted {
                     name: name.clone(),
-                    artifact: artifact.dupe(),
+                    artifact: artifact.clone(),
                     sidecars: sidecars.get(name).cloned().unwrap_or_default(),
                 });
             }
@@ -484,19 +489,7 @@ async fn build_command<'a>(
         line().visit_artifacts(&mut visitor)?;
         visitor.inputs
     };
-    let ensured = dice
-        .try_compute_join(inputs, async |dice, input| {
-            materialize_and_upload_artifact_group(
-                dice,
-                &input,
-                MaterializationAndUploadContext::materialize(),
-                &dice
-                    .per_transaction_data()
-                    .get_materialization_queue_tracker(),
-            )
-            .await
-            .map(|value| (input, value))
-        })
+    let ensured = materialize_groups(dice, inputs.into_iter().collect())
         .await
         .with_buck_error_context(|| what.to_owned())?;
     let path_separator = if cfg!(windows) {
@@ -505,15 +498,7 @@ async fn build_command<'a>(
         PathSeparatorKind::Unix
     };
     let executor_fs = ExecutorFs::new(&artifact_fs, path_separator);
-    let mut contents = Vec::new();
-    for (_, values) in &ensured {
-        for (artifact, value) in values.iter() {
-            let path =
-                artifact.resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
-            contents.push((path.to_string(), value_digest(value)));
-        }
-    }
-    let digest = contents_digest(contents);
+    let digest = contents_digest(contents(&artifact_fs, &ensured)?);
     let mut args = Vec::<String>::new();
     let mapper = ArtifactPathMapperImpl::from(&ensured);
     let mut builder =
@@ -646,13 +631,51 @@ async fn configured_label(
 /// An output to build.
 struct Wanted {
     name: String,
-    artifact: Artifact,
+    artifact: DevArtifact,
     /// The sidecars of the output, by name. They are built with it.
-    sidecars: Vec<(String, Artifact)>,
+    sidecars: Vec<(String, DevArtifact)>,
+}
+
+/// Build and materialise each of `groups`, all or none.
+async fn materialize_groups(
+    dice: &mut DiceComputations<'_>,
+    groups: Vec<ArtifactGroup>,
+) -> buck2_error::Result<Vec<(ArtifactGroup, ArtifactGroupValues)>> {
+    dice.try_compute_join(groups, async |dice, group| {
+        materialize_and_upload_artifact_group(
+            dice,
+            &group,
+            MaterializationAndUploadContext::materialize(),
+            &dice
+                .per_transaction_data()
+                .get_materialization_queue_tracker(),
+        )
+        .await
+        .map(|values| (group, values))
+    })
+    .await
+}
+
+/// The paths of the built artifacts of `groups`, relative to the project root, with what is in
+/// each, for `contents_digest`.
+fn contents(
+    artifact_fs: &ArtifactFs,
+    groups: &[(ArtifactGroup, ArtifactGroupValues)],
+) -> buck2_error::Result<Vec<(String, String)>> {
+    let mut contents = Vec::new();
+    for (_, values) in groups {
+        for (artifact, value) in values.iter() {
+            let path =
+                artifact.resolve_path(artifact_fs, Some(&value.content_based_path_hash()))?;
+            contents.push((path.to_string(), value_digest(value)));
+        }
+    }
+    Ok(contents)
 }
 
 /// Build each output on its own: one that fails does not keep the others from the server. An
-/// output fails if one of its sidecars does.
+/// output fails if one of its sidecars, or an artifact associated with it or with a sidecar,
+/// does.
 async fn build(
     project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
@@ -675,16 +698,8 @@ async fn build(
             );
             let values = dice
                 .try_compute_join(artifacts, async |dice, (sidecar, artifact)| {
-                    let values = materialize_and_upload_artifact_group(
-                        dice,
-                        &ArtifactGroup::Artifact(artifact),
-                        MaterializationAndUploadContext::materialize(),
-                        &dice
-                            .per_transaction_data()
-                            .get_materialization_queue_tracker(),
-                    )
-                    .await?;
-                    buck2_error::Ok((sidecar, values))
+                    let groups = materialize_groups(dice, artifact.groups()).await?;
+                    buck2_error::Ok((sidecar, groups))
                 })
                 .await;
             (name, values)
@@ -702,15 +717,21 @@ async fn build(
         };
         let mut output = None;
         let mut sidecars = BTreeMap::new();
-        for (sidecar, values) in values {
-            let (artifact, value) = values
-                .iter()
-                .next()
+        for (sidecar, groups) in values {
+            // The artifact comes first, and then those associated with it.
+            let (artifact, value) = groups
+                .first()
+                .and_then(|(_, values)| values.iter().next())
                 .ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
             let path =
                 artifact.resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
             let path = project_root.resolve(&path).to_string();
-            let digest = value.digest().map(|d| d.to_string());
+            let digest = if groups.len() > 1 {
+                // A new associated artifact is a new output, also with the same artifact.
+                Some(contents_digest(contents(&artifact_fs, &groups)?))
+            } else {
+                value.digest().map(|d| d.to_string())
+            };
             match sidecar {
                 Some(sidecar) => {
                     sidecars.insert(sidecar, DevBuiltSidecar { path, digest });

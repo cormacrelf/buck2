@@ -15,6 +15,8 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api_derive::internal_provider;
 use buck2_error::BuckErrorContext;
 use buck2_hash::BuckMutInsertionMap;
+use dupe::Dupe;
+use dupe::IterDupedExt;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
@@ -36,6 +38,7 @@ use starlark::values::list::ListRef;
 use starlark::values::list::ListType;
 
 use crate as buck2_build_api;
+use crate::artifact_groups::ArtifactGroup;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueIsInputArtifactAnnotation;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
@@ -53,8 +56,38 @@ enum DevInfoError {
     ExpectedArtifact { key: String, got: String },
     #[error("Expected a dictionary with string keys, but got key `{0}`")]
     ExpectedStringKey(String),
-    #[error("Output `{key}`: `{artifact}` should not have any associated artifacts")]
-    AssociatedArtifacts { key: String, artifact: String },
+}
+
+/// An artifact of a `DevInfo`, an output or a sidecar, with the artifacts associated with it
+/// (`artifact.with_associated_artifacts()`, `ctx.actions.write(..., with_inputs = True)`).
+/// `buck2 dev` builds and materialises those with it.
+#[derive(Clone)]
+pub struct DevArtifact {
+    pub artifact: Artifact,
+    pub associated: Vec<ArtifactGroup>,
+}
+
+impl DevArtifact {
+    fn new(artifact: &ValueAsInputArtifactLike<'_>) -> buck2_error::Result<DevArtifact> {
+        Ok(DevArtifact {
+            artifact: artifact.0.get_bound_artifact()?,
+            associated: artifact
+                .0
+                .get_associated_artifacts()
+                .into_iter()
+                .flat_map(|associated| associated.iter())
+                .duped()
+                .collect(),
+        })
+    }
+
+    /// The artifact, and then the associated artifacts.
+    pub fn groups(&self) -> Vec<ArtifactGroup> {
+        let mut groups = Vec::with_capacity(1 + self.associated.len());
+        groups.push(ArtifactGroup::Artifact(self.artifact.dupe()));
+        groups.extend(self.associated.iter().duped());
+        groups
+    }
 }
 
 /// Provider that makes a target usable with `buck2 dev`.
@@ -96,7 +129,8 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     ///   out of it: make that one of `outputs`, which the server asks for once it runs.
     /// * `outputs`: artifacts that `buck2 dev` builds by name. It builds an output again after
     ///   every change that the output may be built from. Give an output as
-    ///   `DevOutput(artifact, only = [...])` to hold it back after some of them.
+    ///   `DevOutput(artifact, only = [...])` to hold it back after some of them. An artifact
+    ///   with associated artifacts is built with them, and they count as part of the output.
     /// * `interactive`: give the server the terminal, for a server that reads keys or lines
     ///   from it, such as a REPL. Otherwise its stdin is empty, and Ctrl-C reaches only
     ///   `buck2 dev`.
@@ -182,14 +216,13 @@ impl<'v> DevInfo<'v> {
         DictRef::from_value(self.outputs.get()).expect("Value is a Dict")
     }
 
-    pub fn outputs(&self) -> buck2_error::Result<BuckMutInsertionMap<String, Artifact>> {
+    pub fn outputs(&self) -> buck2_error::Result<BuckMutInsertionMap<String, DevArtifact>> {
         Self::outputs_iter(&self.outputs_dict())
             .map(|x| {
                 let (k, v) = x?;
                 Ok((
                     k.to_owned(),
-                    v.0.get_bound_artifact()
-                        .with_buck_error_context(|| format!("For output `{k}`"))?,
+                    DevArtifact::new(&v).with_buck_error_context(|| format!("For output `{k}`"))?,
                 ))
             })
             .collect()
@@ -198,7 +231,7 @@ impl<'v> DevInfo<'v> {
     /// The sidecars of each output that has some, by name.
     pub fn sidecars(
         &self,
-    ) -> buck2_error::Result<BuckMutInsertionMap<String, Vec<(String, Artifact)>>> {
+    ) -> buck2_error::Result<BuckMutInsertionMap<String, Vec<(String, DevArtifact)>>> {
         DictRef::from_value(self.sidecars.get())
             .expect("Value is a Dict")
             .iter()
@@ -210,7 +243,7 @@ impl<'v> DevInfo<'v> {
                         let (k, v) = x?;
                         Ok((
                             k.to_owned(),
-                            v.0.get_bound_artifact().with_buck_error_context(|| {
+                            DevArtifact::new(&v).with_buck_error_context(|| {
                                 format!("For sidecar `{k}` of output `{output}`")
                             })?,
                         ))
@@ -253,16 +286,7 @@ fn validate_dev_info<'v>(info: &DevInfo<'v>) -> buck2_error::Result<()> {
         return Err(DevInfoError::EmptyServer.into());
     }
     for x in DevInfo::outputs_iter(&info.outputs_dict()) {
-        let (k, v) = x?;
-        if let Some(other_artifacts) = v.0.get_associated_artifacts() {
-            if !other_artifacts.is_empty() {
-                return Err(DevInfoError::AssociatedArtifacts {
-                    key: k.to_owned(),
-                    artifact: v.0.to_string(),
-                }
-                .into());
-            }
-        }
+        x?;
     }
     Ok(())
 }

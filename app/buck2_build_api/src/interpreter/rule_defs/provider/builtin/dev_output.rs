@@ -94,7 +94,7 @@ fn dev_output_creator(globals: &mut GlobalsBuilder) {
     /// An output of `DevInfo`, with the changes after which `buck2 dev` builds it again by
     /// itself.
     ///
-    /// * `artifact`: the artifact to build.
+    /// * `artifact`: the artifact to build, with its associated artifacts.
     /// * `only`: target patterns (`"root//lib/..."`) or labels. `buck2 dev` builds the output
     ///   again by itself only after a change to the own source files of these targets. After
     ///   any other change that the output may be built from, it stops building the output and
