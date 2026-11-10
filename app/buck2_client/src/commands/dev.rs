@@ -146,8 +146,9 @@ impl StreamingCommand for DevCommand {
         // Another command that would wait for a `buck2 dev` build cancels it instead. `buck2 dev`
         // then retries.
         context.preemptible = PreemptibleWhen::OnDifferentState as i32;
-        // `buck2 dev` handles Ctrl-C itself, so that it can stop the server and wait for it.
-        let interrupts = Interrupts::listen()?;
+        // `buck2 dev` handles Ctrl-C itself, so that it can stop the server and wait for it, and
+        // Ctrl-Z, so that it can stop the server with itself.
+        let signals = Signals::listen()?;
         let paths = ctx.paths()?.clone();
         let (server_tx, server_rx) = mpsc::unbounded_channel();
         // Listen before the server starts, so that it can connect at once.
@@ -166,7 +167,7 @@ impl StreamingCommand for DevCommand {
             Duration::from_millis(self.debounce_ms),
             listener,
             server_rx,
-            interrupts,
+            signals,
         )
         .await?
         {
@@ -303,60 +304,96 @@ fn lost_daemon(e: &buck2_error::Error) -> bool {
     e.has_tag(ErrorTag::ClientGrpc) || e.has_tag(ErrorTag::ClientGrpcStream)
 }
 
-/// Ctrl-C, and on Unix `SIGTERM` and `SIGHUP`. Each asks `buck2 dev` to stop the server and exit.
-/// Without this, `buck2 dev` would exit at once, and the server, in a process group of its own,
-/// would keep running.
+/// A signal to `buck2 dev` that the session handles.
 #[cfg(unix)]
-struct Interrupts {
-    rx: mpsc::UnboundedReceiver<()>,
+enum Signal {
+    /// Ctrl-C, `SIGTERM` or `SIGHUP`: stop the server and exit. Without handling these,
+    /// `buck2 dev` would exit at once, and the server, in a process group of its own, would keep
+    /// running.
+    Quit,
+    /// Ctrl-Z (`SIGTSTP`): stop the server too, then stop.
+    Suspend,
+    /// `SIGCONT`: the shell continued `buck2 dev`, perhaps with the terminal.
+    Continue,
+    /// `SIGCHLD`: the server may have stopped.
+    Child,
+}
+
+#[cfg(unix)]
+struct Signals {
+    rx: mpsc::UnboundedReceiver<Signal>,
     task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(unix)]
-impl Interrupts {
-    fn listen() -> buck2_error::Result<Interrupts> {
+impl Signals {
+    fn listen() -> buck2_error::Result<Signals> {
         use tokio::signal::unix::SignalKind;
         use tokio::signal::unix::signal;
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        let mut terminate = signal(SignalKind::terminate())?;
-        // Under `nohup`, `SIGHUP` is ignored, and should stay ignored.
-        let mut hangup = if signal_ignored(libc::SIGHUP) {
-            None
-        } else {
-            Some(signal(SignalKind::hangup())?)
+        // A signal that is ignored, such as `SIGHUP` under `nohup`, should stay ignored.
+        let unless_ignored = |kind: SignalKind| -> buck2_error::Result<_> {
+            Ok(if signal_ignored(kind.as_raw_value()) {
+                None
+            } else {
+                Some(signal(kind)?)
+            })
         };
+        let mut interrupt = Some(signal(SignalKind::interrupt())?);
+        let mut terminate = Some(signal(SignalKind::terminate())?);
+        let mut hangup = unless_ignored(SignalKind::hangup())?;
+        let mut stop = unless_ignored(SignalKind::from_raw(libc::SIGTSTP))?;
+        let mut cont = Some(signal(SignalKind::from_raw(libc::SIGCONT))?);
+        let mut child = Some(signal(SignalKind::child())?);
+        let (tx, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    Some(()) = interrupt.recv() => {}
-                    Some(()) = terminate.recv() => {}
-                    Some(()) = async {
-                        match &mut hangup {
-                            Some(hangup) => hangup.recv().await,
-                            None => futures::future::pending().await,
-                        }
-                    } => {}
-                    else => return,
-                }
-                if tx.send(()).is_err() {
+                let signal = tokio::select! {
+                    () = next(&mut interrupt) => Signal::Quit,
+                    () = next(&mut terminate) => Signal::Quit,
+                    () = next(&mut hangup) => Signal::Quit,
+                    () = next(&mut stop) => Signal::Suspend,
+                    () = next(&mut cont) => Signal::Continue,
+                    () = next(&mut child) => Signal::Child,
+                };
+                if tx.send(signal).is_err() {
                     return;
                 }
             }
         });
-        Ok(Interrupts { rx, task })
+        Ok(Signals { rx, task })
     }
 
-    async fn recv(&mut self) {
-        if self.rx.recv().await.is_none() {
-            futures::future::pending().await
+    async fn recv(&mut self) -> Signal {
+        match self.rx.recv().await {
+            Some(signal) => signal,
+            None => futures::future::pending().await,
+        }
+    }
+
+    /// Wait for `Signal::Quit`. Others are dropped: `buck2 dev` is stopping the server anyway.
+    async fn quit(&mut self) {
+        loop {
+            if let Signal::Quit = self.recv().await {
+                return;
+            }
         }
     }
 }
 
+/// The next delivery of `signal`, or never.
 #[cfg(unix)]
-impl Drop for Interrupts {
+async fn next(signal: &mut Option<tokio::signal::unix::Signal>) {
+    let Some(signal) = signal else {
+        return futures::future::pending().await;
+    };
+    if signal.recv().await.is_none() {
+        futures::future::pending().await
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Signals {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -416,12 +453,12 @@ impl Server {
 
     /// Ask the server to stop, and wait for it, killing it if it takes too long. Returns whether
     /// Ctrl-C cut the wait short.
-    async fn stop(&mut self, interrupts: &mut Interrupts) -> bool {
+    async fn stop(&mut self, signals: &mut Signals) -> bool {
         if self.conn.is_some() {
             self.send(json!({"type": "shutdown"}));
         }
         let sent_shutdown = self.conn.is_some();
-        let interrupted = stop_process(&mut self.process, sent_shutdown, interrupts).await;
+        let interrupted = stop_process(&mut self.process, sent_shutdown, signals).await;
         self.conn = None;
         self.unintroduced.clear();
         interrupted
@@ -434,11 +471,11 @@ impl Server {
 async fn stop_process(
     process: &mut ServerProcess,
     sent_shutdown: bool,
-    interrupts: &mut Interrupts,
+    signals: &mut Signals,
 ) -> bool {
     tokio::select! {
         () = process.stop(sent_shutdown, SERVER_STOP_TIMEOUT) => false,
-        () = interrupts.recv() => {
+        () = signals.quit() => {
             process.kill().await;
             true
         }
@@ -551,18 +588,73 @@ impl ServerLink {
         Ok(())
     }
 
+    fn on_signal(&mut self, signal: Signal) -> buck2_error::Result<()> {
+        match signal {
+            Signal::Quit => self.exit = Some(ExitResult::signal_interrupt()),
+            Signal::Suspend => self.suspend(),
+            Signal::Continue => self.resume(),
+            Signal::Child => self.on_child()?,
+        }
+        Ok(())
+    }
+
+    /// Ctrl-Z: stop the server's group, take the terminal back if the server had it, and stop
+    /// `buck2 dev`, so that the shell sees its job stop. When the shell continues `buck2 dev`,
+    /// continue the server.
+    fn suspend(&mut self) {
+        if let Some(server) = &mut self.server {
+            server.process.pause();
+        }
+        stop_self();
+        // Continued, by `fg` or `bg`.
+        self.resume();
+    }
+
+    fn resume(&mut self) {
+        if let Some(server) = &mut self.server {
+            server.process.resume();
+        }
+    }
+
+    /// The server may have stopped.
+    fn on_child(&mut self) -> buck2_error::Result<()> {
+        let Some(server) = &mut self.server else {
+            return Ok(());
+        };
+        let Some(signal) = server.process.stopped_by() else {
+            return Ok(());
+        };
+        let terminal_signal = signal == libc::SIGTTIN || signal == libc::SIGTTOU;
+        if server.process.has_terminal() && !terminal_signal {
+            // Ctrl-Z in an interactive server, which has the terminal. Stop `buck2 dev` too, so
+            // that the shell gets the terminal back.
+            self.suspend();
+        } else if terminal_signal && !server.interactive {
+            // Otherwise it waits, stopped, for a terminal it never gets.
+            buck2_client_ctx::eprintln!(
+                "The `buck2 dev` server tried to use the terminal, which it does not have, so `buck2 dev` stopped it. A server that reads the terminal needs `DevInfo(interactive = True)`."
+            )?;
+            server.process.kill_now();
+        } else if terminal_signal {
+            // An interactive server that read the terminal while `buck2 dev` ran in the
+            // background, after `bg`. It continues when `fg` gives `buck2 dev` the terminal.
+            server.process.paused_for_terminal();
+        }
+        Ok(())
+    }
+
     /// The server exited. Stop what it left running in its group. The session goes on, and the
     /// next change starts the server again, unless the user quit an interactive server.
     async fn on_exit(
         &mut self,
         status: ExitStatus,
-        interrupts: &mut Interrupts,
+        signals: &mut Signals,
     ) -> buck2_error::Result<()> {
         let Some(mut server) = self.server.take() else {
             return Ok(());
         };
         self.requests.clear();
-        if stop_process(&mut server.process, false, interrupts).await {
+        if stop_process(&mut server.process, false, signals).await {
             self.exit = Some(ExitResult::signal_interrupt());
         } else if server.interactive && status.success() {
             // An interactive server has the terminal, and the user quit it.
@@ -582,6 +674,16 @@ impl ServerLink {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Stop `buck2 dev`, as the default action of `SIGTSTP` would. This returns when the shell
+/// continues it.
+#[cfg(unix)]
+fn stop_self() {
+    // SAFETY: no memory is passed.
+    unsafe {
+        libc::raise(libc::SIGSTOP);
     }
 }
 
@@ -827,7 +929,7 @@ struct Session<'a> {
     listener: Listener,
     server_rx: mpsc::UnboundedReceiver<ServerEvent>,
     link: ServerLink,
-    interrupts: Interrupts,
+    signals: Signals,
     generation: u64,
     /// The digest of each output when it was last built.
     digests: BuckMutMap<String, Option<String>>,
@@ -886,15 +988,26 @@ impl<'a> Session<'a> {
         debounce: Duration,
         listener: Listener,
         server_rx: mpsc::UnboundedReceiver<ServerEvent>,
-        mut interrupts: Interrupts,
+        mut signals: Signals,
     ) -> buck2_error::Result<Result<Session<'a>, ExitResult>> {
-        let server_info = tokio::select! {
-            response = daemon.request(|| DevAction::Server) => match response? {
-                Ok(DevResponse::Server(info)) => info,
-                Ok(_) => return Err(unexpected_response()),
-                Err(Failed(messages)) => return Err(could_not_start(messages)),
-            },
-            () = interrupts.recv() => return Ok(Err(ExitResult::signal_interrupt())),
+        let response = {
+            let request = daemon.request(|| DevAction::Server);
+            tokio::pin!(request);
+            loop {
+                tokio::select! {
+                    response = &mut request => break response?,
+                    signal = signals.recv() => match signal {
+                        Signal::Quit => return Ok(Err(ExitResult::signal_interrupt())),
+                        Signal::Suspend => stop_self(),
+                        Signal::Continue | Signal::Child => {}
+                    },
+                }
+            }
+        };
+        let server_info = match response {
+            Ok(DevResponse::Server(info)) => info,
+            Ok(_) => return Err(unexpected_response()),
+            Err(Failed(messages)) => return Err(could_not_start(messages)),
         };
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let mut session = Session {
@@ -911,7 +1024,7 @@ impl<'a> Session<'a> {
                 requests: VecDeque::new(),
                 exit: None,
             },
-            interrupts,
+            signals,
             generation: 0,
             digests: BuckMutMap::default(),
             baseline: Arc::new(Mutex::new(BuckMutMap::default())),
@@ -970,11 +1083,9 @@ impl<'a> Session<'a> {
                     self.link.on_event(event, &self.server_info.outputs, &self.pending)?;
                 }
                 status = server_exited(&mut self.link.server) => {
-                    self.link.on_exit(status, &mut self.interrupts).await?;
+                    self.link.on_exit(status, &mut self.signals).await?;
                 }
-                () = self.interrupts.recv() => {
-                    self.link.exit = Some(ExitResult::signal_interrupt());
-                }
+                signal = self.signals.recv() => self.link.on_signal(signal)?,
             }
         }
     }
@@ -982,7 +1093,7 @@ impl<'a> Session<'a> {
     /// Stop the server before `buck2 dev` exits. Another Ctrl-C kills it at once.
     async fn shutdown(&mut self) {
         if let Some(mut server) = self.link.server.take() {
-            server.stop(&mut self.interrupts).await;
+            server.stop(&mut self.signals).await;
         }
     }
 
@@ -1200,7 +1311,7 @@ impl<'a> Session<'a> {
             server_rx,
             link,
             pending,
-            interrupts: signals,
+            signals,
             ..
         } = &mut *self;
         let request = daemon.request(action);
@@ -1224,9 +1335,12 @@ impl<'a> Session<'a> {
                         return Ok(Outcome::Interrupted);
                     }
                 }
-                () = signals.recv() => {
-                    link.exit = Some(ExitResult::signal_interrupt());
-                    return Ok(Outcome::Interrupted);
+                signal = signals.recv() => {
+                    // Ctrl-Z stops `buck2 dev` here, and the daemon request with it.
+                    link.on_signal(signal)?;
+                    if link.exit.is_some() {
+                        return Ok(Outcome::Interrupted);
+                    }
                 }
                 event = events_rx.recv() => {
                     let Some(event) = event else { continue };
@@ -1384,7 +1498,7 @@ impl<'a> Session<'a> {
     async fn respawn(&mut self) -> buck2_error::Result<()> {
         // Stop the old server first, so that the new one can use its resources, such as a port.
         if let Some(mut server) = self.link.server.take() {
-            if server.stop(&mut self.interrupts).await {
+            if server.stop(&mut self.signals).await {
                 self.link.exit = Some(ExitResult::signal_interrupt());
                 return Ok(());
             }

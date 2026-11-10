@@ -103,6 +103,20 @@ def write(buck: Buck, rel: str, content: str) -> None:
     target.write_text(content)
 
 
+def stopped(pid: int) -> bool:
+    """Whether the process is stopped, as by Ctrl-Z. Linux only."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    return stat.rsplit(")", 1)[1].split()[0] == "T"
+
+
+async def wait_until(condition: Any, what: str, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"Timed out waiting until {what}")
+        await asyncio.sleep(0.1)
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -372,6 +386,30 @@ class DevTest(BuckTestCase):
         finally:
             await dev.stop()
         assert not alive(second["pid"])
+
+    @buck_test()
+    async def test_ctrl_z_stops_the_server_too(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:no_connect")
+        try:
+            server = (await dev.wait_for("started"))["pid"]
+            pid = dev.process.pid
+
+            # Ctrl-Z reaches `buck2 dev`, which stops the server, then itself.
+            dev.process.send_signal(signal.SIGTSTP)
+            await wait_until(lambda: stopped(pid), "buck2 dev stops")
+            assert stopped(server)
+
+            # `fg` continues both.
+            dev.process.send_signal(signal.SIGCONT)
+            await wait_until(lambda: not stopped(server), "the server continues")
+            assert not stopped(pid)
+
+            # And `buck2 dev` still works.
+            write(buck, "app/main.txt", "app v2\n")
+            second = await dev.wait_for("started")
+            assert second["pid"] != server
+        finally:
+            await dev.stop()
 
     @buck_test()
     async def test_crashed_server_starts_again_after_a_change(self, buck: Buck) -> None:

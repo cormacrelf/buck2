@@ -15,6 +15,10 @@
 //! Ctrl-C reaches only `buck2 dev`, which stops it. An interactive server inherits stdin, and its
 //! group becomes the terminal's foreground group, so that it gets the keys typed and Ctrl-C.
 //! `buck2 dev` takes the terminal back when it stops.
+//!
+//! For job control, `buck2 dev` stops the server's group with itself on Ctrl-Z, taking the
+//! terminal back so that the shell gets it, and continues the group, giving the terminal back,
+//! when the shell continues `buck2 dev`.
 
 use std::io::IsTerminal;
 use std::os::unix::process::ExitStatusExt;
@@ -38,6 +42,9 @@ pub(super) struct ServerProcess {
     group: Group,
     /// For an interactive server that has the terminal: how to take it back.
     terminal: Option<Terminal>,
+    /// `buck2 dev` stopped the group with itself, or the server stopped when it read the
+    /// terminal while `buck2 dev` was in the background. `resume` continues it.
+    paused: bool,
 }
 
 impl ServerProcess {
@@ -101,6 +108,7 @@ impl ServerProcess {
             exit,
             group,
             terminal,
+            paused: false,
         })
     }
 
@@ -135,16 +143,28 @@ impl ServerProcess {
     /// `timeout` to exit. Then send the group `SIGTERM`, wait up to `timeout`, and kill what is
     /// left. Take the terminal back.
     pub(super) async fn stop(&mut self, sent_shutdown: bool, timeout: Duration) {
+        if self.paused {
+            // A stopped process neither reads `shutdown` nor acts on `SIGTERM`.
+            self.group.signal(libc::SIGCONT);
+            self.paused = false;
+        }
         if sent_shutdown {
             let _ignored = tokio::time::timeout(timeout, self.wait()).await;
         }
         if !self.wait_group(Duration::ZERO).await {
             self.group.terminate();
+            // In case a process of the group stopped itself.
+            self.group.signal(libc::SIGCONT);
             if !self.wait_group(timeout).await {
                 self.kill().await;
             }
         }
         self.take_terminal();
+    }
+
+    /// Kill the server and its group, without waiting.
+    pub(super) fn kill_now(&self) {
+        self.group.kill();
     }
 
     /// Kill the server and its group now, and take the terminal back.
@@ -160,6 +180,71 @@ impl ServerProcess {
             terminal.take_back();
         }
     }
+
+    /// Whether the server has the terminal: it is the foreground group.
+    pub(super) fn has_terminal(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.given)
+    }
+
+    /// The signal that stopped the server, if it stopped since the last call. This does not
+    /// reap the server: `waitid` without `WEXITED` reports only stops, and leaves its exit status
+    /// for the task that waits for it.
+    pub(super) fn stopped_by(&self) -> Option<libc::c_int> {
+        // SAFETY: `info` is a plain C struct, written by `waitid`.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let ret = libc::waitid(
+                libc::P_PID,
+                self.group.pgid as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WNOHANG,
+            );
+            let (pid, status) = stop_info(&info);
+            (ret == 0 && pid != 0).then_some(status)
+        }
+    }
+
+    /// Stop the server's group, if it is not stopped already, and take the terminal back from
+    /// it, keeping its settings to give back.
+    pub(super) fn pause(&mut self) {
+        self.group.signal(libc::SIGSTOP);
+        self.paused = true;
+        if let Some(terminal) = &mut self.terminal {
+            terminal.park();
+        }
+    }
+
+    /// The server stopped when it read the terminal while `buck2 dev` was in the background.
+    /// `resume` continues it once `buck2 dev` has the terminal again.
+    pub(super) fn paused_for_terminal(&mut self) {
+        self.paused = true;
+    }
+
+    /// `buck2 dev` was continued. If it is in the foreground, give the terminal back to a server
+    /// that had it. Continue the server if `buck2 dev` stopped it, without the terminal if
+    /// `buck2 dev` is in the background: a server that then reads it stops again until `fg`.
+    pub(super) fn resume(&mut self) {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.unpark(&self.group);
+        }
+        if self.paused {
+            self.paused = false;
+            self.group.signal(libc::SIGCONT);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_info(info: &libc::siginfo_t) -> (libc::pid_t, libc::c_int) {
+    // SAFETY: `waitid` filled in the fields for a child.
+    unsafe { (info.si_pid(), info.si_status()) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_info(info: &libc::siginfo_t) -> (libc::pid_t, libc::c_int) {
+    (info.si_pid, info.si_status)
 }
 
 impl Drop for ServerProcess {
@@ -243,31 +328,82 @@ impl Group {
     }
 }
 
-/// The terminal's state before an interactive server got it.
+/// The terminal, while an interactive server has it or `buck2 dev` keeps it for the server
+/// over Ctrl-Z.
 struct Terminal {
+    /// `buck2 dev`'s group.
     pgrp: libc::pid_t,
-    termios: Option<libc::termios>,
+    /// The settings before the server got the terminal.
+    ours: Option<libc::termios>,
+    /// The server's settings, while `buck2 dev` has taken the terminal back over Ctrl-Z.
+    server: Option<libc::termios>,
+    /// Whether the server's group is the foreground group.
+    given: bool,
     /// `buck2 dev`'s `SIGTTOU` disposition before. While the server has the terminal, `buck2 dev`
     /// is in the background, where changing the terminal, or writing to it with `stty tostop`,
     /// would stop it with `SIGTTOU`. So it ignores the signal.
     sigttou: libc::sighandler_t,
 }
 
+fn get_termios() -> Option<libc::termios> {
+    // SAFETY: `termios` is a plain C struct, written by `tcgetattr`.
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        (libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0).then_some(termios)
+    }
+}
+
+fn set_termios(termios: &Option<libc::termios>) {
+    if let Some(termios) = termios {
+        // SAFETY: `termios` was written by `tcgetattr`.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, termios);
+        }
+    }
+}
+
+fn set_foreground(pgrp: libc::pid_t) {
+    // SAFETY: no memory is passed.
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, pgrp);
+    }
+}
+
 impl Terminal {
     fn give(group: &Group) -> Option<Terminal> {
-        // SAFETY: `termios` is a plain C struct, written by `tcgetattr`. The rest pass no memory.
-        unsafe {
-            let mut termios: libc::termios = std::mem::zeroed();
-            let termios =
-                (libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0).then_some(termios);
-            let pgrp = libc::getpgrp();
-            let sigttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-            libc::tcsetpgrp(libc::STDIN_FILENO, group.pgid);
-            Some(Terminal {
-                pgrp,
-                termios,
-                sigttou,
-            })
+        let ours = get_termios();
+        // SAFETY: no memory is passed.
+        let (pgrp, sigttou) =
+            unsafe { (libc::getpgrp(), libc::signal(libc::SIGTTOU, libc::SIG_IGN)) };
+        set_foreground(group.pgid);
+        Some(Terminal {
+            pgrp,
+            ours,
+            server: None,
+            given: true,
+            sigttou,
+        })
+    }
+
+    /// Take the terminal back for `buck2 dev` over Ctrl-Z, keeping the server's settings.
+    fn park(&mut self) {
+        if self.given {
+            self.server = get_termios();
+            set_foreground(self.pgrp);
+            set_termios(&self.ours);
+            self.given = false;
+        }
+    }
+
+    /// Give the terminal back to the server after Ctrl-Z, if `buck2 dev` is in the foreground
+    /// and so has it to give.
+    fn unpark(&mut self, group: &Group) {
+        if !self.given && in_foreground() {
+            // The shell may have changed the settings while `buck2 dev` was stopped.
+            self.ours = get_termios();
+            set_termios(&self.server);
+            set_foreground(group.pgid);
+            self.given = true;
         }
     }
 
@@ -275,12 +411,12 @@ impl Terminal {
     /// made to the terminal's settings, such as raw mode, in case it exited without undoing
     /// it.
     fn take_back(self) {
-        // SAFETY: `termios` was written by `tcgetattr`. The rest pass no memory.
+        if self.given {
+            set_foreground(self.pgrp);
+        }
+        set_termios(&self.ours);
+        // SAFETY: restores the disposition from before.
         unsafe {
-            libc::tcsetpgrp(libc::STDIN_FILENO, self.pgrp);
-            if let Some(termios) = &self.termios {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, termios);
-            }
             libc::signal(libc::SIGTTOU, self.sigttou);
         }
     }

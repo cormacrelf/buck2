@@ -211,6 +211,13 @@ shortcuts, a REPL, or a debugger. If Ctrl-C kills the server, `buck2 dev`
 exits. `buck2 dev` takes the terminal back, and restores its settings, whenever
 the server stops.
 
+Ctrl-Z stops the server with `buck2 dev`, and returns the terminal to the
+shell. `fg` continues both, and gives an interactive server the terminal back
+with its settings. After `bg`, an interactive server that reads the terminal
+stops until `fg`. A server that is not interactive but opens the terminal
+itself, such as `/dev/tty`, would wait for it forever; `buck2 dev` says so and
+stops it.
+
 Either way the server's output shares the terminal with `buck2 dev`, so once
 the server has started, `buck2 dev` shows its builds with the simple console,
 not the superconsole.
