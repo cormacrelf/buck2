@@ -18,6 +18,19 @@ use crate::exit_result::ExitResult;
 use crate::subscribers::observer::ErrorObserver;
 use crate::ticker::Tick;
 
+/// For a client that runs many daemon commands in one session, such as `buck2 dev`: something
+/// to show between or during its commands. See `EventsCtx::set_session_updates`.
+pub enum SessionUpdate {
+    /// Lines that a process the client runs wrote. They may contain colour escapes.
+    Output(Vec<String>),
+    /// What the client is doing between commands, in one line.
+    Status(String),
+    /// The client is about to stop itself, as on Ctrl-Z: take anything drawn off the terminal.
+    Stop,
+    /// The client was continued after `Stop`.
+    Continued,
+}
+
 /// Visitor trait.  Implement this to subscribe to the event streams.
 /// Each method will be called whenever an event occurs.
 #[async_trait]
@@ -67,6 +80,12 @@ pub trait EventSubscriber: Send {
     /// instead of leaving it behind, for when the display is being replaced rather
     /// than concluded. Subscribers without an interactive display do nothing.
     async fn erase_interactive_output(&mut self) -> buck2_error::Result<()> {
+        Ok(())
+    }
+
+    /// An update from a client that runs many commands in one session. Subscribers without a
+    /// display ignore it.
+    async fn handle_session_update(&mut self, _update: &SessionUpdate) -> buck2_error::Result<()> {
         Ok(())
     }
 

@@ -174,7 +174,8 @@ closes the connection of a server that sends a line longer than 4 MiB, or that
 stops reading, so that a thousand messages wait for it. The server keeps
 running.
 
-The server's stdout and stderr go to the terminal.
+The server's stdout and stderr go to the terminal; see
+[The terminal](#the-terminal).
 
 ### Stopping the server
 
@@ -204,6 +205,19 @@ completion on each change, such as a test runner. `buck2 dev` ends on Ctrl-C,
 By default the server stays in the background. Its stdin is empty, and Ctrl-C
 reaches only `buck2 dev`, which stops the server and exits.
 
+When `buck2 dev` uses the superconsole, it keeps it for the whole session. Each
+build shows its progress there, and between builds one line says how many files
+`buck2 dev` watches, whether the server runs, and how the last build went. The
+server's stdout and stderr are one pseudo-terminal that `buck2 dev` reads, so
+the server still writes to a terminal and keeps its colours and line buffering.
+Its lines appear above the superconsole. Other terminal control, such as moving
+the cursor, is dropped; a server that needs it should be interactive. With the
+simple console, or when stderr is not a terminal, the server writes to stdout
+and stderr itself.
+
+`buck2 dev` does not print the build ID or the cache statistics of each build.
+It prints build errors in full.
+
 With `DevInfo(interactive = True)`, the server inherits stdin. When stdin is a
 terminal, the server's process group becomes the terminal's foreground group,
 so it gets the keys typed and Ctrl-C. Use this for a server with keyboard
@@ -218,9 +232,8 @@ stops until `fg`. A server that is not interactive but opens the terminal
 itself, such as `/dev/tty`, would wait for it forever; `buck2 dev` says so and
 stops it.
 
-Either way the server's output shares the terminal with `buck2 dev`, so once
-the server has started, `buck2 dev` shows its builds with the simple console,
-not the superconsole.
+An interactive server has the terminal to itself: `buck2 dev` uses the simple
+console, and prints only errors and that the server exited or restarts.
 
 ### Messages to the server
 

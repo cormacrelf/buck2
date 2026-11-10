@@ -97,6 +97,12 @@ fn update_events_ctx<T: StreamingCommand>(
         (None, None, None)
     };
 
+    let mut superconsole_config = console_opts.superconsole_config();
+    if cmd.runs_many_commands() {
+        superconsole_config.session = true;
+        // The command reports the files that changed itself.
+        superconsole_config.hide_file_watcher_events = true;
+    }
     let (console_subscriber, used_superconsole) = get_console_with_root(
         ctx.trace_id.dupe(),
         console_opts.console_type,
@@ -107,7 +113,7 @@ fn update_events_ctx<T: StreamingCommand>(
             EventTimestamp(ctx.start_time.into()),
         ),
         T::COMMAND_NAME,
-        console_opts.superconsole_config(),
+        superconsole_config,
         health_check_display_reports_receiver,
     );
     subscribers.push(console_subscriber);
@@ -189,6 +195,13 @@ pub trait StreamingCommand: Sized + Send + Sync {
 
     fn daemon_startup_mode() -> DaemonStartupMode {
         DaemonStartupMode::Standard
+    }
+
+    /// Whether the command runs many daemon commands in one session, as `buck2 dev` does. Its
+    /// console then goes on from one command to the next, and leaves out what it shows for each
+    /// command, such as the build ID.
+    fn runs_many_commands(&self) -> bool {
+        false
     }
 
     /// Whether the command handles Ctrl-C itself once it has connected to the daemon. Otherwise

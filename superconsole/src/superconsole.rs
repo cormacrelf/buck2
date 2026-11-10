@@ -146,6 +146,18 @@ impl SuperConsole {
         Ok(())
     }
 
+    /// Like `render`, but draws every emitted line, waiting for the output where `render` would
+    /// skip a frame. For a program that draws only when something happens, so that no later
+    /// `render` would draw what this one skipped.
+    pub fn render_all<C: Component + ?Sized>(&mut self, root: &C) -> crate::RenderResult<(), C> {
+        loop {
+            self.render_with_mode(root, DrawMode::Normal)?;
+            if self.to_emit.is_empty() && self.aux_to_emit.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
     /// Perform a final render with [`DrawMode::Final`].
     /// Each component will have a chance to finalize themselves before the terminal is disposed of.
     pub fn finalize<C: Component + ?Sized>(self, root: &C) -> crate::RenderResult<(), C> {
@@ -235,6 +247,11 @@ impl SuperConsole {
             .queue(Clear(ClearType::FromCursorDown))
             .map_err(OutputError::Terminal)?;
         Ok(())
+    }
+
+    /// Wait until everything drawn so far has been written to the terminal.
+    pub fn flush(&mut self) -> Result<(), OutputError> {
+        self.output_mut().flush()
     }
 
     /// Clears the canvas portion of the superconsole.

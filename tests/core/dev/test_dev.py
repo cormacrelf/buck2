@@ -66,6 +66,15 @@ class DevSession:
         later = [e for e in self._events()[self.offset :] if e["type"] == kind]
         assert later == [], later
 
+    async def process_output_split(self) -> None:
+        """Stop `buck2 dev`, and keep its stdout and stderr apart in `self.stdout` and
+        `self.stderr`."""
+        if self.process.returncode is None:
+            self.process.send_signal(signal.SIGINT)
+        stdout, stderr = await asyncio.wait_for(self.process.communicate(), timeout=60)
+        self.stdout: str = (stdout or b"").decode(errors="replace")
+        self.stderr: str = (stderr or b"").decode(errors="replace")
+
     async def stop(self) -> str:
         """Stop `buck2 dev`, and return what it wrote to stdout and stderr."""
         if self.process.returncode is None:
@@ -82,9 +91,9 @@ class DevSession:
         return f"stdout:\n{out}\nstderr:\n{err}"
 
 
-async def start_dev(buck: Buck, target: str) -> DevSession:
+async def start_dev(buck: Buck, target: str, console: str = "none") -> DevSession:
     process = await buck.run_buck_command(
-        "dev", target, "--console", "none", "--debounce-ms", "200"
+        "dev", target, "--console", console, "--debounce-ms", "200"
     ).start()
     return DevSession(buck, process)
 
@@ -497,6 +506,41 @@ class DevTest(BuckTestCase):
         finally:
             output = await dev.stop()
         assert "longer than any request" in output, output
+
+    @buck_test()
+    async def test_superconsole_shows_the_server_output(self, buck: Buck) -> None:
+        # `super` forces the superconsole, though stderr is not a terminal here.
+        dev = await start_dev(buck, "//app:all", console="super")
+        try:
+            # The server writes to a pseudo-terminal.
+            assert (await dev.wait_for("stdout"))["isatty"]
+            await dev.wait_for("built")
+            write(buck, "app/main.txt", "app v2\n")
+            await dev.wait_for("built")
+            await asyncio.sleep(1)
+            assert dev.process.returncode is None
+        finally:
+            await dev.process_output_split()
+        # `buck2 dev` shows it above the superconsole, on stderr.
+        assert "server started" in dev.stderr, dev.stderr
+        assert "server started" not in dev.stdout, dev.stdout
+
+    @buck_test()
+    async def test_simple_console_leaves_out_what_each_build_prints(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:all", console="simple")
+        try:
+            assert not (await dev.wait_for("stdout"))["isatty"]
+            await dev.wait_for("built")
+            write(buck, "app/main.txt", "app v2\n")
+            await dev.wait_for("built")
+        finally:
+            output = await dev.stop()
+        for chatter in ["Build ID:", "Cache hits", "Commands:", "File changed"]:
+            assert chatter not in output, output
+        # The server writes to stdout itself.
+        assert "server started" in output, output
 
     @buck_test()
     async def test_inputs_set_takes_a_source_file_of_the_target(self, buck: Buck) -> None:

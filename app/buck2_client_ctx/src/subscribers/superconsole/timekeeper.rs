@@ -76,6 +76,12 @@ impl Timekeeper {
         duration_between_timestamps(start.0, self.event_timestamp_for_last_tick.0)
     }
 
+    /// Measure elapsed time from `start`, for the next command of a session.
+    pub(crate) fn restart(&mut self, start: EventTimestamp) {
+        self.start_time = start;
+        self.event_timestamp_for_last_tick = start;
+    }
+
     pub(crate) fn duration_since_command_start(&self) -> Duration {
         duration_between_timestamps(self.start_time.0, self.event_timestamp_for_last_tick.0)
     }

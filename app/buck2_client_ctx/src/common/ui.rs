@@ -76,32 +76,42 @@ pub fn get_console_with_root(
     config: SuperConsoleConfig,
     health_check_display_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
 ) -> (Box<dyn EventSubscriber>, bool) {
+    let session = config.session;
     let result: buck2_error::Result<(Box<dyn EventSubscriber>, bool)> = match console_type {
         ConsoleType::Simple => Ok((
-            Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
-                trace_id.dupe(),
-                verbosity,
-                expect_spans,
-                health_check_display_reports_receiver,
-            )),
+            Box::new(
+                SimpleConsole::<NoopEventObserverExtra>::autodetect(
+                    trace_id.dupe(),
+                    verbosity,
+                    expect_spans,
+                    health_check_display_reports_receiver,
+                )
+                .in_session(session),
+            ),
             false,
         )),
         ConsoleType::SimpleNoTty => Ok((
-            Box::new(SimpleConsole::<NoopEventObserverExtra>::without_tty(
-                trace_id.dupe(),
-                verbosity,
-                expect_spans,
-                health_check_display_reports_receiver,
-            )),
+            Box::new(
+                SimpleConsole::<NoopEventObserverExtra>::without_tty(
+                    trace_id.dupe(),
+                    verbosity,
+                    expect_spans,
+                    health_check_display_reports_receiver,
+                )
+                .in_session(session),
+            ),
             false,
         )),
         ConsoleType::SimpleTty => Ok((
-            Box::new(SimpleConsole::<NoopEventObserverExtra>::with_tty(
-                trace_id.dupe(),
-                verbosity,
-                expect_spans,
-                health_check_display_reports_receiver,
-            )),
+            Box::new(
+                SimpleConsole::<NoopEventObserverExtra>::with_tty(
+                    trace_id.dupe(),
+                    verbosity,
+                    expect_spans,
+                    health_check_display_reports_receiver,
+                )
+                .in_session(session),
+            ),
             false,
         )),
         ConsoleType::Super => StatefulSuperConsole::new_with_root_forced(
@@ -128,12 +138,15 @@ pub fn get_console_with_root(
             )
             .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
             _ => Ok((
-                Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
-                    trace_id.dupe(),
-                    verbosity,
-                    expect_spans,
-                    health_check_display_reports_receiver,
-                )),
+                Box::new(
+                    SimpleConsole::<NoopEventObserverExtra>::autodetect(
+                        trace_id.dupe(),
+                        verbosity,
+                        expect_spans,
+                        health_check_display_reports_receiver,
+                    )
+                    .in_session(session),
+                ),
                 false,
             )),
         },
@@ -146,13 +159,16 @@ pub fn get_console_with_root(
             eprintln!("Falling back to simple console, super console initialization failed: {e}");
             soft_error_or_panic!("console_init_failed", e);
             (
-                Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
-                    trace_id,
-                    verbosity,
-                    expect_spans,
-                    // Maybe refactor and set this.
-                    None,
-                )),
+                Box::new(
+                    SimpleConsole::<NoopEventObserverExtra>::autodetect(
+                        trace_id,
+                        verbosity,
+                        expect_spans,
+                        // Maybe refactor and set this.
+                        None,
+                    )
+                    .in_session(session),
+                ),
                 false,
             )
         }

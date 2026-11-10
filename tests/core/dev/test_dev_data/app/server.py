@@ -48,6 +48,7 @@ def main():
     args = sys.argv[1:]
     # Output goes to the terminal, like any other process's.
     print("server started", flush=True)
+    log({"type": "stdout", "isatty": sys.stdout.isatty()})
     if "--no-connect" in args:
         log({"type": "started"})
         while True:

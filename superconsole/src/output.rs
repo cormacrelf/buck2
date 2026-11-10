@@ -63,6 +63,12 @@ pub trait SuperConsoleOutput: Send + Sync + 'static {
             .into())
     }
 
+    /// Wait until all output so far has been written. For example, before the process stops itself
+    /// on Ctrl-Z, so that what it last drew is what the terminal shows.
+    fn flush(&mut self) -> Result<(), OutputError> {
+        Ok(())
+    }
+
     /// Called when the console has finalized. This must block if necessary. No further output will
     /// be emitted.
     fn finalize(self: Box<Self>) -> Result<(), OutputError>;
@@ -137,9 +143,16 @@ impl SuperConsoleOutput for BlockingSuperConsoleOutput {
 /// - Calls to output() after should_render() returned true will not block.
 /// - When finalize() returns, the last frame passed to output() is shown.
 /// - When an error occurs, the next fallible call will return it.
+/// What the writer thread of a `NonBlockingSuperConsoleOutput` does next.
+enum WriterMessage {
+    Frame(Vec<u8>, OutputTarget),
+    /// Say that every earlier frame is written.
+    Flush(Sender<()>),
+}
+
 pub(crate) struct NonBlockingSuperConsoleOutput {
     /// A channel to send frames for writing.
-    sender: Sender<(Vec<u8>, OutputTarget)>,
+    sender: Sender<WriterMessage>,
     /// A channel back for errors encountered by the thread doing the writing.
     errors: Receiver<OutputError>,
     /// The thread doing the writing. It owns the other end of the aforementioned channels and will
@@ -161,14 +174,21 @@ impl NonBlockingSuperConsoleOutput {
         mut stream: Box<dyn Write + Send + 'static + Sync>,
         mut aux_stream: Box<dyn IsTtyWrite + Send + 'static + Sync>,
     ) -> Result<Self, OutputError> {
-        let (sender, receiver) = bounded::<(Vec<u8>, OutputTarget)>(1);
+        let (sender, receiver) = bounded::<WriterMessage>(1);
         let (error_sender, errors) = unbounded::<OutputError>();
         let aux_compatible = aux_stream.is_tty();
 
         let handle = std::thread::Builder::new()
             .name("superconsole-io".to_owned())
             .spawn(move || {
-                for (data, output_target) in receiver.into_iter() {
+                for write in receiver.into_iter() {
+                    let (data, output_target) = match write {
+                        WriterMessage::Frame(data, output_target) => (data, output_target),
+                        WriterMessage::Flush(done) => {
+                            let _ignored = done.send(());
+                            continue;
+                        }
+                    };
                     let out_stream = match output_target {
                         OutputTarget::Main => &mut stream,
                         OutputTarget::Aux => &mut aux_stream as &mut dyn Write,
@@ -217,10 +237,22 @@ impl SuperConsoleOutput for NonBlockingSuperConsoleOutput {
         }
 
         self.sender
-            .send((buffer, target))
+            .send(WriterMessage::Frame(buffer, target))
             .expect("Superconsole I/O thread crashed");
 
         Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), OutputError> {
+        let (done, written) = bounded(1);
+        self.sender
+            .send(WriterMessage::Flush(done))
+            .expect("Superconsole I/O thread crashed");
+        let _ignored = written.recv();
+        match self.errors.try_recv() {
+            Ok(err) => Err(err),
+            Err(_) => Ok(()),
+        }
     }
 
     fn aux_stream_is_tty(&self) -> bool {

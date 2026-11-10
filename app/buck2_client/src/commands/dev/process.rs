@@ -26,11 +26,15 @@ use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
 
+use buck2_client_ctx::subscribers::subscriber::SessionUpdate;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
+
+use super::pty::Pty;
 
 /// How often `buck2 dev` checks whether a stopping server and the processes it started have
 /// exited.
@@ -45,15 +49,19 @@ pub(super) struct ServerProcess {
     /// `buck2 dev` stopped the group with itself, or the server stopped when it read the
     /// terminal while `buck2 dev` was in the background. `resume` continues it.
     paused: bool,
+    /// The server's stdout and stderr, when `buck2 dev` shows them in its console.
+    pty: Option<Pty>,
 }
 
 impl ServerProcess {
-    /// Start `argv` in `cwd`, with `BUCK2_DEV_SOCKET` set to `socket`.
+    /// Start `argv` in `cwd`, with `BUCK2_DEV_SOCKET` set to `socket`. With `output`, its
+    /// stdout and stderr go there as lines, rather than to the terminal.
     pub(super) fn spawn(
         argv: &[String],
         cwd: &str,
         interactive: bool,
         socket: &str,
+        output: Option<mpsc::UnboundedSender<SessionUpdate>>,
     ) -> buck2_error::Result<ServerProcess> {
         let (program, args) = argv.split_first().ok_or_else(|| {
             buck2_error!(
@@ -76,6 +84,16 @@ impl ServerProcess {
             })
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        let mut pty = match &output {
+            Some(_) => {
+                let pty = Pty::open()?;
+                command
+                    .stdout(Stdio::from(pty.slave()?))
+                    .stderr(Stdio::from(pty.slave()?));
+                Some(pty)
+            }
+            None => None,
+        };
         let foreground = configure(&mut command, interactive);
         let mut child = command.spawn().with_buck_error_context(|| {
             format!("Failed to start the `buck2 dev` server `{program}`")
@@ -92,6 +110,11 @@ impl ServerProcess {
         } else {
             None
         };
+        // `command` holds copies of the server's end of the pseudo-terminal.
+        drop(command);
+        if let (Some(pty), Some(output)) = (&mut pty, output) {
+            pty.read(output);
+        }
         let (tx, exit) = watch::channel(None);
         tokio::spawn(async move {
             let status = match child.wait().await {
@@ -109,6 +132,7 @@ impl ServerProcess {
             group,
             terminal,
             paused: false,
+            pty,
         })
     }
 
@@ -160,6 +184,13 @@ impl ServerProcess {
             }
         }
         self.take_terminal();
+    }
+
+    /// The terminal changed size.
+    pub(super) fn resize(&self) {
+        if let Some(pty) = &self.pty {
+            pty.resize();
+        }
     }
 
     /// Kill the server and its group, without waiting.

@@ -24,6 +24,7 @@ use buck2_event_observer::display::display_file_watcher_end;
 use buck2_event_observer::event_observer::DebugEventObserverExtra;
 use buck2_event_observer::re_state::ReState;
 use buck2_event_observer::session_info::SessionInfo;
+use buck2_event_observer::span_tracker::EventTimestamp;
 use buck2_event_observer::two_snapshots::TwoSnapshots;
 use buck2_event_observer::unpack_event::VisitorError;
 use buck2_event_observer::unpack_event::unpack_event;
@@ -36,6 +37,7 @@ use buck2_event_observer::what_ran::worker_command_as_fallback_to_string;
 use buck2_events::BuckEvent;
 use buck2_health_check::report::DisplayReport;
 use buck2_wrapper_common::invocation_id::TraceId;
+use dupe::Dupe;
 use strum::IntoEnumIterator;
 use superconsole::Component;
 use superconsole::Dimensions;
@@ -59,6 +61,7 @@ use crate::subscribers::console_output_limit::EmitResult;
 use crate::subscribers::emit_event::emit_event_if_relevant;
 use crate::subscribers::simpleconsole::SimpleConsole;
 use crate::subscribers::subscriber::EventSubscriber;
+use crate::subscribers::subscriber::SessionUpdate;
 use crate::subscribers::superconsole::commands::CommandsComponent;
 use crate::subscribers::superconsole::debug_events::DebugEventsComponent;
 use crate::subscribers::superconsole::debugger::StarlarkDebuggerComponent;
@@ -393,6 +396,18 @@ impl ConsoleCanvas {
         }
     }
 
+    fn flush(&mut self) -> buck2_error::Result<()> {
+        match self {
+            Self::Terminal(sc) => Ok(sc.flush()?),
+        }
+    }
+
+    fn clear(&mut self) -> buck2_error::Result<()> {
+        match self {
+            Self::Terminal(sc) => Ok(sc.clear()?),
+        }
+    }
+
     fn emit_aux(&mut self, lines: Lines) {
         match self {
             Self::Terminal(sc) => sc.emit_aux(lines),
@@ -405,6 +420,15 @@ impl ConsoleCanvas {
     ) -> Result<(), superconsole::Error<C::Error>> {
         match self {
             Self::Terminal(sc) => sc.render(root),
+        }
+    }
+
+    fn render_all<C: Component + ?Sized>(
+        &mut self,
+        root: &C,
+    ) -> Result<(), superconsole::Error<C::Error>> {
+        match self {
+            Self::Terminal(sc) => sc.render_all(root),
         }
     }
 
@@ -445,6 +469,31 @@ pub struct StatefulSuperConsoleImpl {
     verbosity: Verbosity,
     games_overlay: GamesOverlay,
     shown_interactive_console_message: bool,
+    /// In a session (`SuperConsoleConfig::session`), between commands: the canvas shows only
+    /// `status`.
+    idle: bool,
+    status: String,
+    /// To start the state afresh for each command of a session.
+    trace_id: TraceId,
+    expect_spans: bool,
+}
+
+/// The canvas between the commands of a session: the client's status line.
+struct IdleStatus<'a>(&'a str);
+
+impl Component for IdleStatus<'_> {
+    type Error = buck2_error::Error;
+
+    fn draw_unchecked(
+        &self,
+        _dimensions: Dimensions,
+        mode: DrawMode,
+    ) -> buck2_error::Result<Lines> {
+        Ok(match mode {
+            DrawMode::Normal if !self.0.is_empty() => Lines(vec![Line::sanitized(self.0)]),
+            _ => Lines::new(),
+        })
+    }
 }
 
 pub struct SuperConsoleState {
@@ -482,6 +531,10 @@ pub struct SuperConsoleConfig {
     /// like `buck2 log snoop` where they would pile up as scrollback across
     /// invocation switches.
     pub hide_file_watcher_events: bool,
+    /// The client runs many commands in one session, as `buck2 dev` does. The end of a command
+    /// clears the canvas for the next one instead of finalizing the console, and between
+    /// commands the canvas shows the client's status line.
+    pub session: bool,
 }
 
 impl Default for SuperConsoleConfig {
@@ -498,6 +551,7 @@ impl Default for SuperConsoleConfig {
             max_lines: 10,
             banner: None,
             hide_file_watcher_events: false,
+            session: false,
         }
     }
 }
@@ -737,7 +791,7 @@ impl StatefulSuperConsole {
             header,
             state: SuperConsoleState::new(
                 timekeeper,
-                trace_id,
+                trace_id.dupe(),
                 verbosity,
                 expect_spans,
                 config,
@@ -747,6 +801,10 @@ impl StatefulSuperConsole {
             verbosity,
             games_overlay: GamesOverlay::new(),
             shown_interactive_console_message: false,
+            idle: false,
+            status: String::new(),
+            trace_id,
+            expect_spans,
         }))
     }
 
@@ -838,7 +896,8 @@ impl SuperConsoleState {
                 verbosity,
                 expect_spans,
                 health_check_reports_receiver,
-            ),
+            )
+            .in_session(config.session),
             config,
             active_warnings: None,
         })
@@ -888,6 +947,9 @@ impl StatefulSuperConsoleImpl {
     }
 
     async fn handle_event(&mut self, event: &Arc<BuckEvent>) -> buck2_error::Result<()> {
+        if self.idle {
+            self.start_command(event);
+        }
         self.state.update_event_observer(event).await?;
 
         self.handle_inner_event(event)
@@ -1533,11 +1595,75 @@ impl StatefulSuperConsoleImpl {
             }
         }
 
-        self.canvas.render(&BuckRootComponent {
-            header: &self.header,
-            state: &self.state,
-            games_overlay: &self.games_overlay,
-        })?;
+        self.render()
+    }
+
+    fn render(&mut self) -> buck2_error::Result<()> {
+        if self.idle {
+            // Between commands no tick draws a skipped frame later, so wait for the output.
+            self.canvas.render_all(&IdleStatus(&self.status))?;
+        } else {
+            self.canvas.render(&BuckRootComponent {
+                header: &self.header,
+                state: &self.state,
+                games_overlay: &self.games_overlay,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// In a session, the first event of the next command: start from a fresh state, so that the
+    /// canvas shows only this command.
+    fn start_command(&mut self, event: &BuckEvent) {
+        self.idle = false;
+        let health = self
+            .state
+            .simple_console
+            .health_check_reports_receiver
+            .take();
+        self.state.simple_console = SimpleConsole::with_tty(
+            self.trace_id.dupe(),
+            self.verbosity,
+            self.expect_spans,
+            health,
+        )
+        .in_session(true);
+        self.state
+            .timekeeper
+            .restart(EventTimestamp(event.timestamp().into()));
+    }
+
+    /// In a session, a command ended: show the status line until the next one.
+    fn end_command(&mut self) -> buck2_error::Result<()> {
+        self.idle = true;
+        self.render()
+    }
+
+    fn handle_session_update(&mut self, update: &SessionUpdate) -> buck2_error::Result<()> {
+        match update {
+            SessionUpdate::Output(lines) => {
+                for line in lines {
+                    self.canvas.emit(Lines::from_colored_multiline_string(line));
+                }
+                // While a command runs, the next tick draws them.
+                if self.idle {
+                    self.render()?;
+                }
+            }
+            SessionUpdate::Status(status) => {
+                self.status = status.clone();
+                if self.idle {
+                    self.render()?;
+                }
+            }
+            SessionUpdate::Stop => {
+                // The shell draws on the terminal while this process is stopped. Take the canvas
+                // off it, and wait until that is written, since a thread writes it.
+                self.canvas.clear()?;
+                self.canvas.flush()?;
+            }
+            SessionUpdate::Continued => self.render()?,
+        }
         Ok(())
     }
 
@@ -1627,11 +1753,22 @@ impl EventSubscriber for StatefulSuperConsole {
         result: &buck2_cli_proto::CommandResult,
     ) -> buck2_error::Result<()> {
         match self {
+            Self::Running(c) if c.state.config.session => {
+                c.handle_command_result(result).await?;
+                return c.end_command();
+            }
             Self::Running(c) => c.handle_command_result(result).await?,
             Self::Finalized(c) => c.handle_command_result(result).await?,
         }
         self.finalize()?;
         Ok(())
+    }
+
+    async fn handle_session_update(&mut self, update: &SessionUpdate) -> buck2_error::Result<()> {
+        match self {
+            Self::Running(c) => c.handle_session_update(update),
+            Self::Finalized(c) => c.handle_session_update(update).await,
+        }
     }
 
     async fn tick(&mut self, tick: &Tick) -> buck2_error::Result<()> {
@@ -1651,6 +1788,12 @@ impl EventSubscriber for StatefulSuperConsole {
     }
 
     async fn handle_error(&mut self, _error: &buck2_error::Error) -> buck2_error::Result<()> {
+        if let Self::Running(c) = self {
+            if c.state.config.session {
+                // The session goes on, with its next command.
+                return c.end_command();
+            }
+        }
         self.finalize()?;
         Ok(())
     }

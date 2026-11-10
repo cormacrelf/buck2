@@ -46,6 +46,7 @@ use crate::subscribers::console_output_limit::ConsoleOutputLimit;
 use crate::subscribers::console_output_limit::EmitResult;
 use crate::subscribers::emit_event::emit_event_if_relevant;
 use crate::subscribers::subscriber::EventSubscriber;
+use crate::subscribers::subscriber::SessionUpdate;
 use crate::subscribers::superconsole::io::io_in_flight_non_zero_counters;
 use crate::subscribers::system_warning::check_memory_pressure_snapshot;
 use crate::subscribers::system_warning::check_remaining_disk_space_snapshot;
@@ -197,9 +198,13 @@ pub struct SimpleConsole<E> {
     last_print_time: Instant,
     waiting_line: WaitingLineThrottle,
     last_shown_snapshot_ts: Option<SystemTime>,
-    health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+    pub(crate) health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
     health_warning_backoff: HealthWarningBackoff,
     pub(crate) output_limit: ConsoleOutputLimit,
+    /// The client runs many commands in one session, as `buck2 dev` does: leave out what is
+    /// printed for every command, such as the build ID and the cache hits, and the files that
+    /// changed, which the client reports itself.
+    session: bool,
 }
 
 impl<E> SimpleConsole<E>
@@ -225,6 +230,7 @@ where
             health_check_reports_receiver,
             health_warning_backoff: HealthWarningBackoff::new(now),
             output_limit: ConsoleOutputLimit::new(),
+            session: false,
         }
     }
 
@@ -247,6 +253,7 @@ where
             health_check_reports_receiver,
             health_warning_backoff: HealthWarningBackoff::new(now),
             output_limit: ConsoleOutputLimit::new(),
+            session: false,
         }
     }
 
@@ -271,6 +278,12 @@ where
                 health_check_reports_receiver,
             ),
         }
+    }
+
+    /// See `SuperConsoleConfig::session`.
+    pub(crate) fn in_session(mut self, session: bool) -> Self {
+        self.session = session;
+        self
     }
 
     pub(crate) fn observer(&self) -> &EventObserver<E> {
@@ -374,7 +387,7 @@ where
         file_watcher: &buck2_data::FileWatcherEnd,
         _event: &BuckEvent,
     ) -> buck2_error::Result<()> {
-        if self.verbosity.print_status() {
+        if self.verbosity.print_status() && !self.session {
             for x in display_file_watcher_end(file_watcher) {
                 echo!("{}", x)?;
             }
@@ -491,6 +504,9 @@ where
         _command: &buck2_data::CommandStart,
         event: &BuckEvent,
     ) -> buck2_error::Result<()> {
+        if self.session {
+            return Ok(());
+        }
         if cfg!(fbcode_build) {
             echo!(
                 "Buck UI: https://www.internalfb.com/buck2/{}",
@@ -508,6 +524,9 @@ where
         _command: &buck2_data::CommandEnd,
         _event: &BuckEvent,
     ) -> buck2_error::Result<()> {
+        if self.session {
+            return Ok(());
+        }
         let snapshots = self.observer().two_snapshots();
 
         if self.verbosity.print_status() && self.observer().action_stats().log_stats() {
@@ -712,6 +731,17 @@ where
 
     async fn handle_tailer_stderr(&mut self, stderr: &str) -> buck2_error::Result<()> {
         self.handle_stderr(stderr).await
+    }
+
+    async fn handle_session_update(&mut self, update: &SessionUpdate) -> buck2_error::Result<()> {
+        if let SessionUpdate::Output(lines) = update {
+            for line in lines {
+                // ast-grep-ignore: rust/buck2-cli-simpleconsole-echo
+                crate::eprintln!("{}", line)?;
+            }
+            self.notify_printed();
+        }
+        Ok(())
     }
 
     async fn handle_command_result(

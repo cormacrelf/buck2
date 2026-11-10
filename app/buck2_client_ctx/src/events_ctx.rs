@@ -49,6 +49,7 @@ use crate::file_tailers::tailers::FileTailers;
 use crate::subscribers::observer::ErrorObserver;
 use crate::subscribers::recorder::InvocationRecorder;
 use crate::subscribers::subscriber::EventSubscriber;
+use crate::subscribers::subscriber::SessionUpdate;
 use crate::ticker::Tick;
 use crate::ticker::Ticker;
 
@@ -294,6 +295,9 @@ impl<'a> DaemonEventsCtx<'a> {
                     interaction = console_interaction.interaction() => {
                         self.inner.handle_console_interaction(&interaction?).await?;
                     }
+                    update = self.inner.next_session_update() => {
+                        self.inner.handle_session_update(update).await?;
+                    }
                     tick = self.ticker.tick() => {
                         self.inner.tick(&tick).await?;
                         if let Some(tps) = self.inner.desired_ticks_per_second() {
@@ -474,6 +478,9 @@ pub struct EventsCtx {
     /// `get_console_with_root`. Defaults to `false` for non-streaming entry
     /// points (e.g. log replay) that don't go through that path.
     pub used_superconsole: bool,
+    /// For a client that runs many commands in one session: updates for the console, handled
+    /// while a command runs, and by the client between commands.
+    session_updates: Option<tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>>,
 }
 
 impl EventsCtx {
@@ -492,7 +499,52 @@ impl EventsCtx {
             cgroup_path_of_buck2_daemon: None,
             daemon_start_instant: None,
             used_superconsole: false,
+            session_updates: None,
         }
+    }
+
+    /// For a client that runs many commands in one session, such as `buck2 dev`: show what
+    /// `updates` sends. While a daemon command runs, its event loop handles them; between
+    /// commands, the client waits for `next_session_update` and passes the update to
+    /// `handle_session_update`.
+    pub fn set_session_updates(
+        &mut self,
+        updates: tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
+    ) {
+        self.session_updates = Some(updates);
+    }
+
+    /// The next of the updates given to `set_session_updates`, or never.
+    pub async fn next_session_update(&mut self) -> SessionUpdate {
+        match &mut self.session_updates {
+            Some(updates) => match updates.recv().await {
+                Some(update) => update,
+                None => futures::future::pending().await,
+            },
+            None => futures::future::pending().await,
+        }
+    }
+
+    /// Show `update`. For `SessionUpdate::Stop`, stop this process once the subscribers have
+    /// taken their display off the terminal, and redraw it once continued.
+    pub async fn handle_session_update(
+        &mut self,
+        update: SessionUpdate,
+    ) -> buck2_error::Result<()> {
+        self.try_for_each_subscriber(|s| s.handle_session_update(&update))
+            .await?;
+        if let SessionUpdate::Stop = update {
+            #[cfg(unix)]
+            {
+                // SAFETY: no memory is passed. This returns when the process is continued.
+                unsafe {
+                    libc::raise(libc::SIGSTOP);
+                }
+            }
+            self.try_for_each_subscriber(|s| s.handle_session_update(&SessionUpdate::Continued))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Describes why the daemon is believed to have been OOM-killed, if it was.

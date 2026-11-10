@@ -1548,6 +1548,7 @@ dependencies = [
  "jiff",
  "libc",
  "lsp-server",
+ "nix 0.31.3",
  "notify",
  "prost",
  "serde",
