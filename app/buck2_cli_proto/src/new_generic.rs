@@ -262,9 +262,6 @@ pub struct DevPath {
     /// A change to it waits (see the `buck2 dev` docs): it is a file of a `notify` set, a build
     /// file of a package with a target in one, or a `.bzl` file when there is a `notify` set.
     pub waits: bool,
-    /// The digest of its contents as the daemon knows them, if a set claims it and its change
-    /// does not wait. `None` if it does not exist.
-    pub digest: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

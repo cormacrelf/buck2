@@ -281,8 +281,8 @@ class DevTest(BuckTestCase):
             built = await dev.wait_for("built")
             assert built["gen"] == first["gen"]
 
-            # `buck2 dev` had not seen `main.txt` change before, so it does not know that the
-            # save changed nothing: it builds once more, after the build, and nothing is new.
+            # `buck2 dev` does not know that the save of `main.txt` changed nothing: it builds
+            # once more, after the build, and nothing is new.
             again = await dev.wait_for("built")
             assert not any(output["changed"] for output in again["outputs"].values())
             await dev.assert_none("building", 3)
@@ -334,25 +334,18 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_touch_restarts_the_server_only_the_first_time(
-        self, buck: Buck
-    ) -> None:
+    async def test_touch_restarts_the_server(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:restart")
         try:
             first = await dev.wait_for("ready")
             await dev.wait_for("built")
 
-            # `buck2 dev` has not seen the file change before, so it does not know that its
-            # contents are the same: it restarts the server.
+            # `buck2 dev` does not know that the contents of the file are the same, so the
+            # file changed: it restarts the server.
             os.utime(buck.cwd / "app/main.txt")
             second = await dev.wait_for("ready")
             assert second["pid"] != first["pid"]
             await dev.wait_for("built")
-
-            # Now it knows the contents, and they are the same: nothing changed.
-            os.utime(buck.cwd / "app/main.txt")
-            await dev.assert_none("shutdown", 3)
-            await dev.assert_none("ready", 0)
 
             write(buck, "app/main.txt", "app v2\n")
             third = await dev.wait_for("ready")

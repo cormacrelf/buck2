@@ -839,13 +839,6 @@ struct Session<'a> {
     /// restart. The empty path stands for the project: changes were missed, so any of them may
     /// have changed.
     pending: BTreeSet<String>,
-    /// The digest of each claimed file whose change does not wait, as it was when `buck2 dev`
-    /// last acted on it. A file is here from its first change. A change that leaves a file with
-    /// this digest is no change.
-    known: BTreeMap<String, Option<String>>,
-    /// The digests that the daemon gave while changes waited, which `buck2 dev` has not acted
-    /// on. They are `known` once the server asks for a build or a restart.
-    seen: BTreeMap<String, Option<String>>,
     /// `pending` as absolute paths, for `stale`.
     stale: Vec<String>,
     /// Project-relative paths that changed since `buck2 dev` last acted on changes. Each `Watch`
@@ -948,8 +941,6 @@ impl<'a> Session<'a> {
             digests: BuckMutMap::default(),
             waiting_graph: BTreeSet::new(),
             pending: BTreeSet::new(),
-            known: BTreeMap::new(),
-            seen: BTreeMap::new(),
             stale: Vec::new(),
             unacted: BTreeSet::new(),
             resolve_due: false,
@@ -1145,7 +1136,6 @@ impl<'a> Session<'a> {
             self.watched.state = self.watched.latest.clone();
         }
         self.unacted.clear();
-        self.known.append(&mut self.seen);
         if !self.stale.is_empty() {
             self.stale.clear();
             self.link
@@ -1230,8 +1220,9 @@ impl<'a> Session<'a> {
                 watched.graph_changed,
             )
         };
-        // A file that the daemon was asked about changed, unless it is as `buck2 dev` knows it.
-        // Its set changed with it.
+        // A claimed file that the daemon was asked about changed, and its set with it. A file
+        // saved without a change counts: finding out would take knowing every file's contents
+        // beforehand, and a build that nothing called for builds nothing.
         let mut changed: BTreeSet<&str> = BTreeSet::new();
         let mut restart_is_news = missed || graph_changed;
         for path in &watched.paths {
@@ -1240,14 +1231,6 @@ impl<'a> Session<'a> {
                 continue;
             };
             if path.waits {
-                continue;
-            }
-            // A file that `buck2 dev` has not seen change before changed, for all it knows.
-            let known = self
-                .seen
-                .get(&path.path)
-                .or_else(|| self.known.get(&path.path));
-            if known == Some(&path.digest) {
                 continue;
             }
             sets.insert(set);
@@ -1263,9 +1246,6 @@ impl<'a> Session<'a> {
                     sets.insert(set);
                 }
             }
-            // What `buck2 dev` knew of the files may be out of date.
-            self.known.clear();
-            self.seen.clear();
             self.waiting_graph = watched.waiting.iter().cloned().collect();
         }
 
@@ -1275,11 +1255,6 @@ impl<'a> Session<'a> {
             // then `buck2 dev` keeps comparing with what it last acted on, so that the answer
             // after that says what still changed.
             self.watched.latest = Some(watched.state.clone());
-            for path in &watched.paths {
-                if path.set.is_some() && !path.waits {
-                    self.seen.insert(path.path.clone(), path.digest.clone());
-                }
-            }
             if unknown {
                 // The build that ends the wait builds what the missed changes changed.
                 self.missed = false;
@@ -1302,12 +1277,6 @@ impl<'a> Session<'a> {
 
         let files: Vec<String> = changed.iter().map(|path| self.absolute(path)).collect();
         self.started_after.clear();
-        self.seen.clear();
-        for path in &watched.paths {
-            if path.set.is_some() && !path.waits {
-                self.known.insert(path.path.clone(), path.digest.clone());
-            }
-        }
         self.missed = false;
         self.unacted.clear();
         self.watched.state = Some(watched.state.clone());

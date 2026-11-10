@@ -1382,7 +1382,7 @@ async fn dev_watch(
 
 /// Say what the requested paths are to the watch sets, and which sets' targets changed since
 /// `request.previous`. Whether a file changed is not said here: a path that `buck2 dev` asks
-/// about did, unless its digest is the one that `buck2 dev` knows.
+/// about did.
 async fn watch_files(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
@@ -1412,17 +1412,10 @@ async fn watch_files(
         } else {
             (None, false)
         };
-        // Only for the files whose contents say whether they changed.
-        let digest = if set.is_some() && !waits {
-            file_digest(dice, cell_resolver.get_cell_path(&rel)).await?
-        } else {
-            None
-        };
         paths.push(DevPath {
             path: path.clone(),
             set,
             waits,
-            digest,
         });
     }
 

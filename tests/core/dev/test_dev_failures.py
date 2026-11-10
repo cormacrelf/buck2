@@ -151,15 +151,21 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_unrelated_change_while_broken(self, buck: Buck) -> None:
-        """A change to a file outside the graph, or a save without a change, while the build is
-        broken: nothing is built again."""
+        """A change to a file outside the graph while the build is broken: nothing is built
+        again. A save of the broken file without a change builds again, and fails again:
+        `buck2 dev` does not know that the contents are the same."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
             await dev.expect("building", "failed")
             write(buck, "app/other.txt", "other v2\n")
+            await dev.quiet()
+
             os.utime(buck.cwd / "app/main.txt")
+            building, failed = await dev.expect("building", "failed")
+            assert files(buck, building) == ["app/main.txt"]
+            assert failed["gen"] == building["gen"]
             await dev.quiet()
             assert_kept(dev, first)
         finally:

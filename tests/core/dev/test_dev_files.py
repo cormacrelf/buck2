@@ -57,25 +57,17 @@ class DevFilesTest(BuckTestCase):
     async def test_save_without_a_change_through_a_temporary_file(
         self, buck: Buck
     ) -> None:
-        """The same save with the same content. `buck2 dev` learns the contents of a file of a
-        set that only builds when the file first changes, so the first such save builds, and the
-        output is unchanged. The second builds nothing."""
+        """The same save with the same content: `buck2 dev` does not know that the contents are
+        the same, so it builds, and the output is unchanged."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
-
-            def save() -> None:
-                temp = buck.cwd / "app/.main.txt.tmp"
-                temp.write_text("app v1\n")
-                os.replace(temp, buck.cwd / "app/main.txt")
-
-            save()
+            temp = buck.cwd / "app/.main.txt.tmp"
+            temp.write_text("app v1\n")
+            os.replace(temp, buck.cwd / "app/main.txt")
             building, built = await dev.expect("building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert changed(built) == {"site": False}
-            await dev.quiet()
-
-            save()
             await dev.quiet()
             assert_kept(dev, first)
         finally:

@@ -115,11 +115,10 @@ created and removed again, such as the temporary files some editors make when
 they save. A source file that is a symlink to another file in the project is
 built from that file, so the set that claims the symlink claims that file too.
 
-`buck2 dev` learns the contents of a file when the file first changes. So the
-first time a file is saved without a change, `buck2 dev` does what the file's
-set asks for: a build, which builds nothing new, so that the server gets
-`built` with `changed` false for each output, or a restart. After that, such a
-save of that file does nothing.
+Saving a file without changing it counts as a change: `buck2 dev` does not
+know what the files were. It does what the file's set asks for: a build, which
+builds nothing new, so that the server gets `built` with `changed` false for
+each output, or a restart.
 
 The file watcher must report changes as they happen. The `notify` watcher,
 the default outside Meta, does; `buck2 dev` stops with an error if the
