@@ -115,14 +115,11 @@ created and removed again, such as the temporary files some editors make when
 they save. A source file that is a symlink to another file in the project is
 built from that file, so the set that claims the symlink claims that file too.
 
-Saving a file without changing it depends on the set:
-
-- A set that restarts is compared by the contents of its files, from the start,
-  because a restart stops a running program. Such a save does nothing.
-- For a set that only builds, `buck2 dev` learns the contents of a file when it
-  first changes. The first such save of a file builds, which builds nothing new:
-  the server gets `built` with `changed` false for each output. After that,
-  such a save does nothing.
+`buck2 dev` learns the contents of a file when the file first changes. So the
+first time a file is saved without a change, `buck2 dev` does what the file's
+set asks for: a build, which builds nothing new, so that the server gets
+`built` with `changed` false for each output, or a restart. After that, such a
+save of that file does nothing.
 
 The file watcher must report changes as they happen. The `notify` watcher,
 the default outside Meta, does; `buck2 dev` stops with an error if the
@@ -132,9 +129,8 @@ and `buck-out`, are never reported.
 
 If the file watcher misses changes, or the daemon restarts, `buck2 dev` cannot
 tell which files changed. It then builds what every set that builds names,
-restarts the server if a file of a set that restarts has different contents,
-and, if there is a `notify` set, sends `stale` with the project root (see
-[Changes that wait](#changes-that-wait)).
+restarts the server if a set restarts, and, if there is a `notify` set, sends
+`stale` with the project root (see [Changes that wait](#changes-that-wait)).
 
 The daemon finds what the sets claim once, and again only when the graph
 changes: a target, a build file or a `.bzl` file. A change to a source file is

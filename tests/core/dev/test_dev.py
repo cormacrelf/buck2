@@ -334,20 +334,29 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_touch_does_not_restart_the_server(self, buck: Buck) -> None:
+    async def test_touch_restarts_the_server_only_the_first_time(
+        self, buck: Buck
+    ) -> None:
         dev = await start_dev(buck, "//app:restart")
         try:
             first = await dev.wait_for("ready")
             await dev.wait_for("built")
 
-            # The contents of the file are the same, so nothing changed.
+            # `buck2 dev` has not seen the file change before, so it does not know that its
+            # contents are the same: it restarts the server.
+            os.utime(buck.cwd / "app/main.txt")
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
+            await dev.wait_for("built")
+
+            # Now it knows the contents, and they are the same: nothing changed.
             os.utime(buck.cwd / "app/main.txt")
             await dev.assert_none("shutdown", 3)
             await dev.assert_none("ready", 0)
 
             write(buck, "app/main.txt", "app v2\n")
-            second = await dev.wait_for("ready")
-            assert second["pid"] != first["pid"]
+            third = await dev.wait_for("ready")
+            assert third["pid"] != second["pid"]
         finally:
             await dev.stop()
 

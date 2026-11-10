@@ -199,9 +199,8 @@ pub struct DevWatchRequest {
     pub paths: Vec<String>,
     /// The `state` of an earlier answer, to say what changed since. `None` at the start.
     pub previous: Option<DevWatchState>,
-    /// Also answer `compared`: at the start, and when changes were missed, so that no path says
-    /// what changed.
-    pub all_compared: bool,
+    /// Also answer `waiting`: at the start, and when changes were missed.
+    pub all_waiting: bool,
 }
 
 /// Digests that say whether the targets of the watch sets, or the graph, changed. `buck2 dev`
@@ -229,9 +228,10 @@ pub struct DevWatched {
     pub state: DevWatchState,
     /// What each of the requested paths is.
     pub paths: Vec<DevPath>,
-    /// With `all_compared`: every file of the sets that restart, with its contents, which say
-    /// whether it changed; and the build files and `.bzl` files whose change waits, without.
-    pub compared: Vec<DevPath>,
+    /// With `all_waiting`: the project-relative paths of the build files and `.bzl` files whose
+    /// change waits. `buck2 dev` keeps them for when the analysis fails, and so cannot say that
+    /// the change to one of them waits.
+    pub waiting: Vec<String>,
     /// The sets whose targets changed since `previous`, and every set if a `.bzl` file changed.
     /// Empty without `previous`. A set whose file changed is not here: `paths` says that.
     pub changed_sets: Vec<usize>,

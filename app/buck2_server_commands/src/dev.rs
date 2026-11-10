@@ -1426,59 +1426,19 @@ async fn watch_files(
         });
     }
 
-    // Only the sets that restart are compared by the contents of their files from the start: a
-    // restart that nothing called for stops a running program, whereas a build that nothing
-    // called for builds nothing. The build files and `.bzl` files whose change waits are here
-    // too, without their contents, for when the analysis fails and cannot say what a path is.
-    let mut compared = Vec::new();
-    if request.all_compared && watch.iter().any(|spec| spec.restart || spec.notify) {
+    // The build files and `.bzl` files whose change waits, for when the analysis fails and
+    // cannot say what a path is.
+    let mut waiting = Vec::new();
+    if request.all_waiting && claims.notify_sets {
         let graph = graph_claims(dice, label, watch).await?;
-        // The files of the sets that restart: those they claim by name, and the source files of
-        // the targets whose own source files they claim.
-        let mut restarts: BTreeMap<ProjectRelativePathBuf, (usize, CellPath)> = BTreeMap::new();
-        for (path, (set, cell_path)) in &graph.files {
-            if watch[*set].restart {
-                restarts.insert(path.clone(), (*set, cell_path.dupe()));
-            }
-        }
-        for node in &graph.nodes {
-            let Some(own) = graph.with_own_files.get(node.label()) else {
-                continue;
-            };
-            for input in node.inputs() {
-                let set = graph.set_of_own_file(cell_resolver, input, *own);
-                if !watch[set].restart {
-                    continue;
-                }
-                if let Some(path) = project_path(cell_resolver, input)? {
-                    if !graph.build_files.contains_key(&path) {
-                        restarts.entry(path).or_insert((set, input));
-                    }
-                }
-            }
-        }
-        compared = dice
-            .try_compute_join(restarts, async |dice, (path, (set, cell_path))| {
-                buck2_error::Ok(DevPath {
-                    path: path.to_string(),
-                    set: Some(set),
-                    waits: false,
-                    digest: file_digest(dice, cell_path).await?,
-                })
-            })
-            .await?;
-        let waiting = graph
-            .build_files
-            .iter()
-            .filter(|(_, (waits, _))| *waits)
-            .map(|(path, _)| path)
-            .chain(graph.bzl_files.keys().filter(|_| graph.notify_sets));
-        compared.extend(waiting.map(|path| DevPath {
-            path: path.to_string(),
-            set: None,
-            waits: true,
-            digest: None,
-        }));
+        waiting.extend(
+            graph
+                .build_files
+                .iter()
+                .filter(|(_, (waits, _))| *waits)
+                .map(|(path, _)| path.to_string()),
+        );
+        waiting.extend(graph.bzl_files.keys().map(|path| path.to_string()));
     }
 
     let state = claims.state();
@@ -1519,7 +1479,7 @@ async fn watch_files(
             .collect(),
         state,
         paths,
-        compared,
+        waiting,
         changed_sets,
         graph_changed,
         incomplete: claims.incomplete.clone(),

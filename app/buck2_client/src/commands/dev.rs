@@ -840,8 +840,8 @@ struct Session<'a> {
     /// have changed.
     pending: BTreeSet<String>,
     /// The digest of each claimed file whose change does not wait, as it was when `buck2 dev`
-    /// last acted on it: every file of a set that restarts, from the start, and each other file
-    /// from its first change. A change that leaves a file with this digest is no change.
+    /// last acted on it. A file is here from its first change. A change that leaves a file with
+    /// this digest is no change.
     known: BTreeMap<String, Option<String>>,
     /// The digests that the daemon gave while changes waited, which `buck2 dev` has not acted
     /// on. They are `known` once the server asks for a build or a restart.
@@ -968,16 +968,15 @@ impl<'a> Session<'a> {
 
     async fn run(&mut self) -> buck2_error::Result<ExitResult> {
         // The server starts while the daemon finds what the watch sets claim, which may build what
-        // dynamic actions need. `buck2 dev` handles the server's requests afterwards. The answer
-        // has the contents of the files of the sets that restart, which they are compared with.
+        // dynamic actions need. `buck2 dev` handles the server's requests afterwards.
         let request = DevWatchRequest {
             paths: Vec::new(),
             previous: None,
-            all_compared: true,
+            all_waiting: true,
         };
         match self.request(|| DevAction::Watch(request.clone())).await? {
             Outcome::Done(DevResponse::Watch(watched)) => {
-                self.take_compared(&watched);
+                self.waiting_graph = watched.waiting.iter().cloned().collect();
                 self.watched.state = Some(watched.state.clone());
                 self.take_watched(watched)?;
             }
@@ -1161,15 +1160,13 @@ impl<'a> Session<'a> {
         if self.unacted.is_empty() && !missed && self.cancelled_outputs.is_empty() {
             return Ok(());
         }
-        // After missed changes, which files changed is not known. The daemon then gives every
-        // file that is compared by its contents: those whose changes wait, and those of the sets
-        // that restart. The sets that only build all count as changed: a build that nothing
-        // called for builds nothing.
+        // After missed changes, which files changed is not known. Every set that builds or
+        // restarts then counts as changed.
         let unknown = missed || self.watched.state.is_none();
         let request = DevWatchRequest {
             paths: self.unacted.iter().cloned().collect(),
             previous: self.watched.state.clone(),
-            all_compared: unknown,
+            all_waiting: unknown,
         };
         let watched = match self.request(|| DevAction::Watch(request.clone())).await? {
             Outcome::Done(DevResponse::Watch(watched)) => watched,
@@ -1237,7 +1234,7 @@ impl<'a> Session<'a> {
         // Its set changed with it.
         let mut changed: BTreeSet<&str> = BTreeSet::new();
         let mut restart_is_news = missed || graph_changed;
-        for path in watched.paths.iter().chain(&watched.compared) {
+        for path in &watched.paths {
             let Some(set) = path.set else { continue };
             let Some(spec) = watched.watch.get(set) else {
                 continue;
@@ -1245,16 +1242,12 @@ impl<'a> Session<'a> {
             if path.waits {
                 continue;
             }
+            // A file that `buck2 dev` has not seen change before changed, for all it knows.
             let known = self
                 .seen
                 .get(&path.path)
                 .or_else(|| self.known.get(&path.path));
-            let as_known = match known {
-                Some(digest) => *digest == path.digest,
-                // Every file of a set that restarts is known, so this one did not exist.
-                None => spec.restart && !unknown && path.digest.is_none(),
-            };
-            if as_known {
+            if known == Some(&path.digest) {
                 continue;
             }
             sets.insert(set);
@@ -1263,15 +1256,17 @@ impl<'a> Session<'a> {
             restart_is_news |= spec.restart && !self.started_after.contains(&path.path);
         }
         if unknown {
-            // No path says what changed in the sets that only build.
+            // No path says what changed, so every set that builds or restarts did. A build
+            // that nothing called for builds nothing; a restart stops the server once.
             for (set, spec) in watched.watch.iter().enumerate() {
-                if !spec.restart && !spec.notify {
+                if !spec.notify {
                     sets.insert(set);
                 }
             }
-            // What `buck2 dev` knew of the other files may be out of date.
+            // What `buck2 dev` knew of the files may be out of date.
             self.known.clear();
             self.seen.clear();
+            self.waiting_graph = watched.waiting.iter().cloned().collect();
         }
 
         if !self.pending.is_empty() {
@@ -1280,16 +1275,13 @@ impl<'a> Session<'a> {
             // then `buck2 dev` keeps comparing with what it last acted on, so that the answer
             // after that says what still changed.
             self.watched.latest = Some(watched.state.clone());
-            self.take_compared(&watched);
             for path in &watched.paths {
                 if path.set.is_some() && !path.waits {
                     self.seen.insert(path.path.clone(), path.digest.clone());
                 }
             }
             if unknown {
-                // The files of the sets that restart are known again, in `seen`. The sets that
-                // only build are built by the build that ends the wait.
-                self.seen.append(&mut self.known);
+                // The build that ends the wait builds what the missed changes changed.
                 self.missed = false;
             }
             // Without a server, nothing asks for the build that ends the wait. A change that
@@ -1311,7 +1303,6 @@ impl<'a> Session<'a> {
         let files: Vec<String> = changed.iter().map(|path| self.absolute(path)).collect();
         self.started_after.clear();
         self.seen.clear();
-        self.take_compared(&watched);
         for path in &watched.paths {
             if path.set.is_some() && !path.waits {
                 self.known.insert(path.path.clone(), path.digest.clone());
@@ -1333,22 +1324,6 @@ impl<'a> Session<'a> {
             }
         }
         self.apply(sets, files, &resolved, restart_is_news).await
-    }
-
-    /// Keep what an answer with every compared file says: the contents of the files of the sets
-    /// that restart, and which build files and `.bzl` files wait.
-    fn take_compared(&mut self, watched: &DevWatched) {
-        if watched.compared.is_empty() {
-            return;
-        }
-        self.waiting_graph.clear();
-        for path in &watched.compared {
-            if path.waits {
-                self.waiting_graph.insert(path.path.clone());
-            } else {
-                self.known.insert(path.path.clone(), path.digest.clone());
-            }
-        }
     }
 
     /// Tell the server about the files whose changes wait, if they are not what it was last
