@@ -27,6 +27,7 @@ ignore = \
     tests/prelude, \
     .jj, \
     .git, \
+    .claude/worktrees, \
     target
 
 [rust]
