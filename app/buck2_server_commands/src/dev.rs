@@ -210,6 +210,7 @@ async fn dev(
                 project_root: server_ctx.project_root().root().to_string(),
                 server,
                 outputs: outputs.keys().cloned().collect(),
+                interactive: info.as_ref().value().as_ref().interactive(),
             }))
         }
         DevAction::Watch => {

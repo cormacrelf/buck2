@@ -172,6 +172,8 @@ pub struct DevServer {
     pub server: Vec<String>,
     /// The names of `DevInfo.outputs`.
     pub outputs: Vec<String>,
+    /// `DevInfo.interactive`: the server gets the terminal.
+    pub interactive: bool,
 }
 
 #[derive(Serialize, Deserialize)]

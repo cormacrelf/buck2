@@ -82,6 +82,8 @@ pub struct DevInfo<'v> {
     outputs: ValueOfUnchecked<'v, DictType<String, ValueIsInputArtifactAnnotation>>,
     /// The watch policy, as a list of `DevWatch`.
     watch: ValueOfUnchecked<'v, ListType<DevWatch<'static>>>,
+    /// Whether the server gets the terminal: its stdin, and the keys typed into it.
+    interactive: ValueOfUnchecked<'v, bool>,
 }
 
 #[starlark_module]
@@ -89,10 +91,14 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     /// Makes a target usable with `buck2 dev`.
     ///
     /// * `server`: a `RunInfo` or command line that `buck2 dev` starts and keeps running. It
-    ///   reads JSON lines from stdin and may write requests to stdout as JSON lines.
+    ///   may connect to the socket named in the `BUCK2_DEV_SOCKET` environment variable, to get
+    ///   messages from `buck2 dev` and send it requests, as JSON lines.
     /// * `outputs`: artifacts that `buck2 dev` builds by name.
     /// * `watch`: a list of `DevWatch`. For a changed file, the first `DevWatch` whose files
     ///   include it decides what happens.
+    /// * `interactive`: give the server the terminal, for a server that reads keys or lines
+    ///   from it, such as a REPL. Otherwise its stdin is empty, and Ctrl-C reaches only
+    ///   `buck2 dev`.
     #[starlark(as_type = DevInfo<'static>)]
     fn DevInfo<'v>(
         #[starlark(require = named)] server: Value<'v>,
@@ -101,6 +107,7 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
         >,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         watch: UnpackListOrTuple<Value<'v>>,
+        #[starlark(require = named, default = false)] interactive: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<DevInfo<'v>> {
         let heap = eval.heap();
@@ -116,6 +123,7 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
             server: ValueOfUnchecked::new(heap.alloc(server)),
             outputs,
             watch: ValueOfUnchecked::new(heap.alloc(AllocList(watch.items))),
+            interactive: heap.alloc_typed_unchecked(interactive).cast(),
         };
         validate_dev_info(&info)?;
         Ok(info)
@@ -127,6 +135,12 @@ impl<'v> DevInfo<'v> {
         ValueAsCommandLineLike::unpack_value_err(self.server.get())
             .expect("validated at construction")
             .0
+    }
+
+    pub fn interactive(&self) -> bool {
+        self.interactive
+            .unpack()
+            .expect("validated at construction")
     }
 
     fn outputs_iter<'a>(
