@@ -153,7 +153,34 @@ DevInfo(
 - **Holds that were not needed.** Below the owning target, membership is still by whole target, so a hold can start for a file that the output is not built from. The server asks, and gets `changed: false`.
 - **The protocol.** `stale` gets the output names, so every server that reads it changes.
 - **"Ignore these files" cannot be said.** I do not think anything needs it once the server's files are found from its command, but I have not checked every fixture.
-- **Not prototyped.** In particular, whether one output can be held while the others build from the same files is argued here, not shown.
+- **Prototyped since, on the branch `buck2-dev-only`.** One output can be held while the others build from the same files: `tests/core/dev/test_dev_only.py` shows it on the fixture, which has two targets. On a project of 10k targets the prototype looped; see the next section.
+
+### Found by the prototype: a build that `buck2 dev` starts by itself can loop
+
+**What happened.** `tests/dev_bench` got a mode, `outputs`, for a `DevInfo` with no `watch` and two outputs: a small one, and one built from all 10k libraries, which is 10k actions. The bench's server asks for the small one only. The first run ended when the machine ran out of memory and killed the session that ran it. A second run was stopped by hand after 44 seconds, and this is from what it left:
+
+- The server's first build, of the small output, was `built`. 25ms later `buck2 dev` sent `building` again, with no files, though the server had asked for nothing and no file had changed.
+- That build was `cancelled` after 1.8 seconds, and started again. So it went on: 54 builds in 44 seconds, 52 of them cancelled. The two that finished were the first, and the one after the bench's own edit to a source file.
+- The daemon found the claims 54 times, once for each build. The `inputs` mode run found them 3 times.
+- The daemon held 3.6 GB after 50 seconds.
+
+**What it was not.** The walk. Finding the targets of each slot took 1 to 2ms for the 10k targets, as it does for the `inputs` mode. That is one large output, not several; the mode with eight was never run.
+
+**What I know of the cause, and what I guess.**
+- Known: the build that looped was one that `buck2 dev` started by itself. In the prototype a plain output is built again after any change that it may be built from, whether or not the server has asked for it, and after missed changes every plain output is.
+- Known: `files: []` on each `building` is what missed changes give in the prototype. A changed group of targets with no changed build file gives it too.
+- Not known: what started the first build. No file had changed.
+- Guessed, not checked: 10k actions write under `buck-out`, which is inside the project, and overflow the inotify queue, which holds 16384 events here. The notify watcher then says that it missed changes (`notify.rs`, `need_rescan`). That stops the build, and the next sync has the daemon start over, which is why the claims were found again each time. The next build overflows the queue again. The watcher's debug log was not on, so nothing shows that it said so.
+
+**Why the tests did not find it.** The fixture has two targets. `test_missed_changes_hold_the_outputs_with_only` has changes missed once, and gets one build.
+
+**What it says about the design.**
+- **Build by itself only what the server has asked for.** The proposal above says "builds every output after any change (or every output the server has asked for)". The prototype did the first, and this is the case against it: an output that no server wants, built after every change and after every missed one. I would take the second. An output that the server has not asked for since it started is then never built by `buck2 dev` itself.
+- **The loop is not the prototype's alone.** With a watch list, `buck2 dev` also builds what every `build` set names after missed changes, and a build also stops when changes are missed. If the guess is right, a watch list whose `build` set names a large enough output loops the same way. I did not test that. The old bench modes never build the large artifact.
+- **Nothing bounds it.** A build that is stopped is started again at once, however often that has happened, and memory grew all the while. `buck2 dev` should give up, or wait longer each time, after some number of builds in a row that were stopped without a file to name, and send `failed`.
+- **The guess should be checked first.** If actions under `buck-out` can make the watcher miss changes, that matters to more than `buck2 dev`: every sync after it starts the daemon over.
+
+**The bench.** The `outputs` and `outputs8` modes are still in `tests/dev_bench`, and reproduce this. They should not be run without a limit on memory.
 
 ### To think about: a file added after the sets were found
 
