@@ -743,7 +743,7 @@ class DevGraphNotifyTest(BuckTestCase):
     @dev_test()
     async def test_syntax_error_in_waiting_build_file(self, buck: Buck) -> None:
         """A syntax error in the build file of a package in the `notify` set waits: `stale` with
-        the build file, and undoing it clears `stale`."""
+        the build file. Fixing it leaves the change waiting until the server asks for a build."""
         dev = await start_dev(buck, "//app:auto")
         try:
             first = await dev.start()
@@ -755,16 +755,21 @@ class DevGraphNotifyTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, LIB, lib)
-            (stale,) = await dev.expect("stale")
+            await dev.quiet()
+
+            dev.request({"type": "build", "outputs": ["site"]})
+            _, built, stale = await dev.expect("building", "built", "stale")
+            assert site(built) == "lib v1\napp v1\n"
             assert stale["files"] == []
             await dev.quiet()
+            assert_kept(dev, first)
         finally:
             await dev.stop()
 
     @dev_test()
     async def test_syntax_error_in_bzl_file_with_notify_set(self, buck: Buck) -> None:
         """A syntax error in a `.bzl` file with a `notify` set waits: `stale` with the `.bzl`
-        file, and undoing it clears `stale`."""
+        file. Fixing it leaves the change waiting until the server asks for a build."""
         dev = await start_dev(buck, "//app:auto")
         try:
             first = await dev.start()
@@ -776,16 +781,22 @@ class DevGraphNotifyTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, "defs.bzl", defs)
-            (stale,) = await dev.expect("stale")
+            await dev.quiet()
+
+            dev.request({"type": "build", "outputs": ["site"]})
+            _, built, stale = await dev.expect("building", "built", "stale")
+            assert site(built) == "lib v1\napp v1\n"
             assert stale["files"] == []
             await dev.quiet()
+            assert_kept(dev, first)
         finally:
             await dev.stop()
 
     @dev_test()
     async def test_waiting_build_file_changed(self, buck: Buck) -> None:
         """A comment in the build file of a package in the `notify` set: `stale` with the build
-        file, and nothing is analysed or built until it is undone."""
+        file, and nothing is analysed or built until the server asks for a build, even once the
+        comment is gone."""
         dev = await start_dev(buck, "//app:auto")
         try:
             first = await dev.start()
@@ -794,9 +805,14 @@ class DevGraphNotifyTest(BuckTestCase):
             (stale,) = await dev.expect("stale")
             assert files(buck, stale) == [LIB]
             await dev.quiet()
+            assert_kept(dev, first)
 
             write(buck, LIB, lib)
-            (stale,) = await dev.expect("stale")
+            await dev.quiet()
+
+            dev.request({"type": "build", "outputs": ["site"]})
+            _, built, stale = await dev.expect("building", "built", "stale")
+            assert site(built) == "lib v1\napp v1\n"
             assert stale["files"] == []
             await dev.quiet()
             assert_kept(dev, first)
@@ -806,7 +822,8 @@ class DevGraphNotifyTest(BuckTestCase):
     @dev_test()
     async def test_waiting_dependency_deleted(self, buck: Buck) -> None:
         """The dependency in the `notify` set deleted from its build file waits: `stale` with
-        the build file, and undoing it clears `stale`."""
+        the build file. Putting it back leaves the change waiting until the server asks for a
+        build."""
         dev = await start_dev(buck, "//app:auto")
         try:
             first = await dev.start()
@@ -817,9 +834,14 @@ class DevGraphNotifyTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, LIB, lib)
-            (stale,) = await dev.expect("stale")
+            await dev.quiet()
+
+            dev.request({"type": "build", "outputs": ["site"]})
+            _, built, stale = await dev.expect("building", "built", "stale")
+            assert site(built) == "lib v1\napp v1\n"
             assert stale["files"] == []
             await dev.quiet()
+            assert_kept(dev, first)
         finally:
             await dev.stop()
 

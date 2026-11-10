@@ -41,7 +41,13 @@ message SubscribeToActiveCommands {}
 // one for each batch of changes. If the file watcher cannot report changes as
 // they happen, the command fails. Every change sent is also seen by the next
 // command that the daemon runs.
-message SubscribeToFileChanges {}
+message SubscribeToFileChanges {
+  // The name of a `buck2 dev` session. If set, the daemon sends only the
+  // changes that may matter to that session: its requests tell the daemon what
+  // its target is built from. Until the first of them has, and if this is
+  // empty, the daemon sends every change.
+  string session = 1;
+}
 
 // Daemon to client interaction in a subscription. This is what the client will
 // receive via the `stdout` of the `subscribe` command.

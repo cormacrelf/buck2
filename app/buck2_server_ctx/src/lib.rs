@@ -16,6 +16,7 @@ pub mod concurrency {
     pub use buck2_concurrency::*;
 }
 pub mod ctx;
+pub mod dev_interest;
 pub mod experiment_util;
 pub mod global_cfg_options;
 pub mod late_bindings;

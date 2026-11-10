@@ -67,6 +67,9 @@ pub(super) struct FileChanges {
 struct Connect {
     connection: DaemonConnection,
     context: ClientContext,
+    /// The name of the session, under which its requests tell the daemon what its target is
+    /// built from. The daemon then sends only the changes that may matter to it.
+    session: String,
 }
 
 impl FileChanges {
@@ -75,6 +78,7 @@ impl FileChanges {
     pub(super) async fn subscribe(
         connection: DaemonConnection,
         context: &ClientContext,
+        session: String,
     ) -> buck2_error::Result<FileChanges> {
         let mut context = context.clone();
         // A command of its own, which the daemon need not preempt.
@@ -83,6 +87,7 @@ impl FileChanges {
         let connect = Connect {
             connection,
             context,
+            session,
         };
         let (sender, mut received) = mpsc::unbounded_channel();
         let mut subscription = subscription(connect.clone(), sender.clone(), Duration::ZERO, None);
@@ -180,7 +185,14 @@ fn subscription(
                 Err(e) => return (lost, Err(e)),
             }
         }
-        let result = run(&mut buckd, connect.context, sender, &mut events_ctx).await;
+        let result = run(
+            &mut buckd,
+            connect.context,
+            connect.session,
+            sender,
+            &mut events_ctx,
+        )
+        .await;
         (number, result)
     }
     .boxed_local()
@@ -189,13 +201,14 @@ fn subscription(
 async fn run(
     buckd: &mut BuckdClientConnector,
     context: ClientContext,
+    session: String,
     sender: mpsc::UnboundedSender<buck2_subscription_proto::FileChanges>,
     events_ctx: &mut EventsCtx,
 ) -> buck2_error::Result<CommandOutcome<()>> {
     {
         let request = buck2_cli_proto::SubscriptionRequestWrapper {
             request: Some(buck2_subscription_proto::SubscriptionRequest {
-                request: Some(buck2_subscription_proto::SubscribeToFileChanges {}.into()),
+                request: Some(buck2_subscription_proto::SubscribeToFileChanges { session }.into()),
             }),
         };
         // The stream stays open until `buck2 dev` drops the subscription.

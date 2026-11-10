@@ -61,6 +61,7 @@ use buck2_client_ctx::subscribers::subscriber::SessionUpdate;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_hash::BuckMutMap;
+use buck2_wrapper_common::invocation_id::TraceId;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -212,12 +213,14 @@ impl DevCommand {
         let listener = Listener::bind(&paths, server_tx)?;
         // The daemon's file watcher reports the changes to the project's files. Subscribe before
         // anything else, so that `buck2 dev` stops at once if it cannot.
-        let changes = FileChanges::subscribe(connection.clone(), &context).await?;
+        let session = TraceId::new().to_string();
+        let changes = FileChanges::subscribe(connection.clone(), &context, session.clone()).await?;
         let daemon = Daemon {
             connection,
             events_ctx,
             console: console.clone(),
             context,
+            session,
             target: self.target.clone(),
             target_cfg: self.target_cfg.target_cfg(),
         };
@@ -252,6 +255,8 @@ struct Daemon<'a> {
     events_ctx: &'a mut EventsCtx,
     console: Console,
     context: ClientContext,
+    /// The name of this session, which its file change subscription gave the daemon too.
+    session: String,
     target: String,
     target_cfg: buck2_cli_proto::TargetCfg,
 }
@@ -274,6 +279,7 @@ impl Daemon<'_> {
                         target: self.target.clone(),
                         target_cfg: self.target_cfg.clone(),
                         action: action(),
+                        session: self.session.clone(),
                     })
                 },
                 self.events_ctx,
@@ -793,10 +799,6 @@ impl Watched {
     }
 }
 
-/// The digest of a file whose change waits, while the analysis that would say its content fails.
-/// It equals no real digest.
-const UNKNOWN_DIGEST: &str = "unknown";
-
 /// How long `buck2 dev` waits for a server to exit after `shutdown`, and again after `SIGTERM`.
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -830,11 +832,20 @@ struct Session<'a> {
     generation: u64,
     /// The digest of each output when it was last built.
     digests: BuckMutMap<String, Option<String>>,
-    /// The digest, as the daemon gives it, of each file whose change waits, when the server last
-    /// asked for a build. A file missing here did not exist then.
-    baseline: BTreeMap<String, Option<String>>,
-    /// The files whose change waits that differ from `baseline`, with their digest now.
-    pending: BTreeMap<String, Option<String>>,
+    /// The build files and `.bzl` files whose change waits, as the daemon last gave them. They
+    /// say that a change waits when the analysis fails, and so cannot.
+    waiting_graph: BTreeSet<String>,
+    /// The files whose change waits that changed since the server last asked for a build or a
+    /// restart. The empty path stands for the project: changes were missed, so any of them may
+    /// have changed.
+    pending: BTreeSet<String>,
+    /// The digest of each claimed file whose change does not wait, as it was when `buck2 dev`
+    /// last acted on it: every file of a set that restarts, from the start, and each other file
+    /// from its first change. A change that leaves a file with this digest is no change.
+    known: BTreeMap<String, Option<String>>,
+    /// The digests that the daemon gave while changes waited, which `buck2 dev` has not acted
+    /// on. They are `known` once the server asks for a build or a restart.
+    seen: BTreeMap<String, Option<String>>,
     /// `pending` as absolute paths, for `stale`.
     stale: Vec<String>,
     /// Project-relative paths that changed since `buck2 dev` last acted on changes. Each `Watch`
@@ -935,8 +946,10 @@ impl<'a> Session<'a> {
             last_build: None,
             generation: 0,
             digests: BuckMutMap::default(),
-            baseline: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            waiting_graph: BTreeSet::new(),
+            pending: BTreeSet::new(),
+            known: BTreeMap::new(),
+            seen: BTreeMap::new(),
             stale: Vec::new(),
             unacted: BTreeSet::new(),
             resolve_due: false,
@@ -956,19 +969,15 @@ impl<'a> Session<'a> {
     async fn run(&mut self) -> buck2_error::Result<ExitResult> {
         // The server starts while the daemon finds what the watch sets claim, which may build what
         // dynamic actions need. `buck2 dev` handles the server's requests afterwards. The answer
-        // has the contents of the files whose changes wait, which they are compared with.
+        // has the contents of the files of the sets that restart, which they are compared with.
         let request = DevWatchRequest {
             paths: Vec::new(),
             previous: None,
-            waiting_digests: true,
+            all_compared: true,
         };
         match self.request(|| DevAction::Watch(request.clone())).await? {
             Outcome::Done(DevResponse::Watch(watched)) => {
-                self.baseline = watched
-                    .waiting
-                    .iter()
-                    .map(|path| (path.path.clone(), path.digest.clone()))
-                    .collect();
+                self.take_compared(&watched);
                 self.watched.state = Some(watched.state.clone());
                 self.take_watched(watched)?;
             }
@@ -1129,16 +1138,15 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// The server asked for a build or restart, so it now uses the files as they are: they are
-    /// the new baseline, and the changes that waited are used up.
+    /// The server asked for a build or restart, so it now uses the files as they are: the
+    /// changes that waited are used up.
     fn reset_pending(&mut self) {
-        for (path, digest) in std::mem::take(&mut self.pending) {
-            self.baseline.insert(path, digest);
-        }
+        self.pending.clear();
         if self.watched.latest.is_some() {
             self.watched.state = self.watched.latest.clone();
         }
         self.unacted.clear();
+        self.known.append(&mut self.seen);
         if !self.stale.is_empty() {
             self.stale.clear();
             self.link
@@ -1153,34 +1161,33 @@ impl<'a> Session<'a> {
         if self.unacted.is_empty() && !missed && self.cancelled_outputs.is_empty() {
             return Ok(());
         }
-        // After missed changes, which files changed is not known, but what the daemon compares
-        // is contents, not changes, so its answer says what changed all the same. Only the files
-        // whose changes wait are compared one by one, all of them.
+        // After missed changes, which files changed is not known. The daemon then gives every
+        // file that is compared by its contents: those whose changes wait, and those of the sets
+        // that restart. The sets that only build all count as changed: a build that nothing
+        // called for builds nothing.
+        let unknown = missed || self.watched.state.is_none();
         let request = DevWatchRequest {
             paths: self.unacted.iter().cloned().collect(),
             previous: self.watched.state.clone(),
-            waiting_digests: missed,
+            all_compared: unknown,
         };
         let watched = match self.request(|| DevAction::Watch(request.clone())).await? {
             Outcome::Done(DevResponse::Watch(watched)) => watched,
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
                 // A change that waits may break the analysis, which finding what changed needs. It
-                // waits all the same: nothing needs the analysis until it stops waiting or the
-                // server asks for a build. Its content is not known, so it differs from the
-                // baseline until a `Watch` works again.
+                // waits all the same: nothing needs the analysis until the server asks for a
+                // build.
                 let waiting: Vec<String> = self
                     .unacted
                     .iter()
                     .filter(|path| {
-                        self.baseline.contains_key(*path) || self.pending.contains_key(*path)
+                        self.waiting_graph.contains(*path) || self.pending.contains(*path)
                     })
                     .cloned()
                     .collect();
                 if !waiting.is_empty() {
-                    for path in waiting {
-                        self.pending.insert(path, Some(UNKNOWN_DIGEST.to_owned()));
-                    }
+                    self.pending.extend(waiting);
                     self.send_stale();
                     return Ok(());
                 }
@@ -1203,26 +1210,92 @@ impl<'a> Session<'a> {
         let recovered = std::mem::take(&mut self.watch_failed);
         self.watch_failure = None;
 
-        // Track the files that differ from what the server last built.
-        let waiting = watched.paths.iter().chain(&watched.waiting);
-        for path in waiting.filter(|path| path.waits) {
-            if self.baseline.get(&path.path).cloned().flatten() == path.digest {
-                self.pending.remove(&path.path);
-            } else {
-                self.pending.insert(path.path.clone(), path.digest.clone());
-            }
+        // A change to a file whose change waits waits until the server asks for a build or a
+        // restart. After missed changes, any such file may have changed.
+        for path in watched.paths.iter().filter(|path| path.waits) {
+            self.pending.insert(path.path.clone());
+        }
+        if unknown && watched.watch.iter().any(|set| set.notify) {
+            self.pending.insert(String::new());
         }
         self.send_stale();
+
+        let (mut sets, graph_changed) = if self.watched.state.is_none() {
+            // Nothing to compare with: the session started without an answer.
+            ((0..watched.watch.len()).collect::<BTreeSet<usize>>(), true)
+        } else {
+            (
+                watched
+                    .changed_sets
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<usize>>(),
+                watched.graph_changed,
+            )
+        };
+        // A file that the daemon was asked about changed, unless it is as `buck2 dev` knows it.
+        // Its set changed with it.
+        let mut changed: BTreeSet<&str> = BTreeSet::new();
+        let mut restart_is_news = missed || graph_changed;
+        for path in watched.paths.iter().chain(&watched.compared) {
+            let Some(set) = path.set else { continue };
+            let Some(spec) = watched.watch.get(set) else {
+                continue;
+            };
+            if path.waits {
+                continue;
+            }
+            let known = self
+                .seen
+                .get(&path.path)
+                .or_else(|| self.known.get(&path.path));
+            let as_known = match known {
+                Some(digest) => *digest == path.digest,
+                // Every file of a set that restarts is known, so this one did not exist.
+                None => spec.restart && !unknown && path.digest.is_none(),
+            };
+            if as_known {
+                continue;
+            }
+            sets.insert(set);
+            changed.insert(&path.path);
+            // The server was built and started after some changes: they do not restart it again.
+            restart_is_news |= spec.restart && !self.started_after.contains(&path.path);
+        }
+        if unknown {
+            // No path says what changed in the sets that only build.
+            for (set, spec) in watched.watch.iter().enumerate() {
+                if !spec.restart && !spec.notify {
+                    sets.insert(set);
+                }
+            }
+            // What `buck2 dev` knew of the other files may be out of date.
+            self.known.clear();
+            self.seen.clear();
+        }
+
         if !self.pending.is_empty() {
             // Building now would build the changed files of the `notify` sets too, and so would
-            // analysing, which builds the server. Wait until the server asks for a build, or the
-            // files go back to what they were. Until then `buck2 dev` keeps comparing with what
-            // it last acted on, so that the answer after that says what still changed.
+            // analysing, which builds the server. Wait until the server asks for a build. Until
+            // then `buck2 dev` keeps comparing with what it last acted on, so that the answer
+            // after that says what still changed.
             self.watched.latest = Some(watched.state.clone());
+            self.take_compared(&watched);
+            for path in &watched.paths {
+                if path.set.is_some() && !path.waits {
+                    self.seen.insert(path.path.clone(), path.digest.clone());
+                }
+            }
+            if unknown {
+                // The files of the sets that restart are known again, in `seen`. The sets that
+                // only build are built by the build that ends the wait.
+                self.seen.append(&mut self.known);
+                self.missed = false;
+            }
             // Without a server, nothing asks for the build that ends the wait. A change that
             // builds or restarts starts it, and it gets `stale` after `ready`.
             let start = self.link.server.is_none()
-                && watched.changed_sets.iter().any(|set| {
+                && sets.iter().any(|set| {
                     watched
                         .watch
                         .get(*set)
@@ -1235,34 +1308,15 @@ impl<'a> Session<'a> {
             return Ok(());
         }
 
-        let (sets, graph_changed) = if self.watched.state.is_none() {
-            // Nothing to compare with: the session started without an answer.
-            ((0..watched.watch.len()).collect(), true)
-        } else {
-            (
-                watched
-                    .changed_sets
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<usize>>(),
-                watched.graph_changed,
-            )
-        };
-        let files: Vec<String> = watched
-            .paths
-            .iter()
-            .filter(|path| path.set.is_some_and(|set| sets.contains(&set)))
-            .map(|path| self.absolute(&path.path))
-            .collect();
-        // The server was built and started after these changes: they do not restart it again.
-        let started_after = std::mem::take(&mut self.started_after);
-        let restart_is_news = missed
-            || graph_changed
-            || watched.paths.iter().any(|path| {
-                path.set.is_some_and(|set| {
-                    sets.contains(&set) && watched.watch.get(set).is_some_and(|set| set.restart)
-                }) && !started_after.contains(&path.path)
-            });
+        let files: Vec<String> = changed.iter().map(|path| self.absolute(path)).collect();
+        self.started_after.clear();
+        self.seen.clear();
+        self.take_compared(&watched);
+        for path in &watched.paths {
+            if path.set.is_some() && !path.waits {
+                self.known.insert(path.path.clone(), path.digest.clone());
+            }
+        }
         self.missed = false;
         self.unacted.clear();
         self.watched.state = Some(watched.state.clone());
@@ -1281,12 +1335,28 @@ impl<'a> Session<'a> {
         self.apply(sets, files, &resolved, restart_is_news).await
     }
 
+    /// Keep what an answer with every compared file says: the contents of the files of the sets
+    /// that restart, and which build files and `.bzl` files wait.
+    fn take_compared(&mut self, watched: &DevWatched) {
+        if watched.compared.is_empty() {
+            return;
+        }
+        self.waiting_graph.clear();
+        for path in &watched.compared {
+            if path.waits {
+                self.waiting_graph.insert(path.path.clone());
+            } else {
+                self.known.insert(path.path.clone(), path.digest.clone());
+            }
+        }
+    }
+
     /// Tell the server about the files whose changes wait, if they are not what it was last
     /// told.
     fn send_stale(&mut self) {
         let stale: Vec<String> = self
             .pending
-            .keys()
+            .iter()
             .map(|path| self.absolute(path))
             .collect();
         if stale != self.stale {
@@ -1313,6 +1383,9 @@ impl<'a> Session<'a> {
     }
 
     fn absolute(&self, path: &str) -> String {
+        if path.is_empty() {
+            return self.server_info.project_root.clone();
+        }
         Path::new(&self.server_info.project_root)
             .join(path)
             .to_string_lossy()

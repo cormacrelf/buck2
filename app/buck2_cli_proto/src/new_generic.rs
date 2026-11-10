@@ -144,14 +144,19 @@ pub struct DevRequest {
     pub target: String,
     pub target_cfg: TargetCfg,
     pub action: DevAction,
+    /// The name of the session, as it gave it when it subscribed to file changes. The daemon
+    /// leaves what the target is built from under this name, for the subscription to drop the
+    /// changes that cannot matter.
+    pub session: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum DevAction {
     /// Analyse the target and build the server.
     Server,
-    /// Find what the watch sets claim, with the files as they are now, and what changed since
-    /// an earlier answer. Expanding `DevWatch.inputs` may build what dynamic actions need.
+    /// Say what each changed path is to the watch sets, and whether the targets of the sets
+    /// changed since an earlier answer. Finding what the sets claim, when the graph changed, may
+    /// build what dynamic actions need to expand `DevWatch.inputs`.
     Watch(DevWatchRequest),
     /// Build the named `DevInfo.outputs`. The build stops if a file that it builds from changes,
     /// whose change does not wait.
@@ -192,15 +197,16 @@ pub struct DevServer {
 pub struct DevWatchRequest {
     /// Project-relative paths that changed, to say what each is.
     pub paths: Vec<String>,
-    /// The `state` of an earlier answer, to say what changed since. `None` at the start, or when
-    /// changes were missed.
+    /// The `state` of an earlier answer, to say what changed since. `None` at the start.
     pub previous: Option<DevWatchState>,
-    /// Also answer the digest of every file whose change waits, in `waiting`.
-    pub waiting_digests: bool,
+    /// Also answer `compared`: at the start, and when changes were missed, so that no path says
+    /// what changed.
+    pub all_compared: bool,
 }
 
-/// Digests that say whether the watch sets changed. `buck2 dev` keeps them only to send them
-/// back.
+/// Digests that say whether the targets of the watch sets, or the graph, changed. `buck2 dev`
+/// keeps them only to send them back. They say nothing of the contents of source files: the
+/// changed paths do.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevWatchState {
     pub sets: Vec<DevSetState>,
@@ -214,8 +220,6 @@ pub struct DevWatchState {
 pub struct DevSetState {
     /// The targets that belong to the set.
     pub targets_digest: String,
-    /// The source files that the set claims, and their contents.
-    pub files_digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,10 +229,11 @@ pub struct DevWatched {
     pub state: DevWatchState,
     /// What each of the requested paths is.
     pub paths: Vec<DevPath>,
-    /// With `waiting_digests`: every file whose change waits.
-    pub waiting: Vec<DevPath>,
-    /// The sets whose targets, or claimed files or their contents, changed since `previous`, and
-    /// every set if a `.bzl` file changed. Empty without `previous`.
+    /// With `all_compared`: every file of the sets that restart, with its contents, which say
+    /// whether it changed; and the build files and `.bzl` files whose change waits, without.
+    pub compared: Vec<DevPath>,
+    /// The sets whose targets changed since `previous`, and every set if a `.bzl` file changed.
+    /// Empty without `previous`. A set whose file changed is not here: `paths` says that.
     pub changed_sets: Vec<usize>,
     /// A build file or a `.bzl` file of the graph, or a target, changed since `previous`, so the
     /// server may build differently.
@@ -257,7 +262,8 @@ pub struct DevPath {
     /// A change to it waits (see the `buck2 dev` docs): it is a file of a `notify` set, a build
     /// file of a package with a target in one, or a `.bzl` file when there is a `notify` set.
     pub waits: bool,
-    /// The digest of its contents as the daemon knows them, or `None` if it does not exist.
+    /// The digest of its contents as the daemon knows them, if a set claims it and its change
+    /// does not wait. `None` if it does not exist.
     pub digest: Option<String>,
 }
 

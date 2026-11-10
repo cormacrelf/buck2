@@ -100,34 +100,53 @@ watch = [
 ```
 
 `buck2 dev` does not watch or read files itself: the daemon's file watcher
-reports every change in the project to it, and once the files stop changing,
-`buck2 dev` asks the daemon what the changes mean. The daemon finds the files
-that each set claims, with the files as they are now, and says which sets
-changed: those whose claimed files have different contents, or whose targets
-changed. A set claims only files of the configured dependency graph of the
-`buck2 dev` target: `targets` match only targets in that graph. Without a
-`targets = None` set, the files of targets that no set matches are ignored.
+reports to it the changes in the project that may matter to the target (see
+[Limits](#limits)), and once the files stop changing,
+`buck2 dev` asks the daemon what each changed file is: the set that claims it,
+if one does. A set changed when one of its files did, or when its targets did
+(see [Changes to the graph](#changes-to-the-graph)). A set claims only files of
+the configured dependency graph of the `buck2 dev` target: `targets` match only
+targets in that graph. Without a `targets = None` set, the files of targets
+that no set matches are ignored.
 
-Because the daemon compares contents, saving a file without changing it, a
-file that is created and removed again, such as the temporary files some
-editors make when they save, and a file that no set claims change nothing.
-A source file that is a symlink to another file in the project is built from
-that file, so the set that claims the symlink claims that file too.
+A file that no set claims changes nothing, and neither does a file that is
+created and removed again, such as the temporary files some editors make when
+they save. A source file that is a symlink to another file in the project is
+built from that file, so the set that claims the symlink claims that file too.
+
+Saving a file without changing it depends on the set:
+
+- A set that restarts is compared by the contents of its files, from the start,
+  because a restart stops a running program. Such a save does nothing.
+- For a set that only builds, `buck2 dev` learns the contents of a file when it
+  first changes. The first such save of a file builds, which builds nothing new:
+  the server gets `built` with `changed` false for each output. After that,
+  such a save does nothing.
 
 The file watcher must report changes as they happen. The `notify` watcher,
 the default outside Meta, does; `buck2 dev` stops with an error if the
 `file_watcher` in the `[buck2]` section of `.buckconfig` names one that does
 not, such as `fs_hash_crawler`. Files that the project's ignore rules exclude,
-and `buck-out`, are never reported. If the file watcher misses changes, or the
-daemon restarts, `buck2 dev` asks the daemon in the same way: the daemon
-compares contents, not events, so its answer says what changed all the same.
+and `buck-out`, are never reported.
 
-To find the files of `inputs`, the daemon walks the action graph below them,
-each time `buck2 dev` asks. An action that a
-[dynamic action](dynamic_dependencies.md) creates is only known once the
-dynamic action has run, so the walk builds what dynamic actions need, with the
-files as they are then. If that build fails, the set gets the source files of
-the targets that own those inputs and of their dependencies instead.
+If the file watcher misses changes, or the daemon restarts, `buck2 dev` cannot
+tell which files changed. It then builds what every set that builds names,
+restarts the server if a file of a set that restarts has different contents,
+and, if there is a `notify` set, sends `stale` with the project root (see
+[Changes that wait](#changes-that-wait)).
+
+The daemon finds what the sets claim once, and again only when the graph
+changes: a target, a build file or a `.bzl` file. A change to a source file is
+looked up in what it found, so what a change costs does not grow with the
+graph. It keeps no list of the files: a set claims most files as the source
+files of its targets, which the targets already have.
+
+To find the files of `inputs`, the daemon walks the action graph below them.
+An action that a [dynamic action](dynamic_dependencies.md) creates is only
+known once the dynamic action has run, so the walk builds what dynamic actions
+need, with the files as they are then, and is done again when what they read
+changes. If that build fails, the set gets the source files of the targets
+that own those inputs and of their dependencies instead.
 
 ### Changes to the graph
 
@@ -150,26 +169,23 @@ build, even of an output that a `build` set names, would build that change too.
 For some tools that is wrong. For example, a tool that loads new code into a
 running program cannot load code built against a changed dependency.
 
-So while a file of a `notify` set differs from what it was at the last build
-that the server asked for, `buck2 dev` builds nothing automatically. It does
-not analyse the target again either, because that builds the server. A build
-file of a package with a target in a `notify` set waits in the same way. A
-`.bzl` file can change any target, so when there is a `notify` set, a changed
-`.bzl` file waits too. It sends
-the server a `stale` message with the changed files, and remembers the other
-changes. The changes wait until one of these happens:
+So after a file of a `notify` set changes, `buck2 dev` builds nothing
+automatically until the server asks for a build or a restart. It does not
+analyse the target again either, because that builds the server. A build file
+of a package with a target in a `notify` set waits in the same way. A `.bzl`
+file can change any target, so when there is a `notify` set, a changed `.bzl`
+file waits too. `buck2 dev` sends the server a `stale` message with the changed
+files, and remembers the other changes.
 
-- The files go back to their old content, for example when you undo the edit.
-  `buck2 dev` sends `stale` with no files, and does what the sets ask for the
-  changes that are left.
-- The server asks for a build or a restart. That build uses all the changes.
-  If it fails, the changes still wait: the server has no build with them.
+The wait ends when the server asks for a build or a restart. That build uses
+all the changes, and `buck2 dev` then sends `stale` with no files. If the build
+fails, the changes still wait: the server has no build with them. Changing a
+file back to what it was does not end the wait: `buck2 dev` does not know what
+the files were.
 
-The daemon says which files' changes wait, and their contents. Telling what
-changed takes the daemon a walk of the graph with the changed files, as
-analysing does, but it does not build the server or any output. A change that
-waits and breaks that walk, such as a syntax error in a build file whose change
-waits, waits all the same: the server gets `stale`, not `failed`.
+A change that waits and breaks the analysis, such as a syntax error in a build
+file whose change waits, waits all the same: the server gets `stale`, not
+`failed`.
 
 While the server is not running, nothing would ask for the build that ends the
 wait. So then a change that builds or restarts starts the server, built from
@@ -271,7 +287,7 @@ console, and prints only errors and that the server exited or restarts.
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
-| `stale`         | `files`: the changed files of `notify` sets               | That list changes. An empty list means that nothing waits.                                                   |
+| `stale`         | `files`: the changed files whose change waits             | That list changes. An empty list means that nothing waits. After missed changes the project root is in the list: any such file may have changed. |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
@@ -283,8 +299,8 @@ build only if it got that build's `building`: a server that connects while a
 build runs hears nothing of that build, and asks for what it needs after
 `ready`. A `failed` without a `building` is about the analysis of the target.
 Messages
-are sent only to a server that has sent `hello`. If a file of a `notify` set
-differs when the server sends `hello`, `ready` is followed by `stale`.
+are sent only to a server that has sent `hello`. If a change waits when the
+server sends `hello`, `ready` is followed by `stale`.
 
 While the daemon builds, it watches the files that the build depends on: the
 files of the sets that build or restart, and the build files and `.bzl` files
@@ -335,9 +351,16 @@ repeats the request.
 ## Limits
 
 - `buck2 dev` takes one target.
-- Every change in the project, even to a file that no set claims, costs a short
-  daemon command, in which the daemon walks the graph of the target again. A
-  server that keeps writing files in the project keeps `buck2 dev` asking.
+- A change to a file in a package of the graph costs a short daemon command,
+  even if no set claims the file. A server that keeps writing files in such a
+  package keeps `buck2 dev` asking. Changes elsewhere cost nothing: the daemon
+  does not report them to `buck2 dev`, except to build files and `.bzl` files
+  of the graph, `PACKAGE` files, `.buckconfig` files, and the directories
+  above the packages.
+- When a target, a build file or a `.bzl` file of the graph changes, the daemon
+  walks the graph of the target again to find what the sets claim.
+- A file that a `.buckconfig` includes under another name is not reported, so
+  a change to it is only seen with the next change that is.
 - A `.buckconfig` change is not a change of any watch set, but `buck2 dev` asks
   the daemon about it as about any other file, and the daemon reads the
   configuration again. If that changes the targets of the graph, such as a

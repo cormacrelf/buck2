@@ -3359,6 +3359,7 @@ dependencies = [
 name = "buck2_server_commands"
 version = "0.1.0"
 dependencies = [
+ "allocative",
  "async-trait",
  "buck2_artifact",
  "buck2_build_api",
@@ -3387,6 +3388,7 @@ dependencies = [
  "futures 0.3.34",
  "itertools 0.15.0",
  "jiff",
+ "pagable",
  "regex",
  "serde_json",
  "tokio",

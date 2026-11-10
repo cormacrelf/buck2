@@ -56,7 +56,9 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_notify_set_holds_builds_until_undone(self, buck: Buck) -> None:
+    async def test_notify_set_holds_builds_until_the_server_builds(
+        self, buck: Buck
+    ) -> None:
         dev = await start_dev(buck, "//app:auto")
         try:
             await dev.wait_for("built")
@@ -68,20 +70,24 @@ class DevTest(BuckTestCase):
                 path(buck, "lib/lib.txt")
             ]
 
-            # A change to the app's own file is held while `lib` differs from the last build.
+            # A change to the app's own file is held while the change to `lib` waits.
             write(buck, "app/main.txt", "app v2\n")
             await dev.assert_none("building", 3)
 
-            # Undoing the change to `lib` releases the held build.
+            # Undoing the change to `lib` does not end the wait: `buck2 dev` does not know what
+            # the file was.
             write(buck, "lib/lib.txt", "lib v1\n")
-            stale = await dev.wait_for("stale")
-            assert stale["files"] == []
+            await dev.assert_none("building", 3)
+            await dev.assert_none("stale", 0)
+
+            # The server asks for a build, which ends the wait.
+            dev.request({"type": "build", "outputs": ["site"]})
             building = await dev.wait_for("building")
-            assert [os.path.realpath(f) for f in building["files"]] == [
-                path(buck, "app/main.txt")
-            ]
+            assert building["files"] == []
             built = await dev.wait_for("built")
             assert site(built) == "lib v1\napp v2\n"
+            stale = await dev.wait_for("stale")
+            assert stale["files"] == []
         finally:
             await dev.stop()
 
@@ -124,13 +130,11 @@ class DevTest(BuckTestCase):
             await dev.assert_none("graph_changed", 3)
             await dev.assert_none("building", 0)
 
-            # Undoing it clears `stale`. Nothing changed in the end, so nothing is analysed or
-            # built.
-            write(buck, "defs.bzl", defs)
+            # The server asks for a build, which ends the wait.
+            dev.request({"type": "build", "outputs": ["site"]})
+            await dev.wait_for("built")
             stale = await dev.wait_for("stale")
             assert stale["files"] == []
-            await dev.assert_none("graph_changed", 3)
-            await dev.assert_none("building", 0)
 
             # Later changes build as usual.
             write(buck, "app/main.txt", "app v2\n")
@@ -276,6 +280,11 @@ class DevTest(BuckTestCase):
             os.utime(buck.cwd / "app/main.txt")
             built = await dev.wait_for("built")
             assert built["gen"] == first["gen"]
+
+            # `buck2 dev` had not seen `main.txt` change before, so it does not know that the
+            # save changed nothing: it builds once more, after the build, and nothing is new.
+            again = await dev.wait_for("built")
+            assert not any(output["changed"] for output in again["outputs"].values())
             await dev.assert_none("building", 3)
             assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
         finally:
@@ -690,4 +699,3 @@ bad = rule(impl = _bad, attrs = {})
             buck.build("//bad:bad"),
             stderr_regex="builds output `missing`, which is not in `DevInfo.outputs`",
         )
-

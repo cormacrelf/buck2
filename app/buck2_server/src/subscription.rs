@@ -19,6 +19,7 @@ use buck2_file_watcher::file_watcher::FileChangeSubscription;
 use buck2_file_watcher::file_watcher::PushedChanges;
 use buck2_server_ctx::commands::command_end;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
+use buck2_server_ctx::dev_interest::InterestSubscription;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 use futures::future::FutureExt;
@@ -27,21 +28,34 @@ use tokio::time::MissedTickBehavior;
 use crate::active_commands;
 use crate::ctx::ServerCommandContext;
 
-/// The next changes of a file watcher subscription, or never without one.
-async fn next_file_changes(subscription: &mut Option<FileChangeSubscription>) -> PushedChanges {
-    let Some(changes) = subscription.as_mut() else {
-        return futures::future::pending().await;
-    };
-    match changes.next().await {
-        Some(changes) => (*changes).clone(),
-        None => {
+/// The next changes of a file watcher subscription that may matter to the session that
+/// `interest` is of, if it is of one. Never without a subscription.
+async fn next_file_changes(
+    subscription: &mut Option<FileChangeSubscription>,
+    interest: Option<&InterestSubscription>,
+) -> PushedChanges {
+    loop {
+        let Some(changes) = subscription.as_mut() else {
+            return futures::future::pending().await;
+        };
+        let Some(changes) = changes.next().await else {
             // The file watcher is gone, as when the daemon shuts down.
             *subscription = None;
-            PushedChanges {
+            return PushedChanges {
                 changes: Vec::new(),
                 missed: true,
+            };
+        };
+        let mut changes = (*changes).clone();
+        if let Some(interest) = interest.and_then(|interest| interest.interest()) {
+            changes
+                .changes
+                .retain(|(path, _)| interest.may_matter(path));
+            if changes.changes.is_empty() && !changes.missed {
+                continue;
             }
         }
+        return changes;
     }
 }
 
@@ -83,6 +97,7 @@ pub(crate) async fn run_subscription_server_command(
             // This command takes no lock on the daemon's state, so it neither waits for other
             // commands nor holds them up.
             let mut file_changes: Option<FileChangeSubscription> = None;
+            let mut interest: Option<InterestSubscription> = None;
 
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -106,7 +121,10 @@ pub(crate) async fn run_subscription_server_command(
                             Request::SubscribeToActiveCommands(buck2_subscription_proto::SubscribeToActiveCommands {}) => {
                                 wants_active_commands = true;
                             }
-                            Request::SubscribeToFileChanges(buck2_subscription_proto::SubscribeToFileChanges {}) => {
+                            Request::SubscribeToFileChanges(buck2_subscription_proto::SubscribeToFileChanges { session }) => {
+                                if !session.is_empty() && interest.is_none() {
+                                    interest = Some(InterestSubscription::new(session));
+                                }
                                 if file_changes.is_none() {
                                     file_changes =
                                         Some(ctx.base_context.repo().file_watcher.subscribe().await?);
@@ -120,7 +138,7 @@ pub(crate) async fn run_subscription_server_command(
                             }
                         }
                     }
-                    changes = next_file_changes(&mut file_changes).fuse() => {
+                    changes = next_file_changes(&mut file_changes, interest.as_ref()).fuse() => {
                         partial_result_dispatcher.emit(buck2_cli_proto::SubscriptionResponseWrapper {
                             response: Some(buck2_subscription_proto::SubscriptionResponse {
                                 response: Some(file_changes_response(changes).into())

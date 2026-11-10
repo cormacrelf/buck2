@@ -267,7 +267,8 @@ class DevTimingTest(BuckTestCase):
     @dev_test()
     async def test_daemon_killed_during_a_build(self, buck: Buck) -> None:
         """The daemon killed during a build: `buck2 dev` connects again, and the build
-        finishes, with no message about it to the server."""
+        finishes, with no message about it to the server. `buck2 dev` cannot tell what changed
+        while the daemon was gone, so it then builds once more, and nothing is new."""
         dev = await start_dev(buck, "//app:slow")
         try:
             first = await dev.start()
@@ -278,6 +279,11 @@ class DevTimingTest(BuckTestCase):
             (built,) = await dev.expect("built")
             assert built["gen"] == building["gen"]
             assert built["pid"] == first["pid"]
+
+            again, built = await dev.expect("building", "built")
+            assert again["files"] == []
+            assert changed(built) == {"site": False}
+            assert built["pid"] == first["pid"]
             await dev.quiet()
         finally:
             output = await dev.stop()
@@ -285,16 +291,21 @@ class DevTimingTest(BuckTestCase):
 
     @dev_test()
     async def test_daemon_killed_while_server_exited(self, buck: Buck) -> None:
-        """The daemon killed while the server has exited: the next change starts the server."""
+        """The daemon killed while the server has exited: `buck2 dev` cannot tell what changed
+        while the daemon was gone, so it builds, which starts the server. Later changes build
+        as usual."""
         dev = await start_dev(buck, "//app:all")
         try:
             await dev.start()
             dev.request({"type": "_exit", "code": 1})
             await dev.wait_for("exiting")
             await buck.kill()
-            await dev.quiet(2)
-            write(buck, "app/main.txt", "app v2\n")
             _, _, _, built = await dev.expect("started", "ready", "building", "built")
+            assert site(built) == "app v1\n"
+            await dev.quiet()
+
+            write(buck, "app/main.txt", "app v2\n")
+            _, built = await dev.expect("building", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -322,8 +333,9 @@ class DevTimingTest(BuckTestCase):
 
     @dev_test()
     async def test_daemon_killed_while_changes_wait(self, buck: Buck) -> None:
-        """The daemon killed while a change waits: nothing new is sent, and undoing the change
-        clears `stale`."""
+        """The daemon killed while a change waits: `buck2 dev` cannot tell what changed while
+        the daemon was gone, so `stale` then has the project root too. The server's build ends
+        the wait."""
         dev = await start_dev(buck, "//app:auto")
         try:
             first = await dev.start()
@@ -331,10 +343,13 @@ class DevTimingTest(BuckTestCase):
             await dev.expect("stale")
             await buck.kill()
             write(buck, "app/unrelated.txt", "unrelated\n")
+            (stale,) = await dev.expect("stale")
+            assert files(buck, stale) == [".", "lib/lib.txt"]
             await dev.quiet()
 
-            write(buck, "lib/lib.txt", "lib v1\n")
-            (stale,) = await dev.expect("stale")
+            dev.request({"type": "build", "outputs": ["site"]})
+            _, built, stale = await dev.expect("building", "built", "stale")
+            assert site(built) == "lib v2\napp v1\n"
             assert stale["files"] == []
             await dev.quiet()
             assert_kept(dev, first)

@@ -443,12 +443,12 @@ class DevFailuresTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_failed_requested_build_keeps_the_waiting_baseline(
+    async def test_failed_requested_build_keeps_the_change_waiting(
         self, buck: Buck
     ) -> None:
-        """With a `notify` set, a build that the server asked for and that failed does not
-        count as the build the waiting files are compared with: undoing the edit that broke it
-        leaves nothing waiting, and a change to the app's own files builds."""
+        """With a `notify` set, a build that the server asked for and that failed does not end
+        the wait: a change to the app's own files builds nothing until a build that the server
+        asks for works."""
         dev = await start_dev(buck, "//app:auto")
         try:
             first = await dev.start()
@@ -460,17 +460,18 @@ class DevFailuresTest(BuckTestCase):
             await dev.expect("building", "failed")
             await dev.wait_until_quiet()
 
-            write(buck, "lib/lib.txt", "lib v1\n")
-            later = await dev.collect()
-            stales = [e for e in dev.observed() if e["type"] == "stale"]
-            assert stales[-1]["files"] == [], (
-                f"after the undo, the server's last `stale` says {files(buck, stales[-1])} "
-                f"still wait: {summary(later)}"
-            )
-
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built", timeout=EXPECTED_WITHIN)
+            await dev.quiet()
+
+            write(buck, "lib/lib.txt", "lib v1\n")
+            await dev.quiet()
+
+            dev.request({"type": "build", "outputs": ["site"]})
+            _, built, stale = await dev.expect(
+                "building", "built", "stale", timeout=EXPECTED_WITHIN
+            )
             assert site(built) == "lib v1\napp v2\n"
+            assert stale["files"] == []
             assert_kept(dev, first)
         finally:
             await dev.stop()
