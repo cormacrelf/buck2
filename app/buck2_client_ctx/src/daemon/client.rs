@@ -48,6 +48,7 @@ use crate::events_ctx::PartialResultHandler;
 
 pub mod connect;
 pub mod kill;
+pub mod reconnect;
 
 use crate::startup_deadline::StartupDeadline;
 
@@ -76,6 +77,23 @@ impl BuckdClientConnector {
 
     pub fn daemon_constraints(&self) -> &buck2_cli_proto::DaemonConstraints {
         &self.client.constraints
+    }
+
+    /// Another handle on this connection, for a command that runs next to the commands of the
+    /// first handle. gRPC calls on the same channel are multiplexed, so this does not connect
+    /// again. It stops working when the connection does: use `reconnect::DaemonConnection` to
+    /// replace both.
+    pub fn duplicate(&self) -> BuckdClientConnector {
+        BuckdClientConnector {
+            client: BuckdClient {
+                client: self.client.client.clone(),
+                constraints: self.client.constraints.clone(),
+                daemon_dir: self.client.daemon_dir.clone(),
+            },
+            daemon_pid: self.daemon_pid,
+            cgroup_path_of_buck2_daemon: self.cgroup_path_of_buck2_daemon.clone(),
+            daemon_start_instant: self.daemon_start_instant,
+        }
     }
 }
 

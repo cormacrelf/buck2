@@ -52,14 +52,12 @@ use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
 use buck2_client_ctx::common::ui::CommonConsoleOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
-use buck2_client_ctx::daemon::client::connect::BuckdConnectOptions;
-use buck2_client_ctx::daemon::client::connect::connect_buckd;
+use buck2_client_ctx::daemon::client::reconnect::DaemonConnection;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::streaming::connect_options;
 use buck2_client_ctx::subscribers::subscriber::SessionUpdate;
-use buck2_common::invocation_paths::InvocationPaths;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_hash::BuckMutMap;
@@ -151,59 +149,12 @@ impl StreamingCommand for DevCommand {
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        let mut context = ctx.client_context(matches, &self)?;
-        // Another command that would wait for a `buck2 dev` build cancels it instead. `buck2 dev`
-        // then retries.
-        context.preemptible = PreemptibleWhen::OnDifferentState as i32;
-        // `buck2 dev` handles Ctrl-C itself, so that it can stop the server and wait for it, and
-        // Ctrl-Z, so that it can stop the server with itself.
-        let signals = Signals::listen()?;
-        // What the console shows between and during daemon commands: the server's output, the
-        // status line, and Ctrl-Z, which takes the canvas off the terminal.
-        let (updates_tx, updates) = mpsc::unbounded_channel();
-        events_ctx.set_session_updates(updates);
-        let console = Console {
-            updates: updates_tx,
-            canvas: Arc::new(AtomicBool::new(events_ctx.used_superconsole)),
-        };
         let paths = ctx.paths()?.clone();
-        let (server_tx, server_rx) = mpsc::unbounded_channel();
-        // Listen before the server starts, so that it can connect at once.
-        let listener = Listener::bind(&paths, server_tx)?;
-        // The daemon's file watcher reports the changes to the project's files. Subscribe before
-        // anything else, so that `buck2 dev` stops at once if it cannot.
-        let changes =
-            FileChanges::subscribe(connect_options(&self, ctx)?, paths.clone(), &context).await?;
-        let daemon = Daemon {
-            buckd,
-            events_ctx,
-            console: console.clone(),
-            connect_options: connect_options(&self, ctx)?,
-            paths,
-            context,
-            target: self.target.clone(),
-            target_cfg: self.target_cfg.target_cfg(),
-        };
-        let mut session = match Session::start(
-            daemon,
-            Duration::from_millis(self.debounce_ms),
-            listener,
-            server_rx,
-            signals,
-            console,
-            changes,
-        )
-        .await?
-        {
-            Ok(session) => session,
-            Err(interrupted) => return interrupted,
-        };
-        let result = session.run().await;
-        session.shutdown().await;
-        match result {
-            Ok(result) => result,
-            Err(e) => ExitResult::err(e),
-        }
+        let connection = DaemonConnection::new(buckd, connect_options(&self, ctx)?, paths);
+        let result = self.run(connection.clone(), matches, ctx, events_ctx).await;
+        // The daemon may have been replaced; the caller goes on with the connection that works.
+        *buckd = connection.current().1;
+        result
     }
 
     fn handles_ctrl_c(&self) -> bool {
@@ -231,14 +182,75 @@ impl StreamingCommand for DevCommand {
     }
 }
 
+#[cfg(unix)]
+impl DevCommand {
+    async fn run(
+        self,
+        connection: DaemonConnection,
+        matches: BuckArgMatches<'_>,
+        ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
+    ) -> ExitResult {
+        let mut context = ctx.client_context(matches, &self)?;
+        // Another command that would wait for a `buck2 dev` build cancels it instead. `buck2 dev`
+        // then retries.
+        context.preemptible = PreemptibleWhen::OnDifferentState as i32;
+        // `buck2 dev` handles Ctrl-C itself, so that it can stop the server and wait for it, and
+        // Ctrl-Z, so that it can stop the server with itself.
+        let signals = Signals::listen()?;
+        // What the console shows between and during daemon commands: the server's output, the
+        // status line, and Ctrl-Z, which takes the canvas off the terminal.
+        let (updates_tx, updates) = mpsc::unbounded_channel();
+        events_ctx.set_session_updates(updates);
+        let console = Console {
+            updates: updates_tx,
+            canvas: Arc::new(AtomicBool::new(events_ctx.used_superconsole)),
+        };
+        let paths = ctx.paths()?.clone();
+        let (server_tx, server_rx) = mpsc::unbounded_channel();
+        // Listen before the server starts, so that it can connect at once.
+        let listener = Listener::bind(&paths, server_tx)?;
+        // The daemon's file watcher reports the changes to the project's files. Subscribe before
+        // anything else, so that `buck2 dev` stops at once if it cannot.
+        let changes = FileChanges::subscribe(connection.clone(), &context).await?;
+        let daemon = Daemon {
+            connection,
+            events_ctx,
+            console: console.clone(),
+            context,
+            target: self.target.clone(),
+            target_cfg: self.target_cfg.target_cfg(),
+        };
+        let mut session = match Session::start(
+            daemon,
+            Duration::from_millis(self.debounce_ms),
+            listener,
+            server_rx,
+            signals,
+            console,
+            changes,
+        )
+        .await?
+        {
+            Ok(session) => session,
+            Err(interrupted) => return interrupted,
+        };
+        let result = session.run().await;
+        session.shutdown().await;
+        match result {
+            Ok(result) => result,
+            Err(e) => ExitResult::err(e),
+        }
+    }
+}
+
 /// Sends `buck2 dev` requests to the daemon, one daemon command each.
 struct Daemon<'a> {
-    buckd: &'a mut BuckdClientConnector,
+    /// The connection to the daemon, shared with the file change subscription. It connects again
+    /// when the daemon goes away, for example when another client restarts it.
+    connection: DaemonConnection,
     events_ctx: &'a mut EventsCtx,
     console: Console,
-    /// To connect again when the daemon goes away, for example when another client restarts it.
-    connect_options: BuckdConnectOptions,
-    paths: InvocationPaths,
     context: ClientContext,
     target: String,
     target_cfg: buck2_cli_proto::TargetCfg,
@@ -252,67 +264,41 @@ impl Daemon<'_> {
         &mut self,
         action: impl Fn() -> DevAction,
     ) -> buck2_error::Result<Result<DevResponse, Failed>> {
-        let mut reconnects = 0;
-        loop {
-            let outcome = match self
-                .buckd
-                .with_flushing()
-                .new_generic(
-                    self.context.clone(),
+        let console = &self.console;
+        let outcome = self
+            .connection
+            .new_generic(
+                &self.context,
+                || {
                     NewGenericRequest::Dev(DevRequest {
                         target: self.target.clone(),
                         target_cfg: self.target_cfg.clone(),
                         action: action(),
-                    }),
-                    self.events_ctx,
-                    None,
-                )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) if lost_daemon(&e) && reconnects < MAX_RECONNECTS => {
-                    // The daemon went away, perhaps because another client restarted it.
-                    // Connect again, starting a daemon if needed, and ask again.
-                    reconnects += 1;
-                    self.console.message(
-                        "`buck2 dev` lost its connection to the daemon; connecting again",
-                    )?;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    *self.buckd =
-                        connect_buckd(self.connect_options.clone(), self.events_ctx, &self.paths)
-                            .await?;
-                    continue;
+                    })
+                },
+                self.events_ctx,
+                || {
+                    console
+                        .message("`buck2 dev` lost its connection to the daemon; connecting again")
+                },
+            )
+            .await?;
+        match outcome {
+            CommandOutcome::Success(NewGenericResponse::Dev(response)) => Ok(Ok(response)),
+            CommandOutcome::Success(_) => Err(buck2_error!(
+                ErrorTag::InvalidEvent,
+                "Unexpected response type from the `dev` command"
+            )),
+            CommandOutcome::Failure(result) => {
+                let mut messages: Vec<String> = result
+                    .get_all_errors()
+                    .into_iter()
+                    .map(|e| e.message)
+                    .collect();
+                if messages.is_empty() {
+                    messages.push(format!("`buck2 dev` request failed: {}", result.name()));
                 }
-                Err(e) => return Err(e),
-            };
-            match outcome {
-                CommandOutcome::Success(NewGenericResponse::Dev(response)) => {
-                    return Ok(Ok(response));
-                }
-                CommandOutcome::Success(_) => {
-                    return Err(buck2_error!(
-                        ErrorTag::InvalidEvent,
-                        "Unexpected response type from the `dev` command"
-                    ));
-                }
-                CommandOutcome::Failure(result) => {
-                    let errors = result.get_all_errors();
-                    let preempted = errors.iter().any(|e| {
-                        e.tags
-                            .contains(&(buck2_data::error::ErrorTag::DaemonPreempted as i32))
-                    });
-                    if preempted {
-                        // Another command took the daemon. Ask again; the daemon admits this
-                        // request once that command is done.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                    let mut messages: Vec<String> = errors.into_iter().map(|e| e.message).collect();
-                    if messages.is_empty() {
-                        messages.push(format!("`buck2 dev` request failed: {}", result.name()));
-                    }
-                    return Ok(Err(Failed(messages)));
-                }
+                Ok(Err(Failed(messages)))
             }
         }
     }
@@ -323,14 +309,6 @@ fn unexpected_response() -> buck2_error::Error {
         ErrorTag::InvalidEvent,
         "Unexpected response type from the `dev` command"
     )
-}
-
-/// How many times in a row `buck2 dev` connects to the daemon again for one request.
-const MAX_RECONNECTS: u32 = 3;
-
-/// Whether `e` says that the connection to the daemon was lost, not that the request failed.
-fn lost_daemon(e: &buck2_error::Error) -> bool {
-    e.has_tag(ErrorTag::ClientGrpc) || e.has_tag(ErrorTag::ClientGrpcStream)
 }
 
 /// Where `buck2 dev` shows its own messages: above the superconsole's canvas while there is one,
