@@ -8,8 +8,9 @@
 
 # pyre-strict
 
-# Tests for `buck2 dev`. The fixture's server (`app/server.py`) appends every message it gets
-# to `dev_events.jsonl` in the project root; the tests read that file.
+# Tests for `buck2 dev`. The fixture's server (`app/server.py`) connects to `BUCK2_DEV_SOCKET`
+# and appends every message it gets to `dev_events.jsonl` in the project root; the tests read
+# that file.
 
 import asyncio
 import json
@@ -48,9 +49,10 @@ class DevSession:
                     self.offset = i + 1
                     return events[i]
             if self.process.returncode is not None:
+                output = await self.stop()
                 raise AssertionError(
                     f"`buck2 dev` exited with {self.process.returncode} "
-                    f"before sending `{kind}`"
+                    f"before sending `{kind}`\n{output}"
                 )
             await asyncio.sleep(0.1)
         output = await self.stop()
@@ -101,6 +103,14 @@ def write(buck: Buck, rel: str, content: str) -> None:
     target.write_text(content)
 
 
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 class DevTest(BuckTestCase):
     @buck_test()
     async def test_builds_when_a_watched_file_changes(self, buck: Buck) -> None:
@@ -108,6 +118,7 @@ class DevTest(BuckTestCase):
         try:
             ready = await dev.wait_for("ready")
             assert ready["outputs"] == ["site"]
+            assert ready["version"] == 1
             built = await dev.wait_for("built")
             assert site(built) == "lib v1\napp v1\n"
 
@@ -210,6 +221,8 @@ class DevTest(BuckTestCase):
             output = await dev.stop()
         assert "ignored a request from the server" in output, output
         assert '"type": "bulid"' in output, output
+        # The server's own output goes to the terminal.
+        assert "server started" in output, output
 
     @buck_test()
     async def test_reconnects_after_the_daemon_restarts(self, buck: Buck) -> None:
@@ -249,12 +262,19 @@ class DevTest(BuckTestCase):
             await dev.wait_for("built")
 
             write(buck, "app/main.txt", "app v2\n")
+            # The old server is asked to stop, and is gone before the new one starts.
+            shutdown = await dev.wait_for("shutdown")
+            assert shutdown["pid"] == first["pid"]
             second = await dev.wait_for("ready")
             assert second["pid"] != first["pid"]
+            assert not alive(first["pid"])
             built = await dev.wait_for("built")
             assert site(built) == "app v2\n"
         finally:
             await dev.stop()
+        # `buck2 dev` stops the server, and waits for it, before it exits.
+        assert not alive(second["pid"])
+        assert dev._events()[-1]["type"] == "shutdown", dev._events()
 
     @buck_test()
     async def test_other_commands_do_not_wait_for_dev_builds(self, buck: Buck) -> None:
@@ -312,6 +332,69 @@ class DevTest(BuckTestCase):
             assert time.monotonic() - start < 30
         finally:
             await dev.stop()
+
+    @buck_test()
+    async def test_server_is_read_during_a_build(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:slow_flood")
+        try:
+            await dev.wait_for("built")
+
+            # Start a dev build that takes 60 seconds. The server sends a request far bigger
+            # than a socket buffer when it starts, which it can only finish sending if
+            # `buck2 dev` reads it during the build.
+            write(buck, "app/delay.txt", "60\n")
+            building = await dev.wait_for("building")
+            await dev.wait_for("flooded", timeout=30)
+            assert all(
+                e.get("gen") != building["gen"]
+                for e in dev._events()
+                if e["type"] in ("built", "cancelled", "failed")
+            ), dev._events()
+
+            # The request is handled after the build.
+            write(buck, "app/delay.txt", "0\n")
+            await dev.wait_for("cancelled")
+            built = await dev.wait_for("built")
+            assert site(built) == "app v1\n"
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_server_that_never_connects_is_restarted(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:no_connect")
+        try:
+            first = await dev.wait_for("started")
+
+            write(buck, "app/main.txt", "app v2\n")
+            second = await dev.wait_for("started")
+            assert second["pid"] != first["pid"]
+            assert not alive(first["pid"])
+        finally:
+            await dev.stop()
+        assert not alive(second["pid"])
+
+    @buck_test()
+    async def test_crashed_server_starts_again_after_a_change(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:crash")
+        try:
+            first = await dev.wait_for("ready")
+            await dev.wait_for("built")
+            await dev.wait_for("crashing")
+
+            # The server exited with an error. `buck2 dev` keeps running, and waits.
+            await asyncio.sleep(2)
+            assert dev.process.returncode is None
+            await dev.assert_none("ready", 0)
+
+            # The next change starts it again.
+            write(buck, "app/main.txt", "app v2\n")
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
+            built = await dev.wait_for("built")
+            assert site(built) == "app v2\n"
+        finally:
+            output = await dev.stop()
+        assert "starts it again after the next change" in output, output
 
     @buck_test()
     async def test_inputs_set_takes_a_source_file_of_the_target(self, buck: Buck) -> None:

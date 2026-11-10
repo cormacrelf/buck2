@@ -6,16 +6,23 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# A `buck2 dev` server for the tests. It appends each message it receives, with its process ID
-# and the content of each built output, to `dev_events.jsonl` in the project root.
+# A `buck2 dev` server for the tests. It connects to `BUCK2_DEV_SOCKET`, and appends each
+# message it receives, with its process ID and the content of each built output, to
+# `dev_events.jsonl` in the project root. It also logs some events of its own, whose types do
+# not clash with `buck2 dev` messages.
 #
 # On `ready` it asks for the `site` output. With `--build-on-stale`, it asks for `site` again
 # whenever `buck2 dev` reports files of a `notify` set as changed. With `--bad-request`, it also
-# sends a request of an unknown type on `ready`.
+# sends a request of an unknown type on `ready`. With `--no-connect`, it never connects, and only
+# logs `started`. With `--crash-once`, the first server to get `built` exits with an error. With
+# `--flood-on-second-build`, it sends one very long request when the second build starts, and
+# logs `flooded` once `buck2 dev` has read it.
 
 import json
 import os
+import socket
 import sys
+import time
 
 
 def log(message):
@@ -28,26 +35,54 @@ def log(message):
         f.write(json.dumps(message) + "\n")
 
 
-def request(message):
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+def connect():
+    address = os.environ["BUCK2_DEV_SOCKET"]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(address)
+    return sock.makefile("rwb")
 
 
 def main():
-    build_on_stale = "--build-on-stale" in sys.argv[1:]
-    bad_request = "--bad-request" in sys.argv[1:]
-    # Lines that are not requests are printed by `buck2 dev`.
+    args = sys.argv[1:]
+    # Output goes to the terminal, like any other process's.
     print("server started", flush=True)
-    for line in sys.stdin:
+    if "--no-connect" in args:
+        log({"type": "started"})
+        while True:
+            time.sleep(60)
+
+    conn = connect()
+
+    def request(message):
+        conn.write((json.dumps(message) + "\n").encode())
+        conn.flush()
+
+    request({"type": "hello", "version": 1})
+    builds = 0
+    for line in conn:
         message = json.loads(line)
         log(message)
-        if message["type"] == "ready":
-            if bad_request:
+        kind = message["type"]
+        if kind == "ready":
+            if "--bad-request" in args:
                 request({"type": "bulid", "outputs": ["site"]})
             request({"type": "build", "outputs": ["site"]})
-        elif message["type"] == "stale" and message["files"] and build_on_stale:
+        elif kind == "stale" and message["files"] and "--build-on-stale" in args:
             request({"type": "build", "outputs": ["site"]})
-    # `buck2 dev` closed stdin: it has exited.
+        elif kind == "building":
+            builds += 1
+            if builds == 2 and "--flood-on-second-build" in args:
+                # Far more than a socket buffer: this returns only once `buck2 dev` reads it,
+                # which it must do while it builds.
+                request({"type": "build", "outputs": ["site"], "pad": "x" * (8 << 20)})
+                log({"type": "flooded"})
+        elif kind == "built" and "--crash-once" in args:
+            if not os.path.exists("crashed"):
+                open("crashed", "w").close()
+                log({"type": "crashing"})
+                sys.exit(3)
+        elif kind == "shutdown":
+            return
 
 
 if __name__ == "__main__":

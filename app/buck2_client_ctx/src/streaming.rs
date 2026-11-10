@@ -191,6 +191,13 @@ pub trait StreamingCommand: Sized + Send + Sync {
         DaemonStartupMode::Standard
     }
 
+    /// Whether the command handles Ctrl-C itself once it has connected to the daemon. Otherwise
+    /// Ctrl-C drops the command, which then cannot wait for anything to finish, such as a process
+    /// it started stopping.
+    fn handles_ctrl_c(&self) -> bool {
+        false
+    }
+
     fn console_opts(&self) -> &CommonConsoleOptions;
 
     fn event_log_opts(&self) -> &CommonEventLogOptions;
@@ -265,7 +272,7 @@ impl<T: StreamingCommand> BuckSubcommand for T {
         mut ctx: ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        let work = async {
+        let connect = async {
             let mut connect_options = connect_options(&self, &ctx)?;
             let buckd = match ctx.start_in_process_daemon.take() {
                 None => connect_buckd(connect_options, events_ctx, ctx.paths()?).await,
@@ -281,18 +288,26 @@ impl<T: StreamingCommand> BuckSubcommand for T {
                 }
             };
 
-            let mut buckd = match buckd {
-                Ok(buckd) => buckd,
-                Err(e) if e.has_tag(ErrorTag::AgentAdviceBlocked) => return ExitResult::err(e),
-                Err(e) => {
-                    return ExitResult::err_with_exit_code(e, ExitCode::ConnectError);
-                }
-            };
+            match buckd {
+                Ok(buckd) => Ok(buckd),
+                Err(e) if e.has_tag(ErrorTag::AgentAdviceBlocked) => Err(ExitResult::err(e)),
+                Err(e) => Err(ExitResult::err_with_exit_code(e, ExitCode::ConnectError)),
+            }
+        };
 
-            events_ctx.daemon_pid = Some(buckd.daemon_pid);
-            events_ctx.cgroup_path_of_buck2_daemon = buckd.cgroup_path_of_buck2_daemon.clone();
-            events_ctx.daemon_start_instant = buckd.daemon_start_instant;
+        // FIXME: move this into client_ctx
+        let mut buckd = match with_simple_sigint_handler(connect).await {
+            None => return ExitResult::signal_interrupt(),
+            Some(Err(result)) => return result,
+            Some(Ok(buckd)) => buckd,
+        };
 
+        events_ctx.daemon_pid = Some(buckd.daemon_pid);
+        events_ctx.cgroup_path_of_buck2_daemon = buckd.cgroup_path_of_buck2_daemon.clone();
+        events_ctx.daemon_start_instant = buckd.daemon_start_instant;
+
+        let handles_ctrl_c = self.handles_ctrl_c();
+        let work = async {
             let command_result = self
                 .exec_impl(&mut buckd, matches, &mut ctx, events_ctx)
                 .await;
@@ -302,10 +317,13 @@ impl<T: StreamingCommand> BuckSubcommand for T {
             command_result
         };
 
-        // FIXME: move this into client_ctx
-        with_simple_sigint_handler(work)
-            .await
-            .unwrap_or_else(ExitResult::signal_interrupt)
+        if handles_ctrl_c {
+            work.await
+        } else {
+            with_simple_sigint_handler(work)
+                .await
+                .unwrap_or_else(ExitResult::signal_interrupt)
+        }
     }
 
     fn update_events_ctx(

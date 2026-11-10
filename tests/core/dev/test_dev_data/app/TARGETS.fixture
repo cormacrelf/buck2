@@ -63,6 +63,31 @@ dev_app(
 )
 
 dev_app(
+    name = "slow_flood",
+    mode = "all",
+    srcs = ["main.txt"],
+    delay = "delay.txt",
+    server = "server.py",
+    server_args = ["--flood-on-second-build"],
+)
+
+dev_app(
+    name = "no_connect",
+    mode = "restart",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--no-connect"],
+)
+
+dev_app(
+    name = "crash",
+    mode = "all",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--crash-once"],
+)
+
+dev_app(
     name = "inputs",
     mode = "inputs",
     srcs = ["main.txt"],

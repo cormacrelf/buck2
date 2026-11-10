@@ -29,6 +29,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 
@@ -42,10 +43,12 @@ def log(message):
     sys.stderr.flush()
 
 
-def request(message):
-    """Send a request to `buck2 dev` on stdout."""
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+def connect_to_buck2_dev():
+    """Connect to `buck2 dev`. Returns a file to read and write JSON lines on."""
+    address = os.environ["BUCK2_DEV_SOCKET"]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(address)
+    return sock.makefile("rwb")
 
 
 def copy(src, name):
@@ -68,10 +71,8 @@ class App:
         self.runs += 1
         self.exe = copy(exe, "app-%d" % self.runs)
         log("starting %s" % exe)
-        # The app's stdout must not reach `buck2 dev`, which reads requests from ours.
-        self.process = subprocess.Popen(
-            [self.exe], stdin=subprocess.PIPE, stdout=sys.stderr, text=True
-        )
+        # The app reads jump tables from its stdin.
+        self.process = subprocess.Popen([self.exe], stdin=subprocess.PIPE, text=True)
 
     def stop(self):
         if self.process is not None and self.process.poll() is None:
@@ -117,13 +118,21 @@ def main():
     parser.add_argument("--thinlink", required=True)
     args = parser.parse_args()
 
-    # `buck2 dev` sends SIGTERM when it exits. Exit through the `finally` below.
+    # `buck2 dev` may stop this server with SIGTERM. Exit through the `finally` below.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     app = App(os.path.abspath(args.thinlink))
+    conn = connect_to_buck2_dev()
+
+    def request(message):
+        conn.write((json.dumps(message) + "\n").encode())
+        conn.flush()
+
     try:
-        for line in sys.stdin:
+        request({"type": "hello", "version": 1})
+        for line in conn:
             message = json.loads(line)
-            kind = message["type"]
+            # Messages of other types may be added; ignore them.
+            kind = message.get("type")
             if kind == "ready":
                 request({"type": "build", "outputs": ["exe"]})
             elif kind == "built":
@@ -138,8 +147,10 @@ def main():
                         request({"type": "build", "outputs": ["exe"]})
             elif kind == "failed":
                 log("build failed; the app keeps running the last build")
+            elif kind == "shutdown":
+                break
     finally:
-        # `buck2 dev` closed stdin: it has exited.
+        # `buck2 dev` is stopping this server, or has exited.
         app.stop()
 
 

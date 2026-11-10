@@ -8,11 +8,11 @@
 
 """A web server for a directory that `buck2 dev` rebuilds.
 
-Under `buck2 dev`, the server reads `buck2 dev` messages from stdin, one JSON object per line.
-It asks for the `www` output when it starts, and serves the newest `www` directory it has been
-told about. A browser gets the new pages on its next request.
+Under `buck2 dev`, the server connects to the socket in `BUCK2_DEV_SOCKET`, and exchanges
+JSON lines with `buck2 dev` there. It asks for the `www` output when it starts, and serves the
+newest `www` directory it has been told about. A browser gets the new pages on its next request.
 
-With `--root DIR` (`buck2 run`), it serves DIR and does not read stdin.
+With `--root DIR` (`buck2 run`), it serves DIR and does not connect to `buck2 dev`.
 """
 
 import argparse
@@ -20,6 +20,7 @@ import functools
 import http.server
 import json
 import os
+import socket
 import sys
 import threading
 
@@ -57,21 +58,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
-    def log_message(self, format, *args):
-        # stdout carries requests to `buck2 dev`, so log to stderr.
-        sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+
+def connect_to_buck2_dev():
+    """Connect to `buck2 dev`. Returns a file to read and write JSON lines on."""
+    address = os.environ["BUCK2_DEV_SOCKET"]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(address)
+    return sock.makefile("rwb")
 
 
-def request(message):
-    """Send a request to `buck2 dev`."""
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+def follow_buck2_dev(site, server):
+    conn = connect_to_buck2_dev()
 
+    def request(message):
+        conn.write((json.dumps(message) + "\n").encode())
+        conn.flush()
 
-def follow_buck2_dev(site):
-    for line in sys.stdin:
+    request({"type": "hello", "version": 1})
+    for line in conn:
         message = json.loads(line)
-        kind = message["type"]
+        # Messages of other types may be added; ignore them.
+        kind = message.get("type")
         if kind == "ready":
             request({"type": "build", "outputs": ["www"]})
         elif kind == "building":
@@ -83,8 +90,10 @@ def follow_buck2_dev(site):
                 sys.stderr.write("Serving the new site (build %d)\n" % message["gen"])
         elif kind == "failed":
             sys.stderr.write("Build failed; still serving the last site\n")
-    # `buck2 dev` closed stdin: it has exited, so stop too.
-    os._exit(0)
+        elif kind == "shutdown":
+            break
+    # `buck2 dev` is stopping this server, or has exited.
+    server.shutdown()
 
 
 def main():
@@ -95,13 +104,15 @@ def main():
     port = int(os.environ.get("PORT", args.port))
 
     site = Site(os.path.abspath(args.root) if args.root else None)
-    if args.root is None:
-        threading.Thread(target=follow_buck2_dev, args=(site,), daemon=True).start()
-
     handler = functools.partial(Handler, site=site)
     server = http.server.ThreadingHTTPServer(("localhost", port), handler)
+    if args.root is None:
+        threading.Thread(
+            target=follow_buck2_dev, args=(site, server), daemon=True
+        ).start()
     sys.stderr.write("Serving on http://localhost:%d/\n" % port)
     server.serve_forever()
+    server.server_close()
 
 
 if __name__ == "__main__":

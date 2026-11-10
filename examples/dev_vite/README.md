@@ -39,5 +39,7 @@ The watch sets in `defs.bzl` say what each change does:
    `node_modules`.
 3. Any other change builds `app` again.
 
-Vite reads its stdin for keyboard shortcuts, so the server starts it with no
-stdin: the server's stdin carries the `buck2 dev` messages.
+The server talks to `buck2 dev` over the socket in `BUCK2_DEV_SOCKET`. The
+rule sets `DevInfo(interactive = True)`, so the server, and Vite, which it
+starts, get the terminal, and Vite's keyboard shortcuts work: press `h` for the
+list. Ctrl-C stops Vite and `buck2 dev`.

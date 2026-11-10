@@ -18,14 +18,15 @@ not follow a directory that is replaced. So this server copies each new `app` in
 directory that stays in place, `buck-out/dev_vite/app`, and writes only the files whose
 content changed. Vite sees those writes and updates the browser with hot module
 replacement. When `packages` changes, the server starts Vite again.
+
+Vite runs in this server's process group, so `buck2 dev` stops it with the server.
 """
 
 import argparse
-import ctypes
 import json
 import os
-import shutil
 import signal
+import socket
 import subprocess
 import sys
 
@@ -37,10 +38,12 @@ def log(message):
     sys.stderr.flush()
 
 
-def request(message):
-    """Send a request to `buck2 dev` on stdout."""
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+def connect_to_buck2_dev():
+    """Connect to `buck2 dev`. Returns a file to read and write JSON lines on."""
+    address = os.environ["BUCK2_DEV_SOCKET"]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(address)
+    return sock.makefile("rwb")
 
 
 def read(path):
@@ -81,14 +84,6 @@ def sync(src, dst):
     return changes
 
 
-def die_with_parent():
-    """In the Vite process, before it starts: on Linux, get SIGTERM when this server dies,
-    even if the server is killed with SIGKILL."""
-    if sys.platform.startswith("linux"):
-        PR_SET_PDEATHSIG = 1
-        ctypes.CDLL(None).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
-
-
 class Vite:
     def __init__(self, port):
         self.port = port
@@ -102,15 +97,11 @@ class Vite:
         os.symlink(os.path.join(packages, "node_modules"), link)
         vite = os.path.join(packages, "node_modules", "vite", "bin", "vite.js")
         log("starting Vite on http://localhost:%d/" % self.port)
-        # Vite must not read our stdin, which carries `buck2 dev` messages; it reads stdin for
-        # its keyboard shortcuts. Its stdout must not reach `buck2 dev`, which reads requests
-        # from ours.
+        # Vite inherits the terminal, which `DevInfo(interactive = True)` gives this server, so
+        # its keyboard shortcuts work.
         self.process = subprocess.Popen(
             ["node", vite, "--port", str(self.port), "--strictPort"],
             cwd=STAGE,
-            stdin=subprocess.DEVNULL,
-            stdout=sys.stderr,
-            preexec_fn=die_with_parent,
         )
 
     def stop(self):
@@ -125,15 +116,24 @@ def main():
     parser.add_argument("--port", type=int, default=5173)
     args = parser.parse_args()
 
-    # `buck2 dev` sends SIGTERM when it exits. Exit through the `finally` below, which stops Vite.
+    # `buck2 dev` may stop this server with SIGTERM. Exit through the `finally` below, which
+    # stops Vite.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     vite = Vite(int(os.environ.get("PORT", args.port)))
     packages = None
     have_app = False
+    conn = connect_to_buck2_dev()
+
+    def request(message):
+        conn.write((json.dumps(message) + "\n").encode())
+        conn.flush()
+
     try:
-        for line in sys.stdin:
+        request({"type": "hello", "version": 1})
+        for line in conn:
             message = json.loads(line)
-            kind = message["type"]
+            # Messages of other types may be added; ignore them.
+            kind = message.get("type")
             if kind == "ready":
                 request({"type": "build", "outputs": ["packages", "app"]})
             elif kind == "built":
@@ -153,8 +153,10 @@ def main():
                     vite.start(packages)
             elif kind == "failed":
                 log("build failed; Vite keeps serving the last build")
+            elif kind == "shutdown":
+                break
     finally:
-        # `buck2 dev` closed stdin: it has exited.
+        # `buck2 dev` is stopping this server, or has exited.
         vite.stop()
 
 

@@ -86,6 +86,8 @@ def _vite_app_impl(ctx):
         DevInfo(
             server = server,
             outputs = {"app": app, "packages": packages},
+            # Vite reads the terminal for its keyboard shortcuts.
+            interactive = True,
             watch = [
                 # A change to the server script restarts it, and so Vite too.
                 DevWatch(inputs = server, restart = True),

@@ -12,12 +12,17 @@
 //!
 //! The client watches the files and runs the server. Every build is a separate, short daemon
 //! command, marked preemptible, so `buck2 dev` never keeps other commands waiting.
+//!
+//! `buck2 dev` runs only on Unix so far. Elsewhere the command only says so, and the parts that
+//! do not depend on Unix are unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -49,8 +54,6 @@ use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::streaming::connect_options;
 use buck2_common::invocation_paths::InvocationPaths;
-use buck2_error::BuckErrorContext;
-use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_hash::BuckMutMap;
@@ -59,14 +62,21 @@ use notify::EventKind;
 use notify::RecursiveMode;
 use notify::Watcher;
 use serde_json::json;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
-use tokio::io::Lines;
-use tokio::process::Child;
-use tokio::process::ChildStdin;
-use tokio::process::ChildStdout;
 use tokio::sync::mpsc;
+
+#[cfg(unix)]
+use self::channel::Listener;
+#[cfg(unix)]
+use self::channel::ServerEvent;
+#[cfg(unix)]
+use self::channel::Writer;
+#[cfg(unix)]
+use self::process::ServerProcess;
+
+#[cfg(unix)]
+mod channel;
+#[cfg(unix)]
+mod process;
 
 /// Run a target's `DevInfo` server, and rebuild as source files change.
 ///
@@ -75,9 +85,15 @@ use tokio::sync::mpsc;
 /// `DevWatch` whose files include it decides what happens: build some of the `DevInfo` outputs
 /// and tell the server, rebuild and restart the server, or only tell the server.
 ///
-/// The server reads JSON lines from its stdin. It may write JSON requests to its stdout, such as
-/// `{"type": "build", "outputs": ["name"]}`; other lines are printed. See the `buck2 dev` page of
+/// The server may connect to the socket named in the `BUCK2_DEV_SOCKET` environment variable, and
+/// exchange JSON lines with `buck2 dev` there: it gets messages such as `{"type": "built", ...}`,
+/// and may send requests such as `{"type": "build", "outputs": ["name"]}`. A server that does not
+/// connect is only started, and started again when its files change. See the `buck2 dev` page of
 /// the rule author documentation for the messages.
+///
+/// If the server exits with an error, `buck2 dev` waits for the next change and starts it again.
+/// `buck2 dev` ends when the server exits successfully, or on Ctrl-C, once it has stopped the
+/// server.
 ///
 /// Each build is a separate daemon command that another command may preempt, so `buck2 dev` never
 /// makes other buck2 commands wait.
@@ -104,6 +120,21 @@ pub struct DevCommand {
 impl StreamingCommand for DevCommand {
     const COMMAND_NAME: &'static str = "dev";
 
+    #[cfg(not(unix))]
+    async fn exec_impl(
+        self,
+        _buckd: &mut BuckdClientConnector,
+        _matches: BuckArgMatches<'_>,
+        _ctx: &mut ClientCommandContext<'_>,
+        _events_ctx: &mut EventsCtx,
+    ) -> ExitResult {
+        ExitResult::err(buck2_error!(
+            ErrorTag::Unimplemented,
+            "`buck2 dev` is not supported on Windows yet"
+        ))
+    }
+
+    #[cfg(unix)]
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
@@ -115,20 +146,43 @@ impl StreamingCommand for DevCommand {
         // Another command that would wait for a `buck2 dev` build cancels it instead. `buck2 dev`
         // then retries.
         context.preemptible = PreemptibleWhen::OnDifferentState as i32;
+        // `buck2 dev` handles Ctrl-C itself, so that it can stop the server and wait for it.
+        let interrupts = Interrupts::listen()?;
+        let paths = ctx.paths()?.clone();
+        let (server_tx, server_rx) = mpsc::unbounded_channel();
+        // Listen before the server starts, so that it can connect at once.
+        let listener = Listener::bind(&paths, server_tx)?;
         let daemon = Daemon {
             buckd,
             events_ctx,
             connect_options: connect_options(&self, ctx)?,
-            paths: ctx.paths()?.clone(),
+            paths,
             context,
             target: self.target.clone(),
             target_cfg: self.target_cfg.target_cfg(),
         };
-        let session = Session::start(daemon, Duration::from_millis(self.debounce_ms)).await?;
-        match session.run().await {
+        let mut session = match Session::start(
+            daemon,
+            Duration::from_millis(self.debounce_ms),
+            listener,
+            server_rx,
+            interrupts,
+        )
+        .await?
+        {
+            Ok(session) => session,
+            Err(interrupted) => return interrupted,
+        };
+        let result = session.run().await;
+        session.shutdown().await;
+        match result {
             Ok(result) => result,
             Err(e) => ExitResult::err(e),
         }
+    }
+
+    fn handles_ctrl_c(&self) -> bool {
+        true
     }
 
     fn console_opts(&self) -> &CommonConsoleOptions {
@@ -249,85 +303,260 @@ fn lost_daemon(e: &buck2_error::Error) -> bool {
     e.has_tag(ErrorTag::ClientGrpc) || e.has_tag(ErrorTag::ClientGrpcStream)
 }
 
-/// The running server process.
-struct Server {
-    argv: Vec<String>,
-    child: Child,
-    /// `None` once `buck2 dev` has closed it to stop the server.
-    stdin: Option<ChildStdin>,
-    stdout: Lines<BufReader<ChildStdout>>,
+/// Ctrl-C, and on Unix `SIGTERM` and `SIGHUP`. Each asks `buck2 dev` to stop the server and exit.
+/// Without this, `buck2 dev` would exit at once, and the server, in a process group of its own,
+/// would keep running.
+#[cfg(unix)]
+struct Interrupts {
+    rx: mpsc::UnboundedReceiver<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-impl Server {
-    fn spawn(info: &DevServer) -> buck2_error::Result<Server> {
-        let (program, args) = info.server.split_first().ok_or_else(|| {
-            buck2_error!(
-                ErrorTag::Input,
-                "The `DevInfo` server command line is empty"
-            )
-        })?;
-        let mut child = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(&info.project_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_buck_error_context(|| {
-                format!("Failed to start the `buck2 dev` server `{program}`")
-            })?;
-        let stdin = child.stdin.take().internal_error("stdin was piped")?;
-        let stdout = child.stdout.take().internal_error("stdout was piped")?;
-        Ok(Server {
-            argv: info.server.clone(),
-            child,
-            stdin: Some(stdin),
-            stdout: BufReader::new(stdout).lines(),
-        })
+#[cfg(unix)]
+impl Interrupts {
+    fn listen() -> buck2_error::Result<Interrupts> {
+        use tokio::signal::unix::SignalKind;
+        use tokio::signal::unix::signal;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        // Under `nohup`, `SIGHUP` is ignored, and should stay ignored.
+        let mut hangup = if signal_ignored(libc::SIGHUP) {
+            None
+        } else {
+            Some(signal(SignalKind::hangup())?)
+        };
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(()) = interrupt.recv() => {}
+                    Some(()) = terminate.recv() => {}
+                    Some(()) = async {
+                        match &mut hangup {
+                            Some(hangup) => hangup.recv().await,
+                            None => futures::future::pending().await,
+                        }
+                    } => {}
+                    else => return,
+                }
+                if tx.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Interrupts { rx, task })
     }
 
-    async fn send(&mut self, message: serde_json::Value) -> buck2_error::Result<()> {
-        let mut line = serde_json::to_vec(&message)?;
-        line.push(b'\n');
-        // A server that stopped reading is noticed when it exits.
-        if let Some(stdin) = &mut self.stdin {
-            if stdin.write_all(&line).await.is_ok() {
-                let _ignored = stdin.flush().await;
+    async fn recv(&mut self) {
+        if self.rx.recv().await.is_none() {
+            futures::future::pending().await
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Interrupts {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(unix)]
+fn signal_ignored(signal: libc::c_int) -> bool {
+    // SAFETY: reads the current action into `action`, a plain C struct.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut action) == 0
+            && action.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// The version of the protocol between `buck2 dev` and its server, in `hello` and `ready`.
+const PROTOCOL_VERSION: u64 = 1;
+
+/// A message from the server.
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Request {
+    Hello { version: u64 },
+    Build { outputs: Vec<String> },
+    Restart,
+}
+
+/// The running server, and its connection to `buck2 dev`, if it made one.
+#[cfg(unix)]
+struct Server {
+    process: ServerProcess,
+    argv: Vec<String>,
+    interactive: bool,
+    /// Connections made since the server started that have not sent `hello` yet.
+    unintroduced: BuckMutMap<u64, Writer>,
+    /// The connection that sent `hello`. Messages to the server go to it.
+    conn: Option<(u64, Writer)>,
+    /// Connections numbered below this were made to an earlier server.
+    first_conn: u64,
+}
+
+#[cfg(unix)]
+impl Server {
+    /// Send `message` to the server. A server that has not connected gets no messages.
+    fn send(&self, message: serde_json::Value) {
+        if let Some((_, writer)) = &self.conn {
+            writer.send(&message);
+        }
+    }
+
+    /// Ask the server to stop, and wait for it, killing it if it takes too long.
+    async fn stop(&mut self) {
+        let connected = self.conn.is_some();
+        if connected {
+            self.send(json!({"type": "shutdown"}));
+        }
+        self.process.stop(connected, SERVER_STOP_TIMEOUT).await;
+        self.conn = None;
+        self.unintroduced.clear();
+    }
+}
+
+/// The server, and what it sent that `buck2 dev` has not handled yet. It is apart from the rest
+/// of the session so that `buck2 dev` can handle the server while a daemon request runs.
+#[cfg(unix)]
+struct ServerLink {
+    /// `None` after the server exited, until the next change starts it again.
+    server: Option<Server>,
+    /// Requests from the server, handled when no daemon request is running.
+    requests: VecDeque<Request>,
+    /// Set when the session should end: the server exited successfully, or Ctrl-C.
+    exit: Option<ExitResult>,
+}
+
+#[cfg(unix)]
+impl ServerLink {
+    fn send(&self, message: serde_json::Value) {
+        if let Some(server) = &self.server {
+            server.send(message);
+        }
+    }
+
+    /// Handle what happened on the socket. `hello` is answered at once; requests wait in
+    /// `requests`.
+    fn on_event(
+        &mut self,
+        event: ServerEvent,
+        outputs: &[String],
+        pending: &BTreeSet<PathBuf>,
+    ) -> buck2_error::Result<()> {
+        let Some(server) = &mut self.server else {
+            return Ok(());
+        };
+        match event {
+            ServerEvent::Connected { conn, writer } => {
+                if conn >= server.first_conn {
+                    server.unintroduced.insert(conn, writer);
+                }
+            }
+            ServerEvent::Closed { conn } => {
+                server.unintroduced.remove(&conn);
+                if server.conn.as_ref().is_some_and(|(c, _)| *c == conn) {
+                    // The server keeps running; it gets no more messages.
+                    server.conn = None;
+                }
+            }
+            ServerEvent::Line { conn, line } => {
+                let introduced = server.conn.as_ref().is_some_and(|(c, _)| *c == conn);
+                if !introduced && !server.unintroduced.contains_key(&conn) {
+                    // A connection to an earlier server.
+                    return Ok(());
+                }
+                match serde_json::from_str::<Request>(&line) {
+                    Ok(Request::Hello { version }) => {
+                        if version != PROTOCOL_VERSION {
+                            // Answer anyway: `ready` says which version `buck2 dev` speaks.
+                            buck2_client_ctx::eprintln!(
+                                "The `buck2 dev` server asked for protocol version {}, but `buck2 dev` speaks version {}",
+                                version,
+                                PROTOCOL_VERSION
+                            )?;
+                        }
+                        // Another connection that sends `hello`, such as the real server behind a
+                        // wrapper that connected first, takes over from the first.
+                        if let Some(writer) = server.unintroduced.remove(&conn) {
+                            server.conn = Some((conn, writer));
+                        }
+                        server.send(json!({
+                            "type": "ready",
+                            "version": PROTOCOL_VERSION,
+                            "outputs": outputs,
+                        }));
+                        if !pending.is_empty() {
+                            server.send(json!({"type": "stale", "files": pending}));
+                        }
+                    }
+                    Ok(_) if !introduced => {
+                        buck2_client_ctx::eprintln!(
+                            "`buck2 dev` ignored a request from the server, which must send `hello` first: {}",
+                            line
+                        )?;
+                    }
+                    Ok(request) => self.requests.push_back(request),
+                    Err(e) => {
+                        buck2_client_ctx::eprintln!(
+                            "`buck2 dev` ignored a request from the server: {}: {}",
+                            e,
+                            line
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Close the server's stdin, so that it can stop what it started, and kill it if it has not
-    /// exited after `SERVER_STOP_TIMEOUT`.
-    async fn stop(&mut self) {
-        self.stdin = None;
-        if tokio::time::timeout(SERVER_STOP_TIMEOUT, self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ignored = self.child.kill().await;
+    /// The server exited. Stop what it left running in its group, and end the session if it
+    /// exited successfully or after Ctrl-C.
+    async fn on_exit(&mut self, status: ExitStatus) -> buck2_error::Result<()> {
+        let Some(mut server) = self.server.take() else {
+            return Ok(());
+        };
+        server.process.stop(false, SERVER_STOP_TIMEOUT).await;
+        self.requests.clear();
+        if status.success() {
+            self.exit = Some(ExitResult::success());
+        } else if server.interactive && killed_by_sigint(status) {
+            // An interactive server has the terminal, so Ctrl-C reaches it and not `buck2 dev`.
+            self.exit = Some(ExitResult::signal_interrupt());
+        } else {
+            buck2_client_ctx::eprintln!(
+                "The `buck2 dev` server exited ({}). `buck2 dev` starts it again after the next change.",
+                status
+            )?;
         }
+        Ok(())
     }
 }
 
-impl Drop for Server {
-    /// `buck2 dev` is exiting, perhaps on Ctrl-C. Close the server's stdin and ask it to stop;
-    /// there is no time to wait for it.
-    fn drop(&mut self) {
-        self.stdin = None;
-        if matches!(self.child.try_wait(), Ok(None)) {
-            #[cfg(unix)]
-            if let Some(pid) = self.child.id() {
-                // SAFETY: sending a signal to a child process we have not yet waited for.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-                return;
-            }
-            let _ignored = self.child.start_kill();
-        }
+#[cfg(unix)]
+fn killed_by_sigint(status: ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(libc::SIGINT)
+}
+
+/// Wait for the server to exit, or forever if there is none.
+#[cfg(unix)]
+async fn server_exited(server: &mut Option<Server>) -> ExitStatus {
+    match server {
+        Some(server) => server.process.wait().await,
+        None => futures::future::pending().await,
     }
+}
+
+fn could_not_start(messages: Vec<String>) -> buck2_error::Error {
+    buck2_error!(
+        ErrorTag::Input,
+        "`buck2 dev` could not start: {}",
+        messages.join("\n")
+    )
 }
 
 /// Where a watched path belongs.
@@ -467,7 +696,7 @@ impl Watched {
     }
 }
 
-/// How long `buck2 dev` waits for a server to exit after closing its stdin.
+/// How long `buck2 dev` waits for a server to exit after `shutdown`, and again after `SIGTERM`.
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest `buck2 dev` waits for files to stop changing before it builds.
@@ -502,6 +731,7 @@ fn hash_in_background(files: Vec<PathBuf>, hashes: Hashes) {
     });
 }
 
+#[cfg(unix)]
 struct Session<'a> {
     daemon: Daemon<'a>,
     debounce: Duration,
@@ -510,7 +740,11 @@ struct Session<'a> {
     watched: Watched,
     /// The server's command line and the names of the outputs, from the last analysis.
     server_info: DevServer,
-    server: Server,
+    /// The socket the server connects to, and what happens on it.
+    listener: Listener,
+    server_rx: mpsc::UnboundedReceiver<ServerEvent>,
+    link: ServerLink,
+    interrupts: Interrupts,
     generation: u64,
     /// The digest of each output when it was last built.
     digests: BuckMutMap<String, Option<String>>,
@@ -560,30 +794,24 @@ enum Resolved {
     Interrupted,
 }
 
+#[cfg(unix)]
 impl<'a> Session<'a> {
-    async fn start(mut daemon: Daemon<'a>, debounce: Duration) -> buck2_error::Result<Session<'a>> {
-        let could_not_start = |messages: Vec<String>| {
-            buck2_error!(
-                ErrorTag::Input,
-                "`buck2 dev` could not start: {}",
-                messages.join("\n")
-            )
-        };
-        let server_info = match daemon.request(|| DevAction::Server).await? {
-            Ok(DevResponse::Server(info)) => info,
-            Ok(_) => return Err(unexpected_response()),
-            Err(Failed(messages)) => return Err(could_not_start(messages)),
-        };
-        let mut server = Server::spawn(&server_info)?;
-        server
-            .send(json!({"type": "ready", "outputs": server_info.outputs}))
-            .await?;
-        // The server starts while `buck2 dev` finds the files to watch, which may build what
-        // dynamic actions need. It handles the server's requests afterwards.
-        let watched = match daemon.request(|| DevAction::Watch).await? {
-            Ok(DevResponse::Watch(watched)) => watched,
-            Ok(_) => return Err(unexpected_response()),
-            Err(Failed(messages)) => return Err(could_not_start(messages)),
+    /// Analyse the target and start the server. `Err` is the result of Ctrl-C before the server
+    /// started.
+    async fn start(
+        mut daemon: Daemon<'a>,
+        debounce: Duration,
+        listener: Listener,
+        server_rx: mpsc::UnboundedReceiver<ServerEvent>,
+        mut interrupts: Interrupts,
+    ) -> buck2_error::Result<Result<Session<'a>, ExitResult>> {
+        let server_info = tokio::select! {
+            response = daemon.request(|| DevAction::Server) => match response? {
+                Ok(DevResponse::Server(info)) => info,
+                Ok(_) => return Err(unexpected_response()),
+                Err(Failed(messages)) => return Err(could_not_start(messages)),
+            },
+            () = interrupts.recv() => return Ok(Err(ExitResult::signal_interrupt())),
         };
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let mut session = Session {
@@ -593,7 +821,14 @@ impl<'a> Session<'a> {
             events_rx,
             watched: Watched::empty(),
             server_info,
-            server,
+            listener,
+            server_rx,
+            link: ServerLink {
+                server: None,
+                requests: VecDeque::new(),
+                exit: None,
+            },
+            interrupts,
             generation: 0,
             digests: BuckMutMap::default(),
             baseline: Arc::new(Mutex::new(BuckMutMap::default())),
@@ -608,12 +843,28 @@ impl<'a> Session<'a> {
             cancelled_outputs: BTreeSet::new(),
             cancelled_files: BTreeSet::new(),
         };
-        session.install_watch(watched)?;
-        Ok(session)
+        session.spawn().await?;
+        Ok(Ok(session))
     }
 
-    async fn run(mut self) -> buck2_error::Result<ExitResult> {
+    async fn run(&mut self) -> buck2_error::Result<ExitResult> {
+        // The server starts while `buck2 dev` finds the files to watch, which may build what
+        // dynamic actions need. It handles the server's requests afterwards.
+        match self.request(|| DevAction::Watch).await? {
+            Outcome::Done(DevResponse::Watch(watched)) => self.install_watch(watched)?,
+            Outcome::Done(_) => return Err(unexpected_response()),
+            Outcome::Failed(messages) => return Err(could_not_start(messages)),
+            // Nothing is watched yet, so only the end of the session interrupts this.
+            Outcome::Interrupted => {}
+        }
         loop {
+            if let Some(exit) = self.link.exit.take() {
+                return Ok(exit);
+            }
+            if let Some(request) = self.link.requests.pop_front() {
+                self.on_request(request).await?;
+                continue;
+            }
             if !self.queued.is_empty() {
                 // Files changed during the last build.
                 let paths = std::mem::take(&mut self.queued);
@@ -632,20 +883,27 @@ impl<'a> Session<'a> {
                     let paths = self.debounce(paths).await;
                     self.on_changes(paths).await?;
                 }
-                line = self.server.stdout.next_line() => {
-                    match line {
-                        Ok(Some(line)) => self.on_server_line(line).await?,
-                        // The server closed its stdout; wait for it to exit.
-                        Ok(None) | Err(_) => {
-                            let status = self.server.child.wait().await?;
-                            return server_exit(status);
-                        }
-                    }
+                Some(event) = self.server_rx.recv() => {
+                    self.link.on_event(event, &self.server_info.outputs, &self.pending)?;
                 }
-                status = self.server.child.wait() => {
-                    return server_exit(status?);
+                status = server_exited(&mut self.link.server) => {
+                    self.link.on_exit(status).await?;
+                }
+                () = self.interrupts.recv() => {
+                    self.link.exit = Some(ExitResult::signal_interrupt());
                 }
             }
+        }
+    }
+
+    /// Stop the server before `buck2 dev` exits. Another Ctrl-C kills it at once.
+    async fn shutdown(&mut self) {
+        let Some(mut server) = self.link.server.take() else {
+            return;
+        };
+        tokio::select! {
+            () = server.stop() => {}
+            () = self.interrupts.recv() => server.process.kill().await,
         }
     }
 
@@ -669,48 +927,28 @@ impl<'a> Session<'a> {
         }
     }
 
-    async fn on_server_line(&mut self, line: String) -> buck2_error::Result<()> {
-        #[derive(serde::Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum Request {
-            Build { outputs: Vec<String> },
-            Restart,
-        }
-        match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Build { outputs }) => {
+    async fn on_request(&mut self, request: Request) -> buck2_error::Result<()> {
+        match request {
+            Request::Build { outputs } => {
                 if self.resolve_due {
                     self.reresolve().await?;
                 }
                 self.build(outputs, Vec::new()).await?;
-                self.reset_pending().await?;
+                self.reset_pending();
             }
-            Ok(Request::Restart) => {
+            Request::Restart => {
                 self.restart().await?;
-                self.reset_pending().await?;
+                self.reset_pending();
             }
-            Err(e) => {
-                // A JSON object with a `type` is meant as a request: say what is wrong with it,
-                // rather than print it as output.
-                let is_request = serde_json::from_str::<serde_json::Value>(&line)
-                    .ok()
-                    .is_some_and(|v| v.get("type").is_some_and(|t| t.is_string()));
-                if is_request {
-                    buck2_client_ctx::eprintln!(
-                        "`buck2 dev` ignored a request from the server: {}: {}",
-                        e,
-                        line
-                    )?;
-                } else {
-                    buck2_client_ctx::println!("{}", line)?;
-                }
-            }
+            // Answered as soon as it arrives.
+            Request::Hello { .. } => {}
         }
         Ok(())
     }
 
     /// The server asked for a build or restart, so it now uses the files as they are: they are
     /// the new baseline.
-    async fn reset_pending(&mut self) -> buck2_error::Result<()> {
+    fn reset_pending(&mut self) {
         if let Ok(mut baseline) = self.baseline.lock() {
             for path in &self.pending {
                 baseline.insert(path.clone(), Baseline::Hash(hash_file(path)));
@@ -720,11 +958,9 @@ impl<'a> Session<'a> {
         self.held_graph_paths.clear();
         if !self.pending.is_empty() {
             self.pending.clear();
-            self.server
-                .send(json!({"type": "stale", "files": Vec::<String>::new()}))
-                .await?;
+            self.link
+                .send(json!({"type": "stale", "files": Vec::<String>::new()}));
         }
-        Ok(())
     }
 
     async fn on_changes(&mut self, paths: BTreeSet<PathBuf>) -> buck2_error::Result<()> {
@@ -783,9 +1019,8 @@ impl<'a> Session<'a> {
             }
         }
         if self.pending != before {
-            self.server
-                .send(json!({"type": "stale", "files": self.pending}))
-                .await?;
+            self.link
+                .send(json!({"type": "stale", "files": self.pending}));
         }
 
         // A changed `.bzl` file may change any target, so it counts as a change to every set
@@ -847,6 +1082,13 @@ impl<'a> Session<'a> {
             outputs.extend(set.build.iter().cloned());
             restart |= set.restart;
         }
+        if self.link.server.is_none()
+            && (restart || !outputs.is_empty() || !self.cancelled_outputs.is_empty())
+        {
+            // The server exited. Start it again, built from the files as they are now. It asks
+            // for the outputs it needs.
+            return self.restart().await;
+        }
         if !outputs.is_empty() || !self.cancelled_outputs.is_empty() {
             self.build(outputs.into_iter().collect(), files).await?;
         }
@@ -856,16 +1098,25 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Send a request to the daemon, and read file events while it runs. If a file changes that
-    /// makes the request out of date, cancel it: dropping the request cancels it in the daemon,
-    /// and the next request, which sees different files, preempts it if it has not stopped yet.
+    /// Send a request to the daemon, and read file events and the server while it runs. If a file
+    /// changes that makes the request out of date, cancel it: dropping the request cancels it in
+    /// the daemon, and the next request, which sees different files, preempts it if it has not
+    /// stopped yet. The session ending cancels it too.
     async fn request(&mut self, action: impl Fn() -> DevAction) -> buck2_error::Result<Outcome> {
+        if self.link.exit.is_some() {
+            return Ok(Outcome::Interrupted);
+        }
         let Session {
             daemon,
             events_rx,
             watched,
             last_seen,
             queued,
+            server_info,
+            server_rx,
+            link,
+            pending,
+            interrupts: signals,
             ..
         } = &mut *self;
         let request = daemon.request(action);
@@ -877,6 +1128,21 @@ impl<'a> Session<'a> {
                         Ok(response) => Outcome::Done(response),
                         Err(Failed(messages)) => Outcome::Failed(messages),
                     });
+                }
+                // The server is not kept waiting while the daemon works. Its requests are handled
+                // after this one.
+                Some(event) = server_rx.recv() => {
+                    link.on_event(event, &server_info.outputs, pending)?;
+                }
+                status = server_exited(&mut link.server) => {
+                    link.on_exit(status).await?;
+                    if link.exit.is_some() {
+                        return Ok(Outcome::Interrupted);
+                    }
+                }
+                () = signals.recv() => {
+                    link.exit = Some(ExitResult::signal_interrupt());
+                    return Ok(Outcome::Interrupted);
                 }
                 event = events_rx.recv() => {
                     let Some(event) = event else { continue };
@@ -908,14 +1174,12 @@ impl<'a> Session<'a> {
         files.append(&mut self.cancelled_files);
         self.generation += 1;
         let generation = self.generation;
-        self.server
-            .send(json!({
-                "type": "building",
-                "gen": generation,
-                "outputs": outputs,
-                "files": files,
-            }))
-            .await?;
+        self.link.send(json!({
+            "type": "building",
+            "gen": generation,
+            "outputs": outputs,
+            "files": files,
+        }));
 
         let outcome = self
             .request(|| DevAction::Build {
@@ -938,26 +1202,22 @@ impl<'a> Session<'a> {
                         }),
                     );
                 }
-                self.server
-                    .send(json!({"type": "built", "gen": generation, "outputs": message}))
-                    .await?;
+                self.link
+                    .send(json!({"type": "built", "gen": generation, "outputs": message}));
             }
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
-                self.server
-                    .send(json!({
-                        "type": "failed",
-                        "gen": generation,
-                        "error": messages.join("\n"),
-                    }))
-                    .await?;
+                self.link.send(json!({
+                    "type": "failed",
+                    "gen": generation,
+                    "error": messages.join("\n"),
+                }));
             }
             Outcome::Interrupted => {
                 self.cancelled_outputs.extend(outputs);
                 self.cancelled_files.extend(files);
-                self.server
-                    .send(json!({"type": "cancelled", "gen": generation}))
-                    .await?;
+                self.link
+                    .send(json!({"type": "cancelled", "gen": generation}));
             }
         }
         Ok(())
@@ -973,12 +1233,16 @@ impl<'a> Session<'a> {
             Outcome::Done(DevResponse::Server(info)) => info,
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
-                self.send_failed(messages).await?;
+                self.send_failed(messages);
                 return Ok(Resolved::Failed);
             }
             Outcome::Interrupted => return Ok(Resolved::Interrupted),
         };
-        let restart = std::mem::take(&mut self.restart_due) || info.server != self.server.argv;
+        // Start the server again if a restart is due, it exited, or it would start differently.
+        let restart = std::mem::take(&mut self.restart_due)
+            || self.link.server.as_ref().is_none_or(|server| {
+                server.argv != info.server || server.interactive != info.interactive
+            });
         self.server_info = info;
         if restart {
             self.respawn().await?;
@@ -987,7 +1251,7 @@ impl<'a> Session<'a> {
             Outcome::Done(DevResponse::Watch(watched)) => watched,
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
-                self.send_failed(messages).await?;
+                self.send_failed(messages);
                 return Ok(Resolved::Failed);
             }
             Outcome::Interrupted => return Ok(Resolved::Interrupted),
@@ -995,7 +1259,7 @@ impl<'a> Session<'a> {
         let changed = self.watched.changed_sets(&watched);
         self.install_watch(watched)?;
         if std::mem::take(&mut self.graph_dirty) {
-            self.server.send(json!({"type": "graph_changed"})).await?;
+            self.link.send(json!({"type": "graph_changed"}));
         }
         Ok(Resolved::Done(changed))
     }
@@ -1016,15 +1280,13 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    async fn send_failed(&mut self, messages: Vec<String>) -> buck2_error::Result<()> {
+    fn send_failed(&mut self, messages: Vec<String>) {
         self.generation += 1;
-        self.server
-            .send(json!({
-                "type": "failed",
-                "gen": self.generation,
-                "error": messages.join("\n"),
-            }))
-            .await
+        self.link.send(json!({
+            "type": "failed",
+            "gen": self.generation,
+            "error": messages.join("\n"),
+        }));
     }
 
     /// Rebuild the server and start it again. If that fails or is interrupted, the next analysis
@@ -1035,17 +1297,48 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Stop the server, if it is running, and start it again. If it does not start, the next
+    /// change that builds or restarts tries again.
     async fn respawn(&mut self) -> buck2_error::Result<()> {
         // Stop the old server first, so that the new one can use its resources, such as a port.
-        self.server.stop().await;
-        self.server = Server::spawn(&self.server_info)?;
-        self.digests.clear();
+        if let Some(mut server) = self.link.server.take() {
+            server.stop().await;
+        }
         // The new server asks for what it needs.
+        self.link.requests.clear();
+        self.digests.clear();
         self.cancelled_outputs.clear();
         self.cancelled_files.clear();
-        self.server
-            .send(json!({"type": "ready", "outputs": self.server_info.outputs}))
-            .await?;
+        if let Err(e) = self.spawn().await {
+            buck2_client_ctx::eprintln!(
+                "{:#}\n`buck2 dev` starts the server again after the next change.",
+                e
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Start the server. It gets `ready` once it connects and sends `hello`.
+    async fn spawn(&mut self) -> buck2_error::Result<()> {
+        // The server writes to the terminal too. The superconsole, which redraws the lines at
+        // the bottom of the terminal, would draw over its output, so from now on `buck2 dev`
+        // uses the simple console. Ending the first daemon command has usually done this already.
+        self.daemon.events_ctx.erase_interactive_output().await?;
+        let first_conn = self.listener.next_conn();
+        let process = ServerProcess::spawn(
+            &self.server_info.server,
+            &self.server_info.project_root,
+            self.server_info.interactive,
+            self.listener.address(),
+        )?;
+        self.link.server = Some(Server {
+            process,
+            argv: self.server_info.server.clone(),
+            interactive: self.server_info.interactive,
+            unintroduced: BuckMutMap::default(),
+            conn: None,
+            first_conn,
+        });
         Ok(())
     }
 }
@@ -1076,14 +1369,4 @@ fn interrupts(
     path: &Path,
 ) -> bool {
     !watched.waits(path) && last_seen.get(path) != Some(&hash_file(path))
-}
-
-fn server_exit(status: std::process::ExitStatus) -> buck2_error::Result<ExitResult> {
-    if status.success() {
-        Ok(ExitResult::success())
-    } else {
-        Ok(ExitResult::bail(format!(
-            "The `buck2 dev` server exited with {status}"
-        )))
-    }
 }

@@ -15,6 +15,8 @@ A rule makes its targets work with `buck2 dev` by returning the
 - `outputs`: the artifacts that `buck2 dev` can build, by name.
 - `watch`: a list of [`DevWatch`](../../api/build/DevWatch) values. They say
   what to do when a source file changes.
+- `interactive`: whether the server gets the terminal. See
+  [The terminal](#the-terminal).
 
 When it starts, `buck2 dev` builds the server and starts it. Then it finds the
 files to watch, which builds what a `DevWatch` with `inputs` needs (see
@@ -51,7 +53,8 @@ site = rule(
 With this rule, `buck2 dev //:site` starts `python3 server.py`. When
 `server.py` changes, it starts the server again. When any other source file in
 the dependency graph of `//:site` changes, it builds `www` again and tells the
-server where it is.
+server where it is, if the server has connected to `buck2 dev` (see
+[The server protocol](#the-server-protocol)).
 
 [`examples/dev_web_server`](https://github.com/facebook/buck2/tree/main/examples/dev_web_server)
 has a complete web server that serves the newest build.
@@ -145,33 +148,83 @@ changes. The changes wait until one of these happens:
 
 ## The server protocol
 
-`buck2 dev` starts the server in the project root. It writes messages to the
-server's stdin, one JSON object per line. The server can write requests to its
-stdout, one JSON object per line. `buck2 dev` prints other lines that the
-server writes to stdout, and reports a JSON object with a `type` that is not a
-valid request. The server's stderr goes to the terminal.
+`buck2 dev` starts the server in the project root, with the environment
+variable `BUCK2_DEV_SOCKET` set to the path of a Unix socket. Python connects
+with `socket.AF_UNIX`, and Node with `net.connect(path)`.
 
-To stop the server, before a restart, `buck2 dev` closes the server's stdin and
-waits up to 5 seconds for it to exit, then kills it. A server that starts
-processes of its own should stop them when its stdin closes. When `buck2 dev`
-itself exits, for example on Ctrl-C, it closes the server's stdin and sends it
-`SIGTERM`.
+The server does not have to connect. A server that never connects is only
+started, and started again when a `restart` set changes or the server exits
+with an error. `buck2 dev` still builds what `build` sets name, but has no one
+to tell.
+
+A server that connects sends `{"type": "hello", "version": 1}`. `buck2 dev`
+answers with `ready`, and from then on writes messages to the connection and
+reads requests from it, one JSON object per line. Because the address is in the
+environment, a process that the server starts, such as the real program behind
+a wrapper script, can connect instead of the server. If a second connection
+sends `hello`, it takes over from the first.
+
+`buck2 dev` may add new message types and new fields. A server must ignore
+messages whose `type` it does not know, and fields it does not know.
+`buck2 dev` reports a line that is not a valid request, and ignores it.
+
+The server's stdout and stderr go to the terminal.
+
+### Stopping the server
+
+The server runs in a process group of its own, so that stopping it stops the
+processes it started too. To stop the
+server, before a restart and when `buck2 dev` exits:
+
+1. If the server is connected, `buck2 dev` sends it `shutdown`, and waits up to
+   5 seconds for it to exit.
+2. If the server, or any process in its group, is still running, `buck2 dev`
+   sends the group `SIGTERM`, and waits up to 5 seconds.
+3. It kills what is left.
+
+`buck2 dev` waits for this before it starts the server again, so that the new
+server can use the old one's resources, such as a port, and before it exits. A
+second Ctrl-C while `buck2 dev` waits to exit kills the server at once.
+
+If the server exits with an error, or fails to start again, `buck2 dev` prints
+that, and keeps watching. The next change that builds or restarts starts the
+server again, built from the files as they are then. `buck2 dev` ends when the
+server exits successfully, or on Ctrl-C, `SIGTERM` or `SIGHUP`.
+
+### The terminal
+
+By default the server stays in the background. Its stdin is empty, and Ctrl-C
+reaches only `buck2 dev`, which stops the server and exits.
+
+With `DevInfo(interactive = True)`, the server inherits stdin. When stdin is a
+terminal, the server's process group becomes the terminal's foreground group,
+so it gets the keys typed and Ctrl-C. Use this for a server with keyboard
+shortcuts, a REPL, or a debugger. If Ctrl-C kills the server, `buck2 dev`
+exits. `buck2 dev` takes the terminal back, and restores its settings, whenever
+the server stops.
+
+Either way the server's output shares the terminal with `buck2 dev`, so once
+the server has started, `buck2 dev` shows its builds with the simple console,
+not the superconsole.
 
 ### Messages to the server
 
 | `type`          | Fields                                                    | Sent when                                                                                                    |
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ready`         | `outputs`: the names in `DevInfo.outputs`                 | The server has started, at the start and after each restart.                                                 |
+| `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`   | The server sent `hello`.                                                                                     |
 | `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`       | A build succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. |
 | `failed`        | `gen`, `error`                                            | A build, or the analysis of the target, failed. The errors are also on the terminal.                         |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so `buck2 dev` stopped it. The next build builds its outputs too.   |
 | `stale`         | `files`: the changed files of `notify` sets               | That list changes. An empty list means that nothing waits.                                                   |
 | `graph_changed` |                                                           | A build file or a `.bzl` file changed, or a package got a new file, and `buck2 dev` analysed the target again. |
+| `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
 `gen` is a number that increases with each build. `building` and `built` for
 the same build have the same `gen`. A
-`building` is followed by one of `built`, `failed` and `cancelled`.
+`building` is followed by one of `built`, `failed` and `cancelled`. Messages
+are sent only to a server that has sent `hello`. If a file of a `notify` set
+differs when the server sends `hello`, `ready` is followed by `stale`.
 
 `buck2 dev` reads file events while it builds. When a file changes that makes
 the build out of date, and whose change does not wait (see
@@ -185,11 +238,16 @@ server asks for.
 
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
+| `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`. Send it before anything else.            |
 | `build`   | `outputs`: a list of names | Build these outputs now, with all changes, including those that wait. Clears `stale`.          |
 | `restart` |                           | Build the server again and restart it. Clears `stale`. If the build fails, or a file change interrupts it, the old server keeps running until the next analysis restarts it. |
 
-A typical server sends `{"type": "build", "outputs": [...]}` when it gets
-`ready`, and uses each `built` message.
+`buck2 dev` reads the connection all the time, also while it builds, so a
+server never waits for it to read. Requests that arrive during a build are
+handled after it.
+
+A typical server sends `hello`, then `{"type": "build", "outputs": [...]}` when
+it gets `ready`, and uses each `built` message.
 
 ## Other buck2 commands
 
@@ -213,3 +271,4 @@ repeats the request.
   the target again. That happens after a change to a build file or to a `.bzl`
   file, or when a file is added to a directory that is already watched.
 - Changes to `.buckconfig` files are not watched. The next build uses them.
+- `buck2 dev` runs only on Unix so far.
