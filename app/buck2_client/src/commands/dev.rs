@@ -481,6 +481,9 @@ struct Server {
     conn: Option<(u64, Connection)>,
     /// Connections numbered below this were made to an earlier server.
     first_conn: u64,
+    /// The build whose `building` the connection got, and whose result it has not. A connection
+    /// gets the result of a build only if it got its `building`.
+    announced: Option<u64>,
     console: Console,
 }
 
@@ -550,6 +553,28 @@ impl ServerLink {
         }
     }
 
+    /// Send `building` for build `generation`, to a server that is connected now.
+    fn send_building(&mut self, generation: u64, message: serde_json::Value) {
+        if let Some(server) = &mut self.server {
+            if server.conn.is_some() {
+                server.send(message);
+                server.announced = server.conn.is_some().then_some(generation);
+            }
+        }
+    }
+
+    /// Send the result of build `generation`: `built`, `failed` or `cancelled`. Only a
+    /// connection that got the build's `building` gets it, so that a server that connected
+    /// during a build is not told about a build it did not hear start.
+    fn send_result(&mut self, generation: u64, message: serde_json::Value) {
+        if let Some(server) = &mut self.server {
+            if server.announced == Some(generation) {
+                server.announced = None;
+                server.send(message);
+            }
+        }
+    }
+
     /// Handle what happened on the socket. `hello` is answered at once; requests wait in
     /// `requests`.
     fn on_event(
@@ -604,6 +629,7 @@ impl ServerLink {
                         // wrapper that connected first, takes over from the first.
                         if let Some(connection) = server.unintroduced.remove(&conn) {
                             server.conn = Some((conn, connection));
+                            server.announced = None;
                         }
                         server.send(json!({
                             "type": "ready",
@@ -826,6 +852,9 @@ struct Session<'a> {
     watch_failed: bool,
     /// The errors of the last `Watch` that failed, to send them only once.
     watch_failure: Option<Vec<String>>,
+    /// Paths that changed before the running server was built and started. Their changes do
+    /// not restart it.
+    started_after: BTreeSet<String>,
     /// Changed paths that `buck2 dev` read during a request. They are handled next.
     queued: BTreeSet<String>,
     /// The outputs and files of a build that the daemon stopped because a file that it builds
@@ -915,6 +944,7 @@ impl<'a> Session<'a> {
             restart_due: false,
             watch_failed: false,
             watch_failure: None,
+            started_after: BTreeSet::new(),
             queued: BTreeSet::new(),
             cancelled_outputs: BTreeSet::new(),
             cancelled_files: BTreeSet::new(),
@@ -1058,17 +1088,23 @@ impl<'a> Session<'a> {
                         // The analysis that the build needs failed: that is how the build went.
                         self.generation += 1;
                         let generation = self.generation;
-                        self.link.send(json!({
-                            "type": "building",
-                            "gen": generation,
-                            "outputs": outputs,
-                            "files": Vec::<String>::new(),
-                        }));
-                        self.link.send(json!({
-                            "type": "failed",
-                            "gen": generation,
-                            "error": messages.join("\n"),
-                        }));
+                        self.link.send_building(
+                            generation,
+                            json!({
+                                "type": "building",
+                                "gen": generation,
+                                "outputs": outputs,
+                                "files": Vec::<String>::new(),
+                            }),
+                        );
+                        self.link.send_result(
+                            generation,
+                            json!({
+                                "type": "failed",
+                                "gen": generation,
+                                "error": messages.join("\n"),
+                            }),
+                        );
                         self.last_build = Some(("failed", Duration::ZERO));
                         return Ok(());
                     }
@@ -1218,6 +1254,15 @@ impl<'a> Session<'a> {
             .filter(|path| path.set.is_some_and(|set| sets.contains(&set)))
             .map(|path| self.absolute(&path.path))
             .collect();
+        // The server was built and started after these changes: they do not restart it again.
+        let started_after = std::mem::take(&mut self.started_after);
+        let restart_is_news = missed
+            || graph_changed
+            || watched.paths.iter().any(|path| {
+                path.set.is_some_and(|set| {
+                    sets.contains(&set) && watched.watch.get(set).is_some_and(|set| set.restart)
+                }) && !started_after.contains(&path.path)
+            });
         self.missed = false;
         self.unacted.clear();
         self.watched.state = Some(watched.state.clone());
@@ -1233,7 +1278,7 @@ impl<'a> Session<'a> {
                 self.send_failed(messages);
             }
         }
-        self.apply(sets, files, &resolved).await
+        self.apply(sets, files, &resolved, restart_is_news).await
     }
 
     /// Tell the server about the files whose changes wait, if they are not what it was last
@@ -1280,6 +1325,7 @@ impl<'a> Session<'a> {
         sets: BTreeSet<usize>,
         files: Vec<String>,
         resolved: &Resolved,
+        restart_is_news: bool,
     ) -> buck2_error::Result<()> {
         let mut outputs = BTreeSet::new();
         let mut restart = false;
@@ -1290,6 +1336,7 @@ impl<'a> Session<'a> {
             outputs.extend(set.build.iter().cloned());
             restart |= set.restart;
         }
+        let restart = restart && (restart_is_news || self.link.server.is_none());
         let cancelled = !self.cancelled_outputs.is_empty();
         if resolved.respawned {
             // The analysis of this change already started the server again, built from the
@@ -1395,12 +1442,15 @@ impl<'a> Session<'a> {
         let files: Vec<String> = files.into_iter().collect();
         self.generation += 1;
         let generation = self.generation;
-        self.link.send(json!({
-            "type": "building",
-            "gen": generation,
-            "outputs": outputs,
-            "files": files,
-        }));
+        self.link.send_building(
+            generation,
+            json!({
+                "type": "building",
+                "gen": generation,
+                "outputs": outputs,
+                "files": files,
+            }),
+        );
 
         let started = Instant::now();
         let outcome = self
@@ -1424,15 +1474,17 @@ impl<'a> Session<'a> {
                         }),
                     );
                 }
-                self.link
-                    .send(json!({"type": "built", "gen": generation, "outputs": message}));
+                self.link.send_result(
+                    generation,
+                    json!({"type": "built", "gen": generation, "outputs": message}),
+                );
                 self.last_build = Some(("succeeded", started.elapsed()));
             }
             Outcome::Done(DevResponse::Interrupted(interrupted)) => {
                 self.cancelled_outputs.extend(outputs);
                 self.cancelled_files.extend(files);
                 self.link
-                    .send(json!({"type": "cancelled", "gen": generation}));
+                    .send_result(generation, json!({"type": "cancelled", "gen": generation}));
                 // `buck2 dev` has these changes from the file watcher too, but asks about them in
                 // any case.
                 self.queued.extend(interrupted.paths);
@@ -1441,11 +1493,14 @@ impl<'a> Session<'a> {
             }
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
-                self.link.send(json!({
-                    "type": "failed",
-                    "gen": generation,
-                    "error": messages.join("\n"),
-                }));
+                self.link.send_result(
+                    generation,
+                    json!({
+                        "type": "failed",
+                        "gen": generation,
+                        "error": messages.join("\n"),
+                    }),
+                );
                 self.last_build = Some(("failed", started.elapsed()));
                 return Ok(false);
             }
@@ -1520,6 +1575,37 @@ impl<'a> Session<'a> {
                 return Ok(());
             }
         }
+        // Files that changed while the old server stopped, or while its replacement was built:
+        // build the replacement from them, so that they need not restart it again.
+        let mut changed = std::mem::take(&mut self.queued);
+        while let Ok(change) =
+            tokio::time::timeout(Duration::from_millis(20), self.changes.next()).await
+        {
+            if collect_paths(change, &mut changed) {
+                self.missed = true;
+                self.missed_queued = true;
+            }
+        }
+        if !changed.is_empty() {
+            match self.request(|| DevAction::Server).await? {
+                Outcome::Done(DevResponse::Server(info)) => {
+                    self.server_info = info;
+                    self.started_after = changed.clone();
+                }
+                Outcome::Done(_) => return Err(unexpected_response()),
+                Outcome::Failed(messages) => {
+                    // No server runs; the next analysis starts it.
+                    self.graph_dirty = true;
+                    self.resolve_due = true;
+                    self.restart_due = true;
+                    self.queued.extend(changed);
+                    self.send_failed(messages);
+                    return Ok(());
+                }
+                Outcome::Interrupted => return Ok(()),
+            }
+            self.queued.extend(changed);
+        }
         // The new server asks for what it needs.
         self.link.requests.clear();
         self.digests.clear();
@@ -1563,6 +1649,7 @@ impl<'a> Session<'a> {
             unintroduced: BuckMutMap::default(),
             conn: None,
             first_conn,
+            announced: None,
             console: self.link.console.clone(),
         });
         Ok(())

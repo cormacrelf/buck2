@@ -214,6 +214,8 @@ server, before a restart and when `buck2 dev` exits:
 
 `buck2 dev` waits for this before it starts the server again, so that the new
 server can use the old one's resources, such as a port, and before it exits.
+If files change while it waits, it builds the new server again from them before
+it starts it, and those changes do not restart the new server.
 Ctrl-C while it waits kills the server at once.
 
 When the server exits, or fails to start again, `buck2 dev` prints that, and
@@ -274,7 +276,10 @@ console, and prints only errors and that the server exited or restarts.
 `gen` is a number that increases with each build. `building` and `built` for
 the same build have the same `gen`. A
 `building` is followed by one of `built`, `failed` and `cancelled`, unless
-`buck2 dev` exits first.
+`buck2 dev` exits first. A server gets `built`, `failed` or `cancelled` for a
+build only if it got that build's `building`: a server that connects while a
+build runs hears nothing of that build, and asks for what it needs after
+`ready`. A `failed` without a `building` is about the analysis of the target.
 Messages
 are sent only to a server that has sent `hello`. If a file of a `notify` set
 differs when the server sends `hello`, `ready` is followed by `stale`.
