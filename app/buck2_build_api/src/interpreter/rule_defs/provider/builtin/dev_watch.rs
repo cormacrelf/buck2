@@ -43,9 +43,7 @@ use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 enum DevWatchError {
     #[error("A `DevWatch` with `notify = True` cannot also set `build` or `restart`")]
     NotifyWithBuild,
-    #[error(
-        "`DevWatch.targets` must contain target patterns (strings) or target labels, but got `{0}`"
-    )]
+    #[error("Expected target patterns (strings) or target labels, but got `{0}`")]
     BadTarget(String),
 }
 
@@ -93,7 +91,7 @@ pub struct DevWatch<'v> {
     notify: ValueOfUnchecked<'v, bool>,
 }
 
-fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
+pub(crate) fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
     if let Some(s) = value.unpack_str() {
         return Ok(s.to_owned());
     }

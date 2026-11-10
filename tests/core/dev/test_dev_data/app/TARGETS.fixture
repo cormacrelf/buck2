@@ -262,3 +262,41 @@ dev_app(
     server = "server.py",
     watch_delay = "watch_delay.txt",
 )
+
+dev_app(
+    name = "outputs",
+    mode = "outputs",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    extra_outputs = {"extra": ["extra.txt"]},
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)
+
+dev_app(
+    name = "only",
+    mode = "only",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)
+
+dev_app(
+    name = "only_pages",
+    mode = "only",
+    srcs = glob(["pages/*.txt"]),
+    deps = ["//lib:lib"],
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)
+
+dev_app(
+    name = "only_slow",
+    mode = "only",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    delay = "delay.txt",
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)

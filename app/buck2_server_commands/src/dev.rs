@@ -20,6 +20,12 @@
 //! The client runs the server, and acts on the file changes that the daemon's file watcher pushes
 //! to it through a subscription, so no daemon command lasts longer than one build.
 //!
+//! A `DevInfo` says what a change is for in one of two ways, a `Policy`. With `watch`, each
+//! file belongs to the first watch set that claims it. Without it, the outputs carry the
+//! policy (the `only` proposal of `dev_review.md`, a prototype): the server and each output
+//! claim the files that they may be built from, and a file may belong to several of them.
+//! Either way, what claims files is a list of `Slot`s, and a set of slots is a bit mask.
+//!
 //! What the watch sets claim is a DICE key, `DevClaimsKey`. Finding it walks the targets of the
 //! graph, and the actions of the targets that own `DevWatch.inputs`, which builds what dynamic
 //! actions of those targets need to say what they do. It reads the contents of no source file,
@@ -59,6 +65,7 @@ use buck2_cli_proto::new_generic::DevAction;
 use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
 use buck2_cli_proto::new_generic::DevInterrupted;
+use buck2_cli_proto::new_generic::DevOutputChanges;
 use buck2_cli_proto::new_generic::DevPath;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
@@ -146,6 +153,103 @@ enum DevError {
     },
     #[error("Output `{0}` of the `DevInfo` produced no artifact")]
     EmptyOutput(String),
+    #[error("`buck2 dev` takes at most {MAX_SLOTS} {0}, but the `DevInfo` has {1}")]
+    TooManySlots(&'static str, usize),
+}
+
+/// How many slots a `DevInfo` may have: a set of slots is the bits of a `u64`.
+const MAX_SLOTS: usize = 64;
+
+/// Something that claims source files.
+struct Slot {
+    /// What it is, for messages.
+    what: String,
+    /// Target patterns whose own source files the slot claims. `None` means every target of
+    /// the graph.
+    targets: Option<Vec<String>>,
+    /// Artifacts. The slot claims the targets that they are built from, with their source
+    /// files.
+    inputs: Vec<ArtifactGroup>,
+    /// For an output with `only`: the target patterns. A change to a file that the slot claims
+    /// holds the output back, unless it is an own source file of one of these targets.
+    only: Option<Vec<String>>,
+    /// A change to a file of the slot waits: a `notify` watch set.
+    waits: bool,
+}
+
+/// How a `DevInfo` says what a change is for.
+enum Policy {
+    /// `DevInfo.watch`. Each watch set is a slot, and a file belongs to the first slot that
+    /// claims it.
+    Watch(Vec<DevWatchSpec>),
+    /// No `DevInfo.watch`: the outputs carry the policy. Slot 0 is the server, and slot
+    /// `i + 1` is the output with the `i`th of these names. A file belongs to every slot that
+    /// claims it.
+    Outputs(Vec<String>),
+}
+
+impl Policy {
+    fn exclusive(&self) -> bool {
+        matches!(self, Policy::Watch(_))
+    }
+}
+
+/// The slot of the server, for a `Policy::Outputs`.
+const SERVER_SLOT: u64 = 1;
+
+fn slot_bit(slot: usize) -> u64 {
+    1 << slot
+}
+
+/// The lowest slot of `mask`, which must have one.
+fn first_slot(mask: u64) -> usize {
+    mask.trailing_zeros() as usize
+}
+
+fn dev_policy(info: &DevInfo<'_>) -> buck2_error::Result<(Policy, Vec<Slot>)> {
+    if let Some(watch) = info.watch()? {
+        if watch.len() > MAX_SLOTS {
+            return Err(DevError::TooManySlots("watch sets", watch.len()).into());
+        }
+        let slots = watch
+            .iter()
+            .enumerate()
+            .map(|(set, spec)| Slot {
+                what: format!("`DevInfo.watch[{set}].inputs`"),
+                targets: spec.targets.clone(),
+                inputs: spec.inputs.clone(),
+                only: None,
+                waits: spec.notify,
+            })
+            .collect();
+        return Ok((Policy::Watch(watch), slots));
+    }
+    let outputs = info.outputs()?;
+    if outputs.len() + 1 > MAX_SLOTS {
+        return Err(DevError::TooManySlots("outputs and the server", outputs.len() + 1).into());
+    }
+    let only = info.only();
+    let mut visitor = SimpleCommandLineArtifactVisitor::new();
+    info.server_command_line().visit_artifacts(&mut visitor)?;
+    let mut slots = vec![Slot {
+        what: "`DevInfo.server`".to_owned(),
+        targets: Some(Vec::new()),
+        inputs: visitor.inputs.into_iter().collect(),
+        only: None,
+        waits: false,
+    }];
+    let mut names = Vec::new();
+    for (name, artifact) in outputs.iter() {
+        slots.push(Slot {
+            what: format!("Output `{name}`"),
+            targets: Some(Vec::new()),
+            inputs: vec![ArtifactGroup::Artifact(artifact.dupe())],
+            only: only.get(name).cloned(),
+            waits: false,
+        });
+        names.push(name.clone());
+    }
+    Ok((Policy::Outputs(names), slots))
 }
 
 pub(crate) async fn dev_command(
@@ -295,9 +399,17 @@ async fn dev(
             }))
         }
         DevAction::Watch(request) => {
-            let watch = info.as_ref().value().as_ref().watch()?;
+            let (policy, slots) = dev_policy(info.as_ref().value().as_ref())?;
             Ok(DevResponse::Watch(
-                watch_files(&mut ctx.ctx(), &label, &watch, request, &req.session).await?,
+                watch_files(
+                    &mut ctx.ctx(),
+                    &label,
+                    &policy,
+                    &slots,
+                    request,
+                    &req.session,
+                )
+                .await?,
             ))
         }
         DevAction::Build { outputs: names } => {
@@ -314,7 +426,21 @@ async fn dev(
                     build(server_ctx.project_root(), &mut ctx.ctx(), wanted).await?,
                 ));
             };
-            let watch = info.as_ref().value().as_ref().watch()?;
+            // The slots that this build is built from. A change to a file of one of them stops
+            // it.
+            let (policy, _) = dev_policy(info.as_ref().value().as_ref())?;
+            let builds = match &policy {
+                Policy::Watch(watch) => watch
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, spec)| !spec.build.is_empty() || spec.restart)
+                    .fold(0, |mask, (set, _)| mask | slot_bit(set)),
+                Policy::Outputs(all) => all
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| names.contains(name))
+                    .fold(0, |mask, (output, _)| mask | slot_bit(output + 1)),
+            };
             let claims = dev_claims(&mut ctx.ctx(), &label).await?;
             let io = ctx
                 .ctx()
@@ -327,7 +453,6 @@ async fn dev(
             let (built_tx, built_rx) = oneshot::channel::<()>();
             let (changed_tx, changed_rx) = oneshot::channel::<()>();
             let project_root = server_ctx.project_root();
-            let watch = &watch;
             let claims = &claims;
             let mut dice = ctx.ctx();
             let (built, interrupted) = dice
@@ -344,7 +469,7 @@ async fn dev(
                     },
                     async move |dice| {
                         tokio::select! {
-                            interrupted = changed_files(dice, changes, claims, watch, io) => {
+                            interrupted = changed_files(dice, changes, claims, builds, io) => {
                                 let _ignored = changed_tx.send(());
                                 Some(interrupted)
                             }
@@ -396,7 +521,7 @@ async fn changed_files(
     dice: &mut DiceComputations<'_>,
     mut changes: BoxStream<'static, FileChangeBatch>,
     claims: &DevClaims,
-    watch: &[DevWatchSpec],
+    builds: u64,
     io: Arc<dyn IoProvider>,
 ) -> DevInterrupted {
     while let Some(batch) = changes.next().await {
@@ -412,7 +537,7 @@ async fn changed_files(
                 continue;
             }
             // A path that cannot be looked at counts as changed.
-            if builds_from_changed(dice, claims, watch, &io, &path)
+            if builds_from_changed(dice, claims, builds, &io, &path)
                 .await
                 .unwrap_or(true)
             {
@@ -430,17 +555,20 @@ async fn changed_files(
     futures::future::pending().await
 }
 
-/// Whether the build is built from `path`, and the file differs from what this command saw.
+/// Whether the build, of the slots `builds`, is built from `path`, and the file differs from
+/// what this command saw.
 async fn builds_from_changed(
     dice: &mut DiceComputations<'_>,
     claims: &DevClaims,
-    watch: &[DevWatchSpec],
+    builds: u64,
     io: &Arc<dyn IoProvider>,
     path: &ProjectRelativePath,
 ) -> buck2_error::Result<bool> {
     let cell_resolver = dice.get_cell_resolver().await?;
     let relevant = match claims.classify(dice, cell_resolver, path).await? {
-        Claimed::Source(set) => !watch[set].build.is_empty() || watch[set].restart,
+        // With `only`, a change that holds an output back stops a build of it too: the build
+        // would use the change.
+        Claimed::Source { may, .. } => claims.slots_of(may) & builds != 0,
         Claimed::BuildFile { waits } => !waits,
         Claimed::Bzl => !claims.notify_sets,
         Claimed::Nothing => false,
@@ -607,17 +735,24 @@ impl Timer {
 /// `inputs` are looked at, so that a target that builds an input and other things does not give
 /// the set the source files of the other things.
 struct GraphClaims {
+    /// Whether a file belongs to the first slot that claims it, and not to every one.
+    exclusive: bool,
     /// The targets of the graph.
     nodes: Vec<ConfiguredTargetNode>,
-    /// The source files that a set claims by name: those that the actions of the targets that
-    /// own its `inputs` use, and those that claimed symlinks point at.
-    files: BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)>,
-    /// The set of each target of the graph that a set has.
-    targets: BuckMutMap<ConfiguredTargetLabel, usize>,
-    /// The set that claims the own source files of each target.
-    with_own_files: BuckMutMap<ConfiguredTargetLabel, usize>,
-    /// The targets of each set.
-    set_targets: Vec<Vec<ConfiguredTargetNode>>,
+    /// The source files that slots claim by name: those that the actions of the targets that
+    /// own their `inputs` use, and those that claimed symlinks point at.
+    files: BuckMutMap<ProjectRelativePathBuf, (u64, CellPath)>,
+    /// The slots that claim the own source files of each target.
+    with_own_files: BuckMutMap<ConfiguredTargetLabel, u64>,
+    /// The slots whose `only` names each target.
+    only: BuckMutMap<ConfiguredTargetLabel, u64>,
+    /// The targets whose digests say whether the targets of the slots changed, in groups.
+    /// When exclusive, group `i` has the targets of slot `i`. Otherwise group `2 * i` has the
+    /// targets of slot `i` that its `only` names, or all of them if it has none, and group
+    /// `2 * i + 1` has the others.
+    groups: Vec<Vec<ConfiguredTargetNode>>,
+    /// How many targets a slot has.
+    claimed_targets: usize,
     /// The directory of each package of the graph.
     package_dirs: BTreeSet<ProjectRelativePathBuf>,
     /// Each build file of the graph, with whether a change to it waits.
@@ -630,12 +765,12 @@ struct GraphClaims {
 }
 
 impl GraphClaims {
-    /// The set that claims the source file `path` of a target whose own source files `own`
-    /// claims: the lower of that set and the one that claims the file by name.
-    fn set_of_own_file(&self, cell_resolver: &CellResolver, path: CellPath, own: usize) -> usize {
+    /// The slots that claim the source file `path` of a target whose own source files `own`
+    /// claim: those, and the ones that claim the file by name.
+    fn slots_of_own_file(&self, cell_resolver: &CellResolver, path: CellPath, own: u64) -> u64 {
         match project_path(cell_resolver, path) {
             Ok(Some(rel)) => match self.files.get(&rel) {
-                Some((set, _)) => own.min(*set),
+                Some((slots, _)) => own | *slots,
                 None => own,
             },
             _ => own,
@@ -643,27 +778,26 @@ impl GraphClaims {
     }
 }
 
-/// Walk the configured dependency graph of `label`. Give each target to the first watch set
-/// that claims it.
+/// Walk the configured dependency graph of `label`. Give each target to the slots that claim
+/// it.
 ///
 /// This reads the contents of no source file, so that a `DevClaims` made from it stays valid
 /// when one changes.
 async fn graph_claims(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
-    watch: &[DevWatchSpec],
+    exclusive: bool,
+    slots: &[Slot],
 ) -> buck2_error::Result<GraphClaims> {
     let mut timer = Timer::new();
     let cell_resolver = dice.get_cell_resolver().await?;
     let cell = label.target().pkg().cell_name();
     let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?;
 
-    let mut patterns: Vec<Option<Vec<ParsedPattern<TargetPatternExtra>>>> =
-        Vec::with_capacity(watch.len());
-    for spec in watch {
-        patterns.push(match &spec.targets {
-            None => None,
-            Some(targets) => Some(
+    let parse = |targets: &Option<Vec<String>>| {
+        targets
+            .as_ref()
+            .map(|targets| {
                 targets
                     .iter()
                     .map(|p| {
@@ -674,9 +808,17 @@ async fn graph_claims(
                             &cell_alias_resolver,
                         )
                     })
-                    .collect::<buck2_error::Result<Vec<_>>>()?,
-            ),
-        });
+                    .collect::<buck2_error::Result<Vec<_>>>()
+            })
+            .transpose()
+    };
+    let mut patterns: Vec<Option<Vec<ParsedPattern<TargetPatternExtra>>>> =
+        Vec::with_capacity(slots.len());
+    let mut only_patterns: Vec<Option<Vec<ParsedPattern<TargetPatternExtra>>>> =
+        Vec::with_capacity(slots.len());
+    for slot in slots {
+        patterns.push(parse(&slot.targets)?);
+        only_patterns.push(parse(&slot.only)?);
     }
 
     let root = dice
@@ -690,17 +832,19 @@ async fn graph_claims(
         .collect();
     timer.step(&format!("the {} targets of the graph", nodes.len()));
 
-    // The lowest watch set index that claims each target, and each source file that a set
-    // claims by name. A set claims the targets that its `targets` match, with their own source
-    // files. Of the targets that own its `inputs`, it claims only the source files that their
-    // actions use. What those actions take from other targets gives it those targets and their
-    // dependencies, with their own source files. The targets of a set say which sets a build
-    // file change changed.
-    let mut files: BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)> = BuckMutMap::default();
-    let mut targets: BuckMutMap<ConfiguredTargetLabel, usize> = BuckMutMap::default();
-    let mut with_own_files: BuckMutMap<ConfiguredTargetLabel, usize> = BuckMutMap::default();
+    // The slots that claim each target, and each source file that slots claim by name. A slot
+    // claims the targets that its `targets` match, with their own source files. Of the targets
+    // that own its `inputs`, it claims only the source files that their actions use. What
+    // those actions take from other targets gives it those targets and their dependencies,
+    // with their own source files. The targets of a slot say which slots a build file change
+    // changed.
+    let mut files: BuckMutMap<ProjectRelativePathBuf, (u64, CellPath)> = BuckMutMap::default();
+    let mut targets: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
+    let mut with_own_files: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
+    let mut only: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
+    let mut only_slots = 0;
     let mut incomplete = Vec::new();
-    for (set, spec) in watch.iter().enumerate() {
+    for (set, spec) in slots.iter().enumerate() {
         for node in &nodes {
             let matches = match &patterns[set] {
                 None => true,
@@ -711,12 +855,20 @@ async fn graph_claims(
                 claim(&mut with_own_files, node.label().dupe(), set);
             }
         }
+        if let Some(p) = &only_patterns[set] {
+            only_slots |= slot_bit(set);
+            for node in &nodes {
+                if p.iter().any(|p| p.matches(node.label().unconfigured())) {
+                    claim(&mut only, node.label().dupe(), set);
+                }
+            }
+        }
         if spec.inputs.is_empty() {
             continue;
         }
         let walk = walk_inputs(dice, &spec.inputs).await;
         for path in walk.sources {
-            claim_file(&mut files, cell_resolver, path, set)?;
+            claim_file(&mut files, cell_resolver, path, slot_bit(set))?;
         }
         for owner in walk.owners {
             if by_label.contains_key(&owner) {
@@ -733,7 +885,7 @@ async fn graph_claims(
             .map(|node| node.dupe())
             .collect();
         for (owner, error) in walk.failed {
-            incomplete.push(format!("`DevInfo.watch[{set}].inputs`: {error:#}"));
+            incomplete.push(format!("{}: {error:#}", spec.what));
             beyond.extend(
                 owner
                     .and_then(|owner| by_label.get(&owner))
@@ -747,16 +899,38 @@ async fn graph_claims(
     }
     timer.step("the targets of each set");
 
-    let notify_sets = watch.iter().any(|spec| spec.notify);
-    let mut set_targets: Vec<Vec<ConfiguredTargetNode>> = vec![Vec::new(); watch.len()];
+    let notify_sets = slots.iter().any(|slot| slot.waits);
+    let mut groups: Vec<Vec<ConfiguredTargetNode>> = vec![
+        Vec::new();
+        if exclusive {
+            slots.len()
+        } else {
+            2 * slots.len()
+        }
+    ];
+    let mut claimed_targets = 0;
     // Each build file, with whether a change to it waits.
     let mut build_files: BTreeMap<ProjectRelativePathBuf, (bool, CellPath)> = BTreeMap::new();
     let mut packages = BTreeSet::new();
     let mut package_dirs = BTreeSet::new();
     for node in &nodes {
-        let set = targets.get(node.label()).copied();
+        let has = targets.get(node.label()).copied().unwrap_or(0);
+        // When exclusive, the first slot that has the target.
+        let set = (exclusive && has != 0).then(|| first_slot(has));
+        if has != 0 {
+            claimed_targets += 1;
+        }
         if let Some(set) = set {
-            set_targets[set].push(node.dupe());
+            groups[set].push(node.dupe());
+        } else {
+            let named = only.get(node.label()).copied().unwrap_or(0);
+            for slot in 0..slots.len() {
+                if has & slot_bit(slot) == 0 {
+                    continue;
+                }
+                let outside = only_slots & slot_bit(slot) != 0 && named & slot_bit(slot) == 0;
+                groups[2 * slot + outside as usize].push(node.dupe());
+            }
         }
         if packages.insert(node.label().pkg()) {
             if let Some(dir) = project_path(cell_resolver, node.label().pkg().as_cell_path())? {
@@ -766,17 +940,19 @@ async fn graph_claims(
         let buildfile = node.buildfile_path().path();
         if let Some(path) = project_path(cell_resolver, buildfile.dupe())? {
             build_files.entry(path).or_insert((false, buildfile)).0 |=
-                set.is_some_and(|set| watch[set].notify);
+                set.is_some_and(|set| slots[set].waits);
         }
     }
     timer.step(&format!("the {} packages of the graph", packages.len()));
 
     let mut claims = GraphClaims {
+        exclusive,
         nodes,
         files,
-        targets,
         with_own_files,
-        set_targets,
+        only,
+        groups,
+        claimed_targets,
         package_dirs,
         build_files,
         bzl_files: BTreeMap::new(),
@@ -834,8 +1010,8 @@ async fn claim_symlink_targets(
         .fill(dice, cell_resolver, package_of.keys().map(|dir| &**dir))
         .await?;
 
-    // The source files that are symlinks, or behind one, with the set that claims them.
-    let mut links: Vec<(usize, CellPath)> = Vec::new();
+    // The source files that are symlinks, or behind one, with the slots that claim them.
+    let mut links: Vec<(u64, CellPath)> = Vec::new();
     // Those that a set claims by name.
     for (path, (set, cell_path)) in &claims.files {
         if symlinks.is_behind(dice, cell_resolver, path).await? {
@@ -866,7 +1042,7 @@ async fn claim_symlink_targets(
         };
         for input in node.inputs() {
             if linked.iter().any(|link| input.starts_with(*link)) {
-                links.push((claims.set_of_own_file(cell_resolver, input, *own), input));
+                links.push((claims.slots_of_own_file(cell_resolver, input, *own), input));
             }
         }
     }
@@ -893,7 +1069,11 @@ async fn claim_symlink_targets(
             let Some(rel) = project_path(cell_resolver, target.dupe())? else {
                 continue;
             };
-            let new = !claims.files.contains_key(&rel);
+            // New to some of the slots.
+            let new = claims
+                .files
+                .get(&rel)
+                .is_none_or(|(slots, _)| set & !*slots != 0);
             claim_file(&mut claims.files, cell_resolver, target.dupe(), set)?;
             // Only a symlink is read again: reading a file would depend on its contents.
             if new && symlinks.is_behind(dice, cell_resolver, &rel).await? {
@@ -1091,13 +1271,15 @@ impl Key for DevDirLinksKey {
     }
 }
 
-/// No watch set, in the tables of a `DevClaims`.
-const NO_SET: u32 = u32::MAX;
-
-/// What a path is to the watch sets.
+/// What a path is to the slots.
 enum Claimed {
-    /// A source file that this set claims.
-    Source(usize),
+    /// A source file that slots claim.
+    Source {
+        /// The slots that claim it, at least one.
+        may: u64,
+        /// Of those, the ones whose `only` names a target that has the file as a source file.
+        only: u64,
+    },
     /// A build file of the graph, and whether a change to it waits.
     BuildFile {
         waits: bool,
@@ -1121,12 +1303,14 @@ enum Claimed {
 /// them, which depend on what those read.
 #[derive(Allocative, Debug, PartialEq, Eq)]
 struct DevClaims {
-    /// For each target of the graph, by the hash of its unconfigured label: the set that has it,
-    /// and the set that claims its own source files. Sorted.
-    targets: Vec<(u64, u32, u32)>,
-    /// The source files that a set claims by name, by the hash of their project-relative path,
-    /// with the set. Sorted.
-    files: Vec<(u64, u32)>,
+    /// Whether a file belongs to the first slot that claims it, and not to every one.
+    exclusive: bool,
+    /// For each target of the graph, by the hash of its unconfigured label: the slots that
+    /// claim its own source files, and the slots whose `only` names it. Sorted.
+    targets: Vec<(u64, u64, u64)>,
+    /// The source files that slots claim by name, by the hash of their project-relative path,
+    /// with the slots. Sorted.
+    files: Vec<(u64, u64)>,
     /// The packages of the graph, and the files that matter outside them: what the session's
     /// file change subscription needs to drop the changes that cannot matter.
     interest: Arc<FileInterest>,
@@ -1134,10 +1318,12 @@ struct DevClaims {
     build_files: Vec<(u64, bool)>,
     /// The `.bzl` files that the graph loads. Sorted.
     bzl_files: Vec<u64>,
-    /// For each set, a digest of its targets.
+    /// A digest of each group of targets; see `GraphClaims::groups`.
     targets_digests: Vec<String>,
-    /// For each set, how many targets it has.
+    /// How many targets each group has.
     target_counts: Vec<usize>,
+    /// How many targets a slot has.
+    claimed_targets: usize,
     /// The `.bzl` files that the graph loads, and their contents.
     bzl_digest: String,
     /// The build files of the graph and the `.bzl` files, and their contents.
@@ -1153,11 +1339,13 @@ impl DevClaims {
     ) -> buck2_error::Result<Self> {
         let mut timer = Timer::new();
         let GraphClaims {
+            exclusive,
             nodes: _,
             files,
-            targets,
             with_own_files,
-            set_targets,
+            only,
+            groups,
+            claimed_targets,
             package_dirs,
             build_files,
             bzl_files,
@@ -1165,27 +1353,25 @@ impl DevClaims {
             incomplete,
         } = claims;
 
-        let mut by_label: BTreeMap<u64, (u32, u32)> = BTreeMap::new();
-        for (label, set) in &targets {
-            let entry = by_label
+        let mut by_label: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        for (label, slots) in &with_own_files {
+            by_label
                 .entry(stable_hash(&label.unconfigured().to_string()))
-                .or_insert((NO_SET, NO_SET));
-            entry.0 = entry.0.min(*set as u32);
+                .or_default()
+                .0 |= *slots;
         }
-        for (label, set) in &with_own_files {
-            let entry = by_label
+        for (label, slots) in &only {
+            by_label
                 .entry(stable_hash(&label.unconfigured().to_string()))
-                .or_insert((NO_SET, NO_SET));
-            entry.1 = entry.1.min(*set as u32);
+                .or_default()
+                .1 |= *slots;
         }
 
-        let mut other_files: Vec<(u64, u32)> = files
-            .iter()
-            .map(|(path, (set, _))| (stable_hash(path.as_str()), *set as u32))
-            .collect();
-        other_files.sort_unstable();
-        // The lowest set of a hash comes first, and is the one found.
-        other_files.dedup_by_key(|(hash, _)| *hash);
+        let mut by_path: BTreeMap<u64, u64> = BTreeMap::new();
+        for (path, (slots, _)) in &files {
+            *by_path.entry(stable_hash(path.as_str())).or_default() |= *slots;
+        }
+        let other_files: Vec<(u64, u64)> = by_path.into_iter().collect();
 
         // The contents of the files that say what the graph is.
         let mut graph_paths: Vec<CellPath> =
@@ -1228,7 +1414,7 @@ impl DevClaims {
             .collect();
         bzl_hashes.sort_unstable();
 
-        let targets_digests: Vec<String> = set_targets
+        let targets_digests: Vec<String> = groups
             .iter()
             .map(|nodes| targets_digest(nodes.iter().collect()))
             .collect();
@@ -1242,16 +1428,18 @@ impl DevClaims {
                 .chain(bzl_hashes.iter().copied()),
         ));
         Ok(DevClaims {
+            exclusive,
             targets: by_label
                 .into_iter()
-                .map(|(hash, (set, own))| (hash, set, own))
+                .map(|(hash, (own, only))| (hash, own, only))
                 .collect(),
             files: other_files,
             interest,
             build_files: build_file_hashes,
             bzl_files: bzl_hashes,
             targets_digests,
-            target_counts: set_targets.iter().map(|nodes| nodes.len()).collect(),
+            target_counts: groups.iter().map(|nodes| nodes.len()).collect(),
+            claimed_targets,
             bzl_digest,
             graph_digest,
             notify_sets,
@@ -1270,6 +1458,16 @@ impl DevClaims {
                 .collect(),
             bzl_digest: self.bzl_digest.clone(),
             graph_digest: self.graph_digest.clone(),
+        }
+    }
+
+    /// The slots that a file of the slots `may` belongs to: the first of them when exclusive,
+    /// and otherwise all of them.
+    fn slots_of(&self, may: u64) -> u64 {
+        if self.exclusive {
+            may & may.wrapping_neg()
+        } else {
+            may
         }
     }
 
@@ -1297,10 +1495,11 @@ impl DevClaims {
         if self.bzl_files.binary_search(&hash).is_ok() {
             return Ok(Claimed::Bzl);
         }
-        let mut set = match self.files.binary_search_by_key(&hash, |x| x.0) {
+        let mut may = match self.files.binary_search_by_key(&hash, |x| x.0) {
             Ok(i) => self.files[i].1,
-            Err(_) => NO_SET,
+            Err(_) => 0,
         };
+        let mut only = 0;
         // The targets that have the file as a source file are in the packages that the file is
         // in. Only the packages of the graph are looked at, and those are loaded already.
         let cell_path = cell_resolver.get_cell_path(&path);
@@ -1319,16 +1518,27 @@ impl DevClaims {
                 else {
                     continue;
                 };
-                let own = self.targets[i].2;
-                if own < set && node.inputs().any(|input| input == cell_path) {
-                    set = own;
+                let (_, own, named) = self.targets[i];
+                // Whether the target would add to the answer, if it has the file.
+                let adds = if self.exclusive {
+                    // A lower slot than the lowest so far.
+                    own.trailing_zeros() < may.trailing_zeros()
+                } else {
+                    own & !may != 0 || named & !only != 0
+                };
+                if adds && node.inputs().any(|input| input == cell_path) {
+                    may |= own;
+                    only |= named;
                 }
             }
         }
-        Ok(if set == NO_SET {
+        Ok(if may == 0 {
             Claimed::Nothing
         } else {
-            Claimed::Source(set as usize)
+            Claimed::Source {
+                may,
+                only: only & may,
+            }
         })
     }
 }
@@ -1353,8 +1563,8 @@ impl Key for DevClaimsKey {
         ctx: &mut DiceComputations,
         _cancellations: &CancellationContext,
     ) -> Self::Value {
-        let watch = dev_watch(ctx, &self.0).await?;
-        let claims = graph_claims(ctx, &self.0, &watch).await?;
+        let (policy, slots) = dev_slots(ctx, &self.0).await?;
+        let claims = graph_claims(ctx, &self.0, policy.exclusive(), &slots).await?;
         Ok(Arc::new(DevClaims::new(ctx, claims).await?))
     }
 
@@ -1381,16 +1591,16 @@ async fn dev_claims(
     dice.compute(&DevClaimsKey(label.dupe())).await?.dupe()
 }
 
-/// The `DevInfo.watch` of a target.
-async fn dev_watch(
+/// The policy of the `DevInfo` of a target, and its slots.
+async fn dev_slots(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
-) -> buck2_error::Result<Vec<DevWatchSpec>> {
+) -> buck2_error::Result<(Policy, Vec<Slot>)> {
     let providers = dice.get_providers(label).await?.require_compatible()?;
     let info = providers
         .builtin_provider_value::<DevInfo>()?
         .ok_or_else(|| DevError::NoDevInfo(label.dupe()))?;
-    info.as_ref().value().as_ref().watch()
+    dev_policy(info.as_ref().value().as_ref())
 }
 
 /// Say what the requested paths are to the watch sets, and which sets' targets changed since
@@ -1399,10 +1609,19 @@ async fn dev_watch(
 async fn watch_files(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
-    watch: &[DevWatchSpec],
+    policy: &Policy,
+    slots: &[Slot],
     request: &DevWatchRequest,
     session: &str,
 ) -> buck2_error::Result<DevWatched> {
+    let watch: &[DevWatchSpec] = match policy {
+        Policy::Watch(watch) => watch,
+        Policy::Outputs(_) => &[],
+    };
+    let mut outputs = match policy {
+        Policy::Watch(_) => None,
+        Policy::Outputs(names) => Some(OutputChanges::new(names, slots)),
+    };
     let claims = dev_claims(dice, label).await?;
     // From here on the session's file change subscription drops the changes that cannot matter
     // to these claims. `buck2 dev` asks again after every change that is let through, and so
@@ -1416,11 +1635,19 @@ async fn watch_files(
             continue;
         };
         let (set, waits) = if claims.may_claim(rel) {
-            match claims.classify(dice, cell_resolver, rel).await? {
-                Claimed::Source(set) => (Some(set), watch[set].notify),
-                Claimed::BuildFile { waits } => (None, waits),
-                Claimed::Bzl => (None, claims.notify_sets),
-                Claimed::Nothing => (None, false),
+            let claimed = claims.classify(dice, cell_resolver, rel).await?;
+            match (&mut outputs, claimed) {
+                (Some(outputs), claimed) => {
+                    outputs.path(path, &claimed);
+                    (None, false)
+                }
+                (None, Claimed::Source { may, .. }) => {
+                    let set = first_slot(may);
+                    (Some(set), watch[set].notify)
+                }
+                (None, Claimed::BuildFile { waits }) => (None, waits),
+                (None, Claimed::Bzl) => (None, claims.notify_sets),
+                (None, Claimed::Nothing) => (None, false),
             }
         } else {
             (None, false)
@@ -1436,7 +1663,7 @@ async fn watch_files(
     // cannot say what a path is.
     let mut waiting = Vec::new();
     if request.all_waiting && claims.notify_sets {
-        let graph = graph_claims(dice, label, watch).await?;
+        let graph = graph_claims(dice, label, policy.exclusive(), slots).await?;
         waiting.extend(
             graph
                 .build_files
@@ -1448,6 +1675,7 @@ async fn watch_files(
     }
 
     let state = claims.state();
+    // Each of these is a group of targets; see `GraphClaims::groups`.
     let (changed_sets, graph_changed) = match &request.previous {
         None => (Vec::new(), false),
         Some(previous) if previous.sets.len() != state.sets.len() => {
@@ -1472,6 +1700,12 @@ async fn watch_files(
         }
     };
 
+    let outputs = outputs.map(|mut outputs| {
+        if request.all_waiting && request.previous.is_some() {
+            outputs.missed();
+        }
+        outputs.finish(&changed_sets, graph_changed, &claims)
+    });
     Ok(DevWatched {
         watch: watch
             .iter()
@@ -1486,10 +1720,130 @@ async fn watch_files(
         state,
         paths,
         waiting,
-        changed_sets,
+        changed_sets: if outputs.is_some() {
+            Vec::new()
+        } else {
+            changed_sets
+        },
         graph_changed,
         incomplete: claims.incomplete.clone(),
+        outputs,
     })
+}
+
+/// Gathers what changes are to the server and to the outputs that carry the policy.
+struct OutputChanges<'a> {
+    names: &'a [String],
+    /// The slots that have `only`.
+    only_slots: u64,
+    changes: DevOutputChanges,
+    /// The requested paths that are build files or `.bzl` files of the graph.
+    graph_paths: Vec<String>,
+}
+
+impl<'a> OutputChanges<'a> {
+    fn new(names: &'a [String], slots: &[Slot]) -> Self {
+        let only_slots = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.only.is_some())
+            .fold(0, |mask, (slot, _)| mask | slot_bit(slot));
+        OutputChanges {
+            names,
+            only_slots,
+            changes: DevOutputChanges::default(),
+            graph_paths: Vec::new(),
+        }
+    }
+
+    /// Changes were missed, so anything may have changed: the server may be new, every output
+    /// without `only` is built again, and the others are held back.
+    fn missed(&mut self) {
+        self.changes.server = true;
+        for (slot, name) in self.names.iter().enumerate().map(|(i, name)| (i + 1, name)) {
+            if self.only_slots & slot_bit(slot) != 0 {
+                self.changes
+                    .hold
+                    .entry(name.clone())
+                    .or_default()
+                    .push(String::new());
+            } else {
+                self.changes.build.entry(name.clone()).or_default();
+            }
+        }
+    }
+
+    /// The requested path `path` changed.
+    fn path(&mut self, path: &str, claimed: &Claimed) {
+        let (may, only) = match claimed {
+            Claimed::Source { may, only } => (*may, *only),
+            Claimed::BuildFile { .. } | Claimed::Bzl => {
+                self.graph_paths.push(path.to_owned());
+                return;
+            }
+            Claimed::Nothing => return,
+        };
+        self.changes.server |= may & SERVER_SLOT != 0;
+        for (slot, name) in self.names.iter().enumerate().map(|(i, name)| (i + 1, name)) {
+            let bit = slot_bit(slot);
+            if may & bit == 0 {
+                continue;
+            }
+            // A file outside the `only` of an output holds it back.
+            let changes = if self.only_slots & bit != 0 && only & bit == 0 {
+                &mut self.changes.hold
+            } else {
+                &mut self.changes.build
+            };
+            changes
+                .entry(name.clone())
+                .or_default()
+                .push(path.to_owned());
+        }
+    }
+
+    /// The groups of targets `changed_groups` changed: group `2 * slot` has the targets of a
+    /// slot that its `only` names, or all of them if it has none, and group `2 * slot + 1` has
+    /// the others.
+    fn finish(
+        mut self,
+        changed_groups: &[usize],
+        graph_changed: bool,
+        claims: &DevClaims,
+    ) -> DevOutputChanges {
+        self.changes.server |= graph_changed;
+        for group in changed_groups {
+            let (slot, outside) = (group / 2, group % 2 == 1);
+            if slot == 0 {
+                self.changes.server = true;
+                continue;
+            }
+            let Some(name) = self.names.get(slot - 1) else {
+                continue;
+            };
+            // Without `only`, an output has no targets outside it.
+            let changes = if outside && self.only_slots & slot_bit(slot) != 0 {
+                &mut self.changes.hold
+            } else {
+                &mut self.changes.build
+            };
+            changes
+                .entry(name.clone())
+                .or_default()
+                .extend(self.graph_paths.iter().cloned());
+        }
+        for paths in self
+            .changes
+            .build
+            .values_mut()
+            .chain(self.changes.hold.values_mut())
+        {
+            paths.sort();
+            paths.dedup();
+        }
+        self.changes.targets = claims.claimed_targets;
+        self.changes
+    }
 }
 
 /// The contents of a file, as the daemon's file watcher keeps them up to date, or `None` if it
@@ -1556,22 +1910,22 @@ fn files_digest(files: &mut Vec<(&ProjectRelativePathBuf, Option<String>)>) -> S
 /// How many symlinks in a row `claims` follows from a source file.
 const MAX_SYMLINK_HOPS: usize = 8;
 
-fn claim<K: Hash + Eq>(map: &mut BuckMutMap<K, usize>, key: K, set: usize) {
-    let entry = map.entry(key).or_insert(set);
-    *entry = (*entry).min(set);
+/// Slot `slot` claims `key`.
+fn claim<K: Hash + Eq>(map: &mut BuckMutMap<K, u64>, key: K, slot: usize) {
+    *map.entry(key).or_insert(0) |= slot_bit(slot);
 }
 
+/// The slots `slots` claim the file `path`.
 fn claim_file(
-    files: &mut BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)>,
+    files: &mut BuckMutMap<ProjectRelativePathBuf, (u64, CellPath)>,
     cell_resolver: &CellResolver,
     path: CellPath,
-    set: usize,
+    slots: u64,
 ) -> buck2_error::Result<Option<ProjectRelativePathBuf>> {
     let Some(rel) = project_path(cell_resolver, path.dupe())? else {
         return Ok(None);
     };
-    let entry = files.entry(rel.clone()).or_insert((set, path));
-    entry.0 = entry.0.min(set);
+    files.entry(rel.clone()).or_insert((0, path)).0 |= slots;
     Ok(Some(rel))
 }
 

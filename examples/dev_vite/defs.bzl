@@ -86,19 +86,15 @@ def _vite_app_impl(ctx):
         DevInfo(
             # The command names only the server script, so only a change to the script
             # restarts the server, and so Vite too. The app's files and the packages are
-            # outputs, which the server asks for when it starts.
+            # outputs, which the server asks for when it starts. `buck2 dev` builds each
+            # again after a change to what it may be built from. A new `package.json` or
+            # lockfile installs the packages again, and the server restarts Vite when they
+            # change. A change to the app's files builds them again; the server copies the
+            # changed files to where Vite serves them, and Vite updates the browser.
             server = server,
             outputs = {"app": app, "packages": packages},
             # Vite reads the terminal for its keyboard shortcuts.
             interactive = True,
-            watch = [
-                # A new `package.json` or lockfile installs the packages again. The server
-                # restarts Vite when they change.
-                DevWatch(inputs = packages, build = ["packages"]),
-                # Everything else builds the app files again. The server copies the changed
-                # files to where Vite serves them, and Vite updates the browser.
-                DevWatch(targets = None, build = ["app"]),
-            ],
         ),
     ]
 

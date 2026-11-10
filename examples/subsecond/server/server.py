@@ -11,8 +11,10 @@
 `buck2 dev` builds two outputs:
 
 - `exe`: the app's binary. This server starts a copy of it, and starts it again when it
-  changes.
+  changes. `buck2 dev` builds it only when this server asks.
 - `patch`: a shared library with the newest code of the patched crate, linked by ThinLink.
+  `buck2 dev` builds it after each change to that crate, until another crate changes: then
+  it says that `patch` is stale, and this server asks for both outputs again.
 
 For each new `patch`, this server writes a subsecond jump table to the app's stdin: the
 address of each function in the running binary, and the address of the same function in
@@ -134,7 +136,14 @@ def main():
             # Messages of other types may be added; ignore them.
             kind = message.get("type")
             if kind == "ready":
-                request({"type": "build", "outputs": ["exe"]})
+                request({"type": "build", "outputs": ["exe", "patch"]})
+            elif kind == "stale":
+                # `exe` is stale after every change, and that is how patching works. `patch`
+                # is stale after a change that cannot be patched, to another crate: build
+                # both again, and the new binary starts below.
+                if "patch" in message.get("outputs", []):
+                    log("a change cannot be patched; building the app again")
+                    request({"type": "build", "outputs": ["exe", "patch"]})
             elif kind == "built":
                 outputs = message["outputs"]
                 exe = outputs.get("exe")
@@ -144,7 +153,7 @@ def main():
                 elif patch is not None and patch["changed"] and app.process is not None:
                     if not app.patch(patch["path"]):
                         log("building the app again")
-                        request({"type": "build", "outputs": ["exe"]})
+                        request({"type": "build", "outputs": ["exe", "patch"]})
             elif kind == "failed":
                 log("build failed; the app keeps running the last build")
             elif kind == "shutdown":

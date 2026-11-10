@@ -15,7 +15,8 @@ A rule makes its targets work with `buck2 dev` by returning the
   again when the command changes. See [The server command](#the-server-command).
 - `outputs`: the artifacts that `buck2 dev` can build, by name.
 - `watch`: a list of [`DevWatch`](../../api/build/DevWatch) values. They say
-  what to do when a source file changes.
+  what to do when a source file changes. Without `watch`, `buck2 dev` works
+  that out itself; see [Without a watch list](#without-a-watch-list).
 - `interactive`: whether the server gets the terminal. See
   [The terminal](#the-terminal).
 
@@ -130,6 +131,67 @@ the file to the command with `hidden`. For files that the rule cannot name as
 artifacts, such as the source files of every target in the graph, use a watch
 set with `restart` (see [Watch sets](#watch-sets)). Such a set restarts the
 server at every save of its files, changed or not.
+
+## Without a watch list
+
+This is a prototype.
+
+A `DevInfo` without `watch` has no rules. `buck2 dev` finds the source files
+that the server's command and each output may be built from, and after a
+change:
+
+- to a file of the server's command, it builds the command again, and starts
+  the server again if the command is new (see
+  [The server command](#the-server-command));
+- to a file of an output, it builds that output again, and sends `built`.
+
+```python
+DevInfo(server = server, outputs = {"www": www})
+```
+
+A file may belong to the server and to several outputs, and then all of that
+happens. A file that belongs to none of them changes nothing, and costs no
+build. What an output may be built from is found as for `inputs` in
+[What `inputs` claim](#what-inputs-claim): of the target that owns the output,
+the source files that its actions build the output from, and all the source
+files of the other targets that those actions use, and of their dependencies.
+
+Some outputs must not be built after every change. Give such an output as a
+[`DevOutput`](../../api/build/DevOutput) with `only`, a list of target patterns
+or labels:
+
+```python
+DevInfo(
+    server = server,
+    outputs = {
+        "exe": DevOutput(exe, only = []),
+        "patch": DevOutput(patch, only = [ctx.attrs.lib.label]),
+    },
+)
+```
+
+`buck2 dev` builds an output with `only` again by itself only after a change to
+the own source files of those targets, or to those targets. After any other
+change that the output may be built from, to a file, a target or a `.bzl` file,
+it _holds the output back_: it stops building it, also after changes inside its
+`only`, and sends `stale` with the output's name and the changed files. The
+other outputs are still built, from the same files. `only = []` means that
+`buck2 dev` never builds the output by itself.
+
+An output is held back until the server asks for it with `build`, and that
+build succeeds. `buck2 dev` then sends `stale` again, without it. A server that
+starts has no outputs, so none is held back for it.
+
+In the example, a change to the crate `lib` builds `patch`, and `exe` is stale
+from then on, which is what a server that loads patches into a running `exe`
+expects. A change to any other crate makes `patch` stale too: the server asks
+for both, and starts the app again.
+
+Here nothing waits: [Changes that wait](#changes-that-wait) is about `notify`
+sets. A change that holds an output back stops a build of it that is running,
+like any change to a file that a build builds from.
+
+A `DevInfo` with `watch` cannot have outputs with `only`.
 
 ## Watch sets
 
@@ -383,7 +445,7 @@ console, and prints only errors and that the server exited or restarts.
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
-| `stale`         | `files`: the changed files whose change waits             | That list changes. An empty list means that nothing waits. After missed changes the project root is in the list: any such file may have changed. |
+| `stale`         | `files`: the changed files whose change waits. Without a watch list, also `outputs`: the names of the outputs that are held back, and `files` are the changes that hold them back | That list changes. An empty list means that nothing waits. After missed changes the project root is in the list: any such file may have changed. |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 

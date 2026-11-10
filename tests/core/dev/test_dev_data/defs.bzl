@@ -177,10 +177,23 @@ def _dev_app(ctx):
             DevWatch(targets = [ctx.label], build = [site_name]),
             DevWatch(targets = None, restart = True),
         ]
+    elif ctx.attrs.mode == "outputs":
+        # No watch list: `buck2 dev` finds what the server and each output may be built from.
+        watch = None
+    elif ctx.attrs.mode == "only":
+        # As a rule that patches a running program has it, without a watch list. `exe` and
+        # `patch` are built from `srcs` and `deps`, like `site`. `buck2 dev` builds `patch`
+        # again by itself only after a change to this target's own files, and never `exe`.
+        extra["exe"] = _concat_output(ctx, "exe.txt")
+        extra["patch"] = _concat_output(ctx, "patch.txt")
+        watch = None
     else:
         fail("unknown mode " + ctx.attrs.mode)
     outputs = {site_name: site}
     outputs.update(extra)
+    if ctx.attrs.mode == "only":
+        outputs["exe"] = DevOutput(outputs["exe"], only = [])
+        outputs["patch"] = DevOutput(outputs["patch"], only = [ctx.label])
     if not ctx.attrs.dev_info:
         return [DefaultInfo(default_output = site)]
     return [

@@ -11,7 +11,8 @@
 usage: bench.py <buck2> <project> <mode>
 
 `<buck2>` is the buck2 to time, such as the one `./bootstrap/buck2 build //:buck2` builds.
-`<mode>` is a target of the project's `app` package: `targets`, `inputs` or `restart`.
+`<mode>` is a target of the project's `app` package: `targets`, `inputs`, `restart`, `outputs`
+or `outputs8`.
 
 It starts `buck2 dev`, with a daemon of its own, and prints how long these take:
 

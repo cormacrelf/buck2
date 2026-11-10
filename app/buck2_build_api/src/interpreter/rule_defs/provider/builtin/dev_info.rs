@@ -24,11 +24,12 @@ use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOf;
 use starlark::values::ValueOfUnchecked;
 use starlark::values::ValueTyped;
+use starlark::values::dict::AllocDict;
 use starlark::values::dict::DictRef;
 use starlark::values::dict::DictType;
+use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::AllocList;
 use starlark::values::list::ListRef;
 use starlark::values::list::ListType;
@@ -42,6 +43,7 @@ use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::FrozenStarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
+use crate::interpreter::rule_defs::provider::builtin::dev_output::DevOutput;
 use crate::interpreter::rule_defs::provider::builtin::dev_watch::DevWatch;
 use crate::interpreter::rule_defs::provider::builtin::dev_watch::DevWatchSpec;
 
@@ -60,6 +62,10 @@ enum DevInfoError {
     UnknownOutput(String),
     #[error("`DevInfo.watch` must contain `DevWatch` values, but got `{0}`")]
     ExpectedDevWatch(String),
+    #[error(
+        "Output `{0}` is a `DevOutput` with `only`, which cannot be used together with `DevInfo.watch`"
+    )]
+    OnlyWithWatch(String),
 }
 
 /// Provider that makes a target usable with `buck2 dev`.
@@ -80,8 +86,10 @@ pub struct DevInfo<'v> {
     server: ValueOfUnchecked<'v, FrozenStarlarkCmdArgs<'static>>,
     /// The outputs `buck2 dev` builds by name.
     outputs: ValueOfUnchecked<'v, DictType<String, ValueIsInputArtifactAnnotation>>,
-    /// The watch policy, as a list of `DevWatch`.
-    watch: ValueOfUnchecked<'v, ListType<DevWatch<'static>>>,
+    /// For each output that was given as a `DevOutput` with `only`: the target patterns.
+    only: ValueOfUnchecked<'v, DictType<String, ListType<String>>>,
+    /// The watch policy, as a list of `DevWatch`. Without it, the outputs carry the policy.
+    watch: ValueOfUnchecked<'v, NoneOr<ListType<DevWatch<'static>>>>,
     /// Whether the server gets the terminal: its stdin, and the keys typed into it.
     interactive: ValueOfUnchecked<'v, bool>,
 }
@@ -96,36 +104,52 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     ///   command again after each change, and starts the server again when the command line,
     ///   or the contents of an artifact that it names, changed. So keep what changes often
     ///   out of it: make that one of `outputs`, which the server asks for once it runs.
-    /// * `outputs`: artifacts that `buck2 dev` builds by name.
+    /// * `outputs`: artifacts that `buck2 dev` builds by name. Without `watch`, it builds an
+    ///   output again after every change that the output may be built from. Give an output
+    ///   as `DevOutput(artifact, only = [...])` to hold it back after some of them.
     /// * `watch`: a list of `DevWatch`. For a changed file, the first `DevWatch` whose files
-    ///   include it decides what happens.
+    ///   include it decides what happens, and `buck2 dev` builds no output by itself that no
+    ///   `DevWatch` names.
     /// * `interactive`: give the server the terminal, for a server that reads keys or lines
     ///   from it, such as a REPL. Otherwise its stdin is empty, and Ctrl-C reaches only
     ///   `buck2 dev`.
     #[starlark(as_type = DevInfo<'static>)]
     fn DevInfo<'v>(
         #[starlark(require = named)] server: Value<'v>,
-        #[starlark(require = named, default = NoneOr::None)] outputs: NoneOr<
-            ValueOf<'v, DictType<&'v str, ValueIsInputArtifactAnnotation>>,
+        #[starlark(require = named, default = UnpackDictEntries::default())]
+        outputs: UnpackDictEntries<Value<'v>, Value<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] watch: NoneOr<
+            UnpackListOrTuple<Value<'v>>,
         >,
-        #[starlark(require = named, default = UnpackListOrTuple::default())]
-        watch: UnpackListOrTuple<Value<'v>>,
         #[starlark(require = named, default = false)] interactive: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<DevInfo<'v>> {
         let heap = eval.heap();
         let server = StarlarkCmdArgs::try_from_value(server)?;
-        let outputs =
-            match outputs.into_option() {
-                Some(outputs) => outputs.as_unchecked().cast(),
-                None => ValueOfUnchecked::new(heap.alloc(starlark::values::dict::AllocDict(
-                    Vec::<(Value, Value)>::new(),
-                ))),
-            };
+        // A `DevOutput` is taken apart here: its artifact goes to `outputs`, and its `only`
+        // to a dictionary of its own.
+        let mut artifacts: Vec<(Value<'v>, Value<'v>)> = Vec::new();
+        let mut only: Vec<(Value<'v>, Value<'v>)> = Vec::new();
+        for (name, output) in outputs.entries {
+            match ValueTyped::<DevOutput>::new(output) {
+                Some(output) => {
+                    artifacts.push((name, output.as_ref().artifact()));
+                    if let Some(patterns) = output.as_ref().only() {
+                        only.push((name, heap.alloc(AllocList(patterns))));
+                    }
+                }
+                None => artifacts.push((name, output)),
+            }
+        }
+        let watch = match watch {
+            NoneOr::None => Value::new_none(),
+            NoneOr::Other(watch) => heap.alloc(AllocList(watch.items)),
+        };
         let info = DevInfo {
             server: ValueOfUnchecked::new(heap.alloc(server)),
-            outputs,
-            watch: ValueOfUnchecked::new(heap.alloc(AllocList(watch.items))),
+            outputs: ValueOfUnchecked::new(heap.alloc(AllocDict(artifacts))),
+            only: ValueOfUnchecked::new(heap.alloc(AllocDict(only))),
+            watch: ValueOfUnchecked::new(watch),
             interactive: heap.alloc_typed_unchecked(interactive).cast(),
         };
         validate_dev_info(&info)?;
@@ -183,23 +207,49 @@ impl<'v> DevInfo<'v> {
             .collect()
     }
 
-    fn watch_values(&self) -> buck2_error::Result<Vec<ValueTyped<'v, DevWatch<'v>>>> {
-        ListRef::from_value(self.watch.get())
-            .expect("Value is a List")
-            .iter()
-            .map(|v| {
-                ValueTyped::<DevWatch>::new(v)
-                    .ok_or_else(|| DevInfoError::ExpectedDevWatch(v.to_repr()).into())
-            })
-            .collect()
+    /// The watch list, or `None` if `watch` was not given: the outputs then carry the policy.
+    pub fn watch(&self) -> buck2_error::Result<Option<Vec<DevWatchSpec>>> {
+        let watch = self.watch.get();
+        if watch.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            ListRef::from_value(watch)
+                .expect("Value is a List")
+                .iter()
+                .map(|v| {
+                    ValueTyped::<DevWatch>::new(v)
+                        .ok_or_else(|| DevInfoError::ExpectedDevWatch(v.to_repr()))?
+                        .as_ref()
+                        .spec()
+                })
+                .collect::<buck2_error::Result<_>>()?,
+        ))
     }
 
-    pub fn watch(&self) -> buck2_error::Result<Vec<DevWatchSpec>> {
-        Ok(self
-            .watch_values()?
-            .into_iter()
-            .map(|w| w.as_ref().spec())
-            .collect::<buck2_error::Result<_>>()?)
+    /// The target patterns of `only`, for each output that has it.
+    pub fn only(&self) -> BuckMutInsertionMap<String, Vec<String>> {
+        DictRef::from_value(self.only.get())
+            .expect("Value is a Dict")
+            .iter()
+            .map(|(name, patterns)| {
+                (
+                    name.unpack_str()
+                        .expect("validated at construction")
+                        .to_owned(),
+                    ListRef::from_value(patterns)
+                        .expect("validated at construction")
+                        .iter()
+                        .map(|pattern| {
+                            pattern
+                                .unpack_str()
+                                .expect("validated at construction")
+                                .to_owned()
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -222,11 +272,16 @@ fn validate_dev_info<'v>(info: &DevInfo<'v>) -> buck2_error::Result<()> {
         }
         names.push(k);
     }
-    for watch in info.watch()? {
-        for name in &watch.build {
-            if !names.contains(&name.as_str()) {
-                return Err(DevInfoError::UnknownOutput(name.clone()).into());
+    if let Some(watch) = info.watch()? {
+        for watch in watch {
+            for name in &watch.build {
+                if !names.contains(&name.as_str()) {
+                    return Err(DevInfoError::UnknownOutput(name.clone()).into());
+                }
             }
+        }
+        if let Some(name) = info.only().keys().next() {
+            return Err(DevInfoError::OnlyWithWatch(name.clone()).into());
         }
     }
     Ok(())

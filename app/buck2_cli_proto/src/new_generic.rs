@@ -246,6 +246,30 @@ pub struct DevWatched {
     /// action needs failed. Their sets have the source files of the targets that own those
     /// inputs and of their dependencies instead. Empty when every input was expanded.
     pub incomplete: Vec<String>,
+    /// For a `DevInfo` without `watch`, whose outputs carry the policy: what the requested
+    /// paths, and the changes since `previous`, are to the server and to each output. `watch`,
+    /// `waiting` and `changed_sets` are then empty, and no path has a set or waits.
+    pub outputs: Option<DevOutputChanges>,
+}
+
+/// What changes are to the server and to the outputs of a `DevInfo` without `watch`. Nothing
+/// here is exclusive: one path may be here for the server and for several outputs.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct DevOutputChanges {
+    /// The server's command may be built from a requested path, or its targets changed, so it
+    /// may be new.
+    pub server: bool,
+    /// The outputs to build again, each with the requested paths that call for it: paths that
+    /// the output may be built from, and, if its targets changed, the build files and `.bzl`
+    /// files.
+    pub build: BTreeMap<String, Vec<String>>,
+    /// The outputs with `only` to hold back, each with the requested paths that call for it:
+    /// the output may be built from them, and they are outside its `only`. With `all_waiting`
+    /// and a `previous`, changes were missed: every output is in `build` or here, the ones
+    /// here with the empty path, which stands for the project.
+    pub hold: BTreeMap<String, Vec<String>>,
+    /// How many targets the server and the outputs may be built from.
+    pub targets: usize,
 }
 
 #[derive(Serialize, Deserialize)]

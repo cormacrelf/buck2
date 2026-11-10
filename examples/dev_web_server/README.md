@@ -33,9 +33,9 @@ command again after each change, and when `server.py` has new contents it stops
 the server and starts it again. The site is not in the command: it is the `www`
 output, which the server asks for when it starts.
 
-`static_site` gives `buck2 dev` one watch set: a change in the dependency
-graph, to a page or to the theme, builds the `www` output again and tells the
-server its new path.
+`static_site` gives `buck2 dev` no rules. `buck2 dev` finds what `www` may be
+built from, and a change to one of those files, a page or the theme, builds
+`www` again and tells the server its new path.
 
 See the rule author documentation page for `buck2 dev` for the messages between
 `buck2 dev` and the server.

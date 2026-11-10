@@ -20,6 +20,9 @@ The modes are targets of the project's `app` package, which differ in their watc
 - `targets`: one `targets = None` set that builds a small output.
 - `inputs`: before it, a set whose `inputs` are built from every library. It builds too.
 - `restart`: the same, but the `inputs` set restarts the server.
+- `outputs`: no watch sets. The outputs carry the policy: the small output, and one that is
+  built from every library.
+- `outputs8`: the same, with eight outputs that are built from every library.
 
 The daemon logs how long each step of finding what the watch sets claim takes, at the `debug`
 level of `buck2_server_commands::dev`. `bench.py` turns that on with `BUCK_LOG` and prints the

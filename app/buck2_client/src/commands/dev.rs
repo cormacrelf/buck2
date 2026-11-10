@@ -475,6 +475,33 @@ enum Request {
     Restart,
 }
 
+/// What the server was last told is stale.
+#[derive(Default, PartialEq, Eq)]
+struct Stale {
+    /// Absolute paths of the changed files whose change waits, or that hold an output back.
+    files: Vec<String>,
+    /// For a `DevInfo` whose outputs carry the policy: the names of the outputs that are held
+    /// back.
+    outputs: Option<Vec<String>>,
+}
+
+impl Stale {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty()
+            && self
+                .outputs
+                .as_ref()
+                .is_none_or(|outputs| outputs.is_empty())
+    }
+
+    fn message(&self) -> serde_json::Value {
+        match &self.outputs {
+            Some(outputs) => json!({"type": "stale", "files": self.files, "outputs": outputs}),
+            None => json!({"type": "stale", "files": self.files}),
+        }
+    }
+}
+
 /// The running server, and its connection to `buck2 dev`, if it made one.
 #[cfg(unix)]
 struct Server {
@@ -589,7 +616,7 @@ impl ServerLink {
         &mut self,
         event: ServerEvent,
         outputs: &[String],
-        stale: &[String],
+        stale: &Stale,
     ) -> buck2_error::Result<()> {
         let Some(server) = &mut self.server else {
             return Ok(());
@@ -645,7 +672,7 @@ impl ServerLink {
                             "outputs": outputs,
                         }));
                         if !stale.is_empty() {
-                            server.send(json!({"type": "stale", "files": stale}));
+                            server.send(stale.message());
                         }
                     }
                     Ok(_) if !introduced => {
@@ -792,12 +819,15 @@ struct Watched {
     latest: Option<DevWatchState>,
     /// The `incomplete` messages last shown.
     incomplete: Vec<String>,
+    /// For a `DevInfo` whose outputs carry the policy: how many targets the server and the
+    /// outputs may be built from.
+    output_targets: usize,
 }
 
 impl Watched {
     /// The number of targets that the watch sets have.
     fn targets(&self) -> usize {
-        self.sets.iter().map(|set| set.targets).sum()
+        self.sets.iter().map(|set| set.targets).sum::<usize>() + self.output_targets
     }
 }
 
@@ -841,8 +871,19 @@ struct Session<'a> {
     /// restart. The empty path stands for the project: changes were missed, so any of them may
     /// have changed.
     pending: BTreeSet<String>,
-    /// `pending` as absolute paths, for `stale`.
-    stale: Vec<String>,
+    /// The `DevInfo` has no `watch`: its outputs carry the policy. Then nothing waits, and
+    /// `pending` stays empty; outputs are held back one by one instead.
+    by_output: bool,
+    /// The outputs with `only` that are held back, each with the project-relative paths that
+    /// changed outside its `only`: `buck2 dev` does not build it by itself until the server has
+    /// asked for it. The empty path stands for the project, as in `pending`.
+    held: BTreeMap<String, BTreeSet<String>>,
+    /// For each output that was built since `buck2 dev` last asked the daemon about changes:
+    /// the paths that had changed by then, and that it has not asked about yet. The build
+    /// used those changes, so they neither hold the output back nor build it again.
+    fresh: BTreeMap<String, BTreeSet<String>>,
+    /// What the server was last told is stale: `pending` and `held`.
+    stale: Stale,
     /// Project-relative paths that changed since `buck2 dev` last acted on changes. Each `Watch`
     /// asks about all of them.
     unacted: BTreeSet<String>,
@@ -870,6 +911,8 @@ struct Session<'a> {
     /// from changed. The next build builds them too.
     cancelled_outputs: BTreeSet<String>,
     cancelled_files: BTreeSet<String>,
+    /// The outputs of `cancelled_outputs` that the server asked for.
+    cancelled_requested: BTreeSet<String>,
 }
 
 /// What became of analysing the target again.
@@ -946,7 +989,10 @@ impl<'a> Session<'a> {
             digests: BuckMutMap::default(),
             waiting_graph: BTreeSet::new(),
             pending: BTreeSet::new(),
-            stale: Vec::new(),
+            by_output: false,
+            held: BTreeMap::new(),
+            fresh: BTreeMap::new(),
+            stale: Stale::default(),
             unacted: BTreeSet::new(),
             resolve_due: false,
             graph_dirty: false,
@@ -958,6 +1004,7 @@ impl<'a> Session<'a> {
             queued: BTreeSet::new(),
             cancelled_outputs: BTreeSet::new(),
             cancelled_files: BTreeSet::new(),
+            cancelled_requested: BTreeSet::new(),
         };
         session.spawn().await?;
         Ok(Ok(session))
@@ -1123,7 +1170,7 @@ impl<'a> Session<'a> {
                 }
                 // A build that failed is not one the server can use: the changes that wait still
                 // differ from the last build it got.
-                if self.build(outputs, Vec::new()).await? {
+                if self.build(outputs, Vec::new(), true).await? {
                     self.reset_pending();
                 }
             }
@@ -1138,18 +1185,17 @@ impl<'a> Session<'a> {
     }
 
     /// The server asked for a build or restart, so it now uses the files as they are: the
-    /// changes that waited are used up.
+    /// changes that waited are used up. When the outputs carry the policy, nothing waited, and
+    /// the build of each output has let it go already.
     fn reset_pending(&mut self) {
-        self.pending.clear();
-        if self.watched.latest.is_some() {
-            self.watched.state = self.watched.latest.clone();
+        if !self.by_output {
+            self.pending.clear();
+            if self.watched.latest.is_some() {
+                self.watched.state = self.watched.latest.clone();
+            }
+            self.unacted.clear();
         }
-        self.unacted.clear();
-        if !self.stale.is_empty() {
-            self.stale.clear();
-            self.link
-                .send(json!({"type": "stale", "files": Vec::<String>::new()}));
-        }
+        self.send_stale();
     }
 
     /// Ask the daemon what changed, and do what the watch sets ask for.
@@ -1205,6 +1251,9 @@ impl<'a> Session<'a> {
         };
         let recovered = std::mem::take(&mut self.watch_failed);
         self.watch_failure = None;
+        if watched.outputs.is_some() {
+            return self.on_output_changes(watched, recovered).await;
+        }
 
         // A change to a file whose change waits waits until the server asks for a build or a
         // restart. After missed changes, any such file may have changed.
@@ -1311,23 +1360,117 @@ impl<'a> Session<'a> {
         self.apply(sets, files, &resolved, restart_is_news).await
     }
 
-    /// Tell the server about the files whose changes wait, if they are not what it was last
-    /// told.
+    /// Act on what the daemon said about changes, for a `DevInfo` whose outputs carry the
+    /// policy. Nothing waits here: the server's command is built again if it may be new, each
+    /// output that a change calls for is built again, and each output that a change holds
+    /// back is left alone, with every later build of it, until the server asks for it.
+    async fn on_output_changes(
+        &mut self,
+        watched: DevWatched,
+        recovered: bool,
+    ) -> buck2_error::Result<()> {
+        let changes = watched.outputs.clone().unwrap_or_default();
+        // Without a state there is nothing to compare with: the session started without an
+        // answer.
+        let graph_changed = self.watched.state.is_none() || watched.graph_changed;
+        let relevant = recovered
+            || graph_changed
+            || changes.server
+            || !changes.build.is_empty()
+            || !changes.hold.is_empty();
+
+        // A build since the changes were read has used them already.
+        let fresh = std::mem::take(&mut self.fresh);
+        let is_news = |name: &String, paths: &mut Vec<String>| {
+            let Some(fresh) = fresh.get(name) else {
+                return true;
+            };
+            let asked = paths.len();
+            paths.retain(|path| !fresh.contains(path));
+            // Without paths, the targets of the output changed.
+            asked == 0 || !paths.is_empty()
+        };
+        let mut hold = changes.hold;
+        hold.retain(is_news);
+        let mut build = changes.build;
+        build.retain(is_news);
+        for (name, paths) in hold {
+            self.held.entry(name).or_default().extend(paths);
+        }
+        self.send_stale();
+        build.retain(|name, _| !self.held.contains_key(name));
+        let files: BTreeSet<String> = build
+            .values()
+            .flatten()
+            .map(|path| self.absolute(path))
+            .collect();
+        let outputs: Vec<String> = build.into_keys().collect();
+
+        self.started_after.clear();
+        self.missed = false;
+        self.unacted.clear();
+        self.watched.state = Some(watched.state.clone());
+        self.take_watched(watched)?;
+        self.graph_dirty |= graph_changed;
+        self.resolve_due |= graph_changed;
+
+        // The server's command is built again only if it may be new, and a server that exited
+        // starts again after a change that is something to it or to an output.
+        let cancelled = !self.cancelled_outputs.is_empty();
+        let start_exited = relevant || cancelled;
+        if changes.server
+            || recovered
+            || self.resolve_due
+            || (self.link.server.is_none() && start_exited)
+        {
+            let resolved = self.reresolve(start_exited).await?;
+            if let Some(messages) = &resolved.failed {
+                if relevant || self.resolve_failure.as_ref() != Some(messages) {
+                    self.send_failed(messages.clone());
+                }
+                self.resolve_failure = Some(messages.clone());
+                if self.link.server.is_none() {
+                    // The next analysis starts the server, which asks for what it needs.
+                    self.restart_due = true;
+                    return Ok(());
+                }
+            }
+            if resolved.respawned {
+                // The new server asks for the outputs it needs.
+                return Ok(());
+            }
+        }
+        if !outputs.is_empty() || cancelled {
+            self.build(outputs, files.into_iter().collect(), false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Tell the server about the files whose changes wait, and the outputs that are held
+    /// back, if they are not what it was last told.
     fn send_stale(&mut self) {
-        let stale: Vec<String> = self
+        let mut files: Vec<String> = self
             .pending
             .iter()
             .map(|path| self.absolute(path))
             .collect();
-        if stale != self.stale {
-            self.stale = stale;
-            self.link
-                .send(json!({"type": "stale", "files": self.stale}));
+        let held: BTreeSet<&String> = self.held.values().flatten().collect();
+        files.extend(held.into_iter().map(|path| self.absolute(path)));
+        let stale = Stale {
+            files,
+            outputs: self.by_output.then(|| self.held.keys().cloned().collect()),
+        };
+        if stale != self.stale && !(stale.is_empty() && self.stale.is_empty()) {
+            self.link.send(stale.message());
         }
+        self.stale = stale;
     }
 
     /// Keep what `watched` says about the watch sets.
     fn take_watched(&mut self, watched: DevWatched) -> buck2_error::Result<()> {
+        self.by_output = watched.outputs.is_some();
+        self.watched.output_targets = watched.outputs.as_ref().map_or(0, |o| o.targets);
         if watched.incomplete != self.watched.incomplete {
             for message in &watched.incomplete {
                 self.link.console.message(format!(
@@ -1388,7 +1531,8 @@ impl<'a> Session<'a> {
             return self.restart().await;
         }
         if !outputs.is_empty() || cancelled {
-            self.build(outputs.into_iter().collect(), files).await?;
+            self.build(outputs.into_iter().collect(), files, false)
+                .await?;
         }
         if restart {
             if resolve_failed {
@@ -1459,6 +1603,8 @@ impl<'a> Session<'a> {
     }
 
     /// Build `outputs`, and the outputs of a build that the daemon stopped, and tell the server.
+    /// `requested` says that the server asked for `outputs`. An output that is held back is
+    /// built only if the server asked for it, and a build of it lets it go.
     /// The daemon stops the build if a file that it builds from changes; other changes during
     /// the build are handled after it.
     /// Returns `false` if the build failed.
@@ -1466,9 +1612,23 @@ impl<'a> Session<'a> {
         &mut self,
         outputs: Vec<String>,
         files: Vec<String>,
+        requested: bool,
     ) -> buck2_error::Result<bool> {
         let mut outputs: BTreeSet<String> = outputs.into_iter().collect();
+        let mut requested = if requested {
+            outputs.clone()
+        } else {
+            BTreeSet::new()
+        };
+        requested.append(&mut self.cancelled_requested);
         outputs.append(&mut self.cancelled_outputs);
+        // An output that was held back after the build of it that the daemon stopped began.
+        let wanted = outputs.len();
+        outputs.retain(|name| requested.contains(name) || !self.held.contains_key(name));
+        if outputs.is_empty() && wanted != 0 {
+            self.cancelled_files.clear();
+            return Ok(true);
+        }
         let outputs: Vec<String> = outputs.into_iter().collect();
         let mut files: BTreeSet<String> = files.into_iter().collect();
         files.append(&mut self.cancelled_files);
@@ -1510,7 +1670,15 @@ impl<'a> Session<'a> {
             }
             Outcome::Done(DevResponse::Build(built)) => {
                 let mut message = serde_json::Map::new();
+                // The changes that `buck2 dev` has read: the daemon stops a build when a file
+                // that it builds from changes, so this build used them.
+                let known: BTreeSet<String> = self.queued.union(&self.unacted).cloned().collect();
                 for (name, output) in built.outputs {
+                    // The server has the output as the files are now.
+                    self.held.remove(&name);
+                    if self.by_output {
+                        self.fresh.insert(name.clone(), known.clone());
+                    }
                     let changed =
                         self.digests.get(&name) != Some(&output.digest) || output.digest.is_none();
                     self.digests.insert(name.clone(), output.digest.clone());
@@ -1542,12 +1710,15 @@ impl<'a> Session<'a> {
                         }),
                     );
                     self.last_build = Some(("partly failed", started.elapsed()));
+                    self.send_stale();
                     return Ok(false);
                 }
+                self.send_stale();
             }
             Outcome::Done(DevResponse::Interrupted(interrupted)) => {
                 self.cancelled_outputs.extend(outputs);
                 self.cancelled_files.extend(files);
+                self.cancelled_requested.extend(requested);
                 self.link
                     .send_result(generation, json!({"type": "cancelled", "gen": generation}));
                 // `buck2 dev` has these changes from the file watcher too, but asks about them in
@@ -1685,6 +1856,11 @@ impl<'a> Session<'a> {
         self.digests.clear();
         self.cancelled_outputs.clear();
         self.cancelled_files.clear();
+        self.cancelled_requested.clear();
+        // Nothing that the new server has is stale: it has nothing yet.
+        self.held.clear();
+        self.fresh.clear();
+        self.send_stale();
         if let Err(e) = self.spawn().await {
             self.link.console.message(format!(
                 "{:#}\n`buck2 dev` starts the server again after the next change.",

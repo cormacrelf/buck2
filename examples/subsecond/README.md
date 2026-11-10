@@ -59,11 +59,15 @@ restarts the server, and the app with it, when either gets new contents. The
 app's binary is not in the command: it is the `exe` output, which the server
 asks for when it starts. So a new binary restarts the app, not the server.
 
-The watch sets in `defs.bzl`:
+The outputs in `defs.bzl` say when `buck2 dev` builds them by itself:
 
-1. A change to `//app:app` builds `patch`.
-2. Any other change builds `exe`. The server starts the app again if the binary
-   changed.
+1. `patch` has `only = [//app:app]`: a change to that crate builds `patch`.
+   After any other change that `patch` may be built from, `buck2 dev` stops
+   building it, and tells the server that it is stale.
+2. `exe` has `only = []`: `buck2 dev` builds it only when the server asks.
+
+The server asks for both when it starts, and again when `patch` is stale. It
+starts the app again if the binary changed.
 
 If a patch calls a function that the binary does not have, such as a function
 of the standard library that the binary does not use, or a generic function with
