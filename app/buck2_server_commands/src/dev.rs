@@ -72,8 +72,6 @@ use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::metadata::FileType;
 use buck2_common::file_ops::metadata::RawPathMetadata;
 use buck2_common::file_ops::metadata::RawSymlink;
-use buck2_common::file_ops::path_check::PathCheck;
-use buck2_common::file_ops::path_check::check_path;
 use buck2_common::io::IoProvider;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
 use buck2_core::bzl::ImportPath;
@@ -704,27 +702,25 @@ async fn full_claims(
         }
     }
     // A source file that is a symlink is built from the file that it points at, which the set
-    // claims too. What a path is says whether it is one without reading it, so this depends on
-    // the contents of no file that is not a symlink.
-    let mut links: Vec<(usize, CellPath)> = files
-        .values()
-        .map(|(set, path)| (*set, path.dupe()))
-        .collect();
+    // claims too. Whether a path is a symlink, or is behind one, comes from the listings of the
+    // directories above it, so this depends on the contents of no file, and on the listing of
+    // a directory only for which of its entries are symlinks.
+    let mut symlinks = Symlinks::default();
+    symlinks
+        .fill(dice, cell_resolver, files.keys().map(|path| &**path))
+        .await?;
+    let mut links: Vec<(usize, CellPath)> = Vec::new();
+    for (path, (set, cell_path)) in &files {
+        if symlinks.is_behind(dice, cell_resolver, path).await? {
+            links.push((*set, cell_path.dupe()));
+        }
+    }
     for _ in 0..MAX_SYMLINK_HOPS {
         if links.is_empty() {
             break;
         }
         let targets = dice
             .try_compute_join(links, async |dice, (set, path)| {
-                let cell_resolver = dice.get_cell_resolver().await?;
-                let rel = cell_resolver.resolve_path(path)?;
-                let check = check_path(dice, IProjectRelativePath::intern_directly(&rel)).await?;
-                if !matches!(
-                    check,
-                    PathCheck::Present(FileType::Symlink) | PathCheck::ParentSymlink { .. }
-                ) {
-                    return buck2_error::Ok(None);
-                }
                 let target =
                     match DiceFileComputations::read_path_metadata_if_exists(dice, path).await? {
                         Some(RawPathMetadata::Symlink {
@@ -738,10 +734,13 @@ async fn full_claims(
             .await?;
         links = Vec::new();
         for (set, target) in targets.into_iter().flatten() {
-            let new = project_path(cell_resolver, target.dupe())?
-                .is_some_and(|rel| !files.contains_key(&rel));
+            let Some(rel) = project_path(cell_resolver, target.dupe())? else {
+                continue;
+            };
+            let new = !files.contains_key(&rel);
             claim_file(&mut files, cell_resolver, target.dupe(), set)?;
-            if new {
+            // Only a symlink is read again: reading a file would depend on its contents.
+            if new && symlinks.is_behind(dice, cell_resolver, &rel).await? {
                 links.push((set, target));
             }
         }
@@ -763,6 +762,193 @@ async fn full_claims(
         notify_sets,
         incomplete,
     })
+}
+
+/// Which paths are symlinks, or are behind one, from the listings of the directories above them.
+#[derive(Default)]
+struct Symlinks {
+    /// For each directory, whether it is a symlink or is behind one.
+    behind: BuckMutMap<ProjectRelativePathBuf, bool>,
+    /// The entries of each directory that are symlinks.
+    links: BuckMutMap<ProjectRelativePathBuf, Arc<Vec<String>>>,
+}
+
+impl Symlinks {
+    /// Find which of the directories above `paths` are symlinks or behind one, and the symlinks
+    /// in the others. The directories of one depth are looked at together, after those above
+    /// them, so that no directory behind a symlink is listed.
+    async fn fill<'a>(
+        &mut self,
+        dice: &mut DiceComputations<'_>,
+        cell_resolver: &CellResolver,
+        paths: impl Iterator<Item = &'a ProjectRelativePath>,
+    ) -> buck2_error::Result<()> {
+        let mut seen: BuckMutSet<&ProjectRelativePath> = BuckMutSet::default();
+        let mut by_depth: Vec<Vec<&ProjectRelativePath>> = Vec::new();
+        for path in paths {
+            let mut above = path.parent();
+            while let Some(dir) = above {
+                if self.behind.contains_key(dir) || !seen.insert(dir) {
+                    break;
+                }
+                let depth = dir
+                    .as_str()
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .count();
+                if by_depth.len() <= depth {
+                    by_depth.resize_with(depth + 1, Vec::new);
+                }
+                by_depth[depth].push(dir);
+                above = dir.parent();
+            }
+        }
+        for dirs in by_depth {
+            let mut listed = Vec::new();
+            for dir in dirs {
+                let behind = match (dir.parent(), dir.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        self.behind.get(parent).copied().unwrap_or(false)
+                            || self.links.get(parent).is_some_and(|links| {
+                                links
+                                    .binary_search_by(|link| link.as_str().cmp(name.as_str()))
+                                    .is_ok()
+                            })
+                    }
+                    // The project root.
+                    _ => false,
+                };
+                self.behind.insert(dir.to_owned(), behind);
+                if !behind && !self.links.contains_key(dir) {
+                    listed.push(dir);
+                }
+            }
+            let found = dice
+                .try_compute_join(listed, async |dice, dir| {
+                    let links = dice
+                        .compute(&DevDirLinksKey(cell_resolver.get_cell_path(&dir)))
+                        .await?
+                        .dupe();
+                    buck2_error::Ok((dir, links))
+                })
+                .await?;
+            for (dir, links) in found {
+                self.links.insert(dir.to_owned(), links);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `path` is a symlink, or a directory above it is.
+    async fn is_behind(
+        &mut self,
+        dice: &mut DiceComputations<'_>,
+        cell_resolver: &CellResolver,
+        path: &ProjectRelativePath,
+    ) -> buck2_error::Result<bool> {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            // The project root.
+            return Ok(false);
+        };
+        if let Some(behind) = self.behind.get(path) {
+            return Ok(*behind);
+        }
+        // The directories above `path` whose answer is not known yet, the highest last.
+        let mut unknown: Vec<&ProjectRelativePath> = Vec::new();
+        let mut above = Some(dir);
+        while let Some(dir) = above {
+            if self.behind.contains_key(dir) {
+                break;
+            }
+            unknown.push(dir);
+            above = dir.parent();
+        }
+        for dir in unknown.into_iter().rev() {
+            let behind = match (dir.parent(), dir.file_name()) {
+                (Some(parent), Some(name)) => {
+                    self.behind.get(parent).copied().unwrap_or(false)
+                        || self
+                            .is_link(dice, cell_resolver, parent, name.as_str())
+                            .await?
+                }
+                // The project root.
+                _ => false,
+            };
+            self.behind.insert(dir.to_owned(), behind);
+        }
+        Ok(self.behind.get(dir).copied().unwrap_or(false)
+            || self
+                .is_link(dice, cell_resolver, dir, name.as_str())
+                .await?)
+    }
+
+    /// Whether the entry `name` of `dir`, which is behind no symlink, is a symlink.
+    async fn is_link(
+        &mut self,
+        dice: &mut DiceComputations<'_>,
+        cell_resolver: &CellResolver,
+        dir: &ProjectRelativePath,
+        name: &str,
+    ) -> buck2_error::Result<bool> {
+        let links = match self.links.get(dir) {
+            Some(links) => links,
+            None => {
+                let links = dice
+                    .compute(&DevDirLinksKey(cell_resolver.get_cell_path(&dir)))
+                    .await?
+                    .dupe();
+                self.links.entry(dir.to_owned()).or_insert(links)
+            }
+        };
+        Ok(links
+            .binary_search_by(|link| link.as_str().cmp(name))
+            .is_ok())
+    }
+}
+
+/// The names of the entries of a directory that are symlinks, sorted. Empty for a directory that
+/// cannot be listed.
+///
+/// What the watch sets claim depends on this, and not on the listing: a file that is added to
+/// the directory, or removed from it, then leaves the claims as they are.
+#[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[pagable_typetag(dice::DiceKeyDyn)]
+struct DevDirLinksKey(CellPath);
+
+impl std::fmt::Display for DevDirLinksKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DevDirLinks({})", self.0)
+    }
+}
+
+#[async_trait]
+impl Key for DevDirLinksKey {
+    type Value = Arc<Vec<String>>;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellations: &CancellationContext,
+    ) -> Self::Value {
+        let links = match DiceFileComputations::read_dir(ctx, self.0).await {
+            Ok(listing) => listing
+                .included
+                .iter_with_tag()
+                .filter(|(_, file_type)| *file_type == FileType::Symlink)
+                .map(|(name, _)| name.as_str().to_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        Arc::new(links)
+    }
+
+    fn equality_behavior() -> EqualityBehavior<Self::Value> {
+        EqualityBehavior::Compare(|x, y| x == y)
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
 }
 
 /// No watch set, in the tables of a `DevClaims`.
