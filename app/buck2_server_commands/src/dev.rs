@@ -26,6 +26,8 @@ use std::collections::VecDeque;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use buck2_artifact::actions::key::ActionKey;
@@ -48,6 +50,7 @@ use buck2_build_api::materialize::materialize_and_upload_artifact_group;
 use buck2_cli_proto::new_generic::DevAction;
 use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
+use buck2_cli_proto::new_generic::DevInterrupted;
 use buck2_cli_proto::new_generic::DevPath;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
@@ -60,12 +63,14 @@ use buck2_cli_proto::new_generic::DevWatched;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::metadata::RawPathMetadata;
+use buck2_common::io::IoProvider;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
+use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
@@ -76,6 +81,7 @@ use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::BuildResult;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
@@ -84,6 +90,7 @@ use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_node::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::target_calculation::ConfiguredTargetCalculation;
+use buck2_server_ctx::ctx::FileChangeBatch;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
 use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
@@ -93,6 +100,8 @@ use buck2_server_ctx::template::run_server_command;
 use dice::DiceComputations;
 use dice::DiceTransaction;
 use dupe::Dupe;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
@@ -115,11 +124,27 @@ pub(crate) async fn dev_command(
     partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
     req: DevRequest,
 ) -> buck2_error::Result<DevResponse> {
-    run_server_command(DevServerCommand { req }, ctx, partial_result_dispatcher).await
+    // A build stops when a file that it builds from changes. Subscribe before the command syncs
+    // the file watcher, so that no change falls between what the build sees and what the
+    // subscription reports. A change in between is reported but is no change to the build.
+    let changes = match &req.action {
+        DevAction::Build { .. } => ctx.subscribe_to_file_changes().await.ok(),
+        DevAction::Server | DevAction::Watch(_) => None,
+    };
+    run_server_command(
+        DevServerCommand {
+            req,
+            changes: Mutex::new(changes),
+        },
+        ctx,
+        partial_result_dispatcher,
+    )
+    .await
 }
 
 struct DevServerCommand {
     req: DevRequest,
+    changes: Mutex<Option<BoxStream<'static, FileChangeBatch>>>,
 }
 
 #[async_trait]
@@ -135,7 +160,12 @@ impl ServerCommandTemplate for DevServerCommand {
         _partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
         mut ctx: DiceTransaction,
     ) -> buck2_error::Result<Self::Response> {
-        dev(server_ctx, &mut ctx, &self.req).await
+        let changes = self
+            .changes
+            .lock()
+            .ok()
+            .and_then(|mut changes| changes.take());
+        dev(server_ctx, &mut ctx, &self.req, changes).await
     }
 
     fn build_result(&self, _response: &Self::Response) -> Option<BuildResult> {
@@ -149,6 +179,7 @@ async fn dev(
     server_ctx: &dyn ServerCommandContextTrait,
     ctx: &mut DiceTransaction,
     req: &DevRequest,
+    changes: Option<BoxStream<'static, FileChangeBatch>>,
 ) -> buck2_error::Result<DevResponse> {
     let label = configured_label(server_ctx, &mut ctx.ctx(), req).await?;
     let providers = ctx
@@ -234,11 +265,108 @@ async fn dev(
                 })?;
                 wanted.push((name.clone(), artifact.dupe()));
             }
-            Ok(DevResponse::Build(
-                build(server_ctx.project_root(), &mut ctx.ctx(), wanted).await?,
-            ))
+            let Some(changes) = changes else {
+                return Ok(DevResponse::Build(
+                    build(server_ctx.project_root(), &mut ctx.ctx(), wanted).await?,
+                ));
+            };
+            // The files that the build must not outlive a change to, as this command sees them.
+            let watch = info.as_ref().value().as_ref().watch()?;
+            let files = claims(&mut ctx.ctx(), &label, &watch)
+                .await?
+                .without_waiting(&watch);
+            let known: BuckMutMap<ProjectRelativePathBuf, Option<FileShape>> = ctx
+                .ctx()
+                .try_compute_join(files, async |dice, (path, cell_path)| {
+                    let metadata =
+                        DiceFileComputations::read_path_metadata_if_exists(dice, cell_path).await?;
+                    buck2_error::Ok((path, metadata.map(FileShape::of)))
+                })
+                .await?
+                .into_iter()
+                .collect();
+            let io = ctx
+                .ctx()
+                .global_data()
+                .get::<Arc<dyn IoProvider>>()
+                .map_err(|_| internal_error!("The daemon has no I/O provider"))?
+                .dupe();
+            let mut dice = ctx.ctx();
+            tokio::select! {
+                built = build(server_ctx.project_root(), &mut dice, wanted) => {
+                    Ok(DevResponse::Build(built?))
+                }
+                // Dropping the build cancels it.
+                interrupted = changed_files(changes, known, io) => {
+                    Ok(DevResponse::Interrupted(interrupted))
+                }
+            }
         }
     }
+}
+
+/// What a file is, to tell whether it changed.
+#[derive(PartialEq, Eq)]
+enum FileShape {
+    File {
+        digest: String,
+        executable: bool,
+    },
+    /// The target of a symlink is not compared.
+    Symlink,
+    Directory,
+}
+
+impl FileShape {
+    fn of<T>(metadata: RawPathMetadata<T>) -> FileShape {
+        match metadata {
+            RawPathMetadata::File(file) => FileShape::File {
+                digest: file.digest.data().to_string(),
+                executable: file.is_executable,
+            },
+            RawPathMetadata::Symlink { .. } => FileShape::Symlink,
+            RawPathMetadata::Directory => FileShape::Directory,
+        }
+    }
+}
+
+/// Wait for one of the `known` files to change from what this command saw, and say which did.
+/// A file saved without a change, or one that nothing builds from, is no change.
+async fn changed_files(
+    mut changes: BoxStream<'static, FileChangeBatch>,
+    known: BuckMutMap<ProjectRelativePathBuf, Option<FileShape>>,
+    io: Arc<dyn IoProvider>,
+) -> DevInterrupted {
+    while let Some(batch) = changes.next().await {
+        if batch.missed {
+            return DevInterrupted {
+                paths: Vec::new(),
+                missed: true,
+            };
+        }
+        let mut changed = Vec::new();
+        for path in batch.paths {
+            let Some(before) = known.get(&path) else {
+                continue;
+            };
+            let now = io
+                .read_path_metadata_if_exists_impl(IProjectRelativePath::intern_directly(&path))
+                .await
+                .map(|metadata| metadata.map(FileShape::of));
+            // A file that cannot be read now counts as changed.
+            if now.as_ref().ok() != Some(before) {
+                changed.push(path.to_string());
+            }
+        }
+        if !changed.is_empty() {
+            return DevInterrupted {
+                paths: changed,
+                missed: false,
+            };
+        }
+    }
+    // The file watcher is gone, as when the daemon shuts down.
+    futures::future::pending().await
 }
 
 async fn configured_label(
@@ -300,16 +428,52 @@ async fn build(
     Ok(DevBuilt { outputs })
 }
 
+/// What the watch sets claim.
+struct Claims {
+    /// Each source file, with the set that claims it.
+    files: BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)>,
+    /// The targets of each set.
+    set_targets: Vec<Vec<ConfiguredTargetNode>>,
+    /// Each build file of the graph, with whether a change to it waits.
+    build_files: BTreeMap<ProjectRelativePathBuf, (bool, CellPath)>,
+    /// The `.bzl` files that the graph loads.
+    bzl_files: BTreeMap<ProjectRelativePathBuf, CellPath>,
+    /// Whether there is a `notify` set. A change to a `.bzl` file then waits.
+    notify_sets: bool,
+    incomplete: Vec<String>,
+}
+
+impl Claims {
+    /// The files whose change makes a build out of date: those that a set that builds or
+    /// restarts claims, and the build files and `.bzl` files whose change does not wait.
+    fn without_waiting(self, watch: &[DevWatchSpec]) -> Vec<(ProjectRelativePathBuf, CellPath)> {
+        let mut files: Vec<(ProjectRelativePathBuf, CellPath)> = self
+            .files
+            .into_iter()
+            .filter(|(_, (set, _))| !watch[*set].build.is_empty() || watch[*set].restart)
+            .map(|(path, (_, cell_path))| (path, cell_path))
+            .collect();
+        files.extend(
+            self.build_files
+                .into_iter()
+                .filter(|(_, (waits, _))| !waits)
+                .map(|(path, (_, cell_path))| (path, cell_path)),
+        );
+        if !self.notify_sets {
+            files.extend(self.bzl_files);
+        }
+        files
+    }
+}
+
 /// Walk the configured dependency graph of `label`, and the action graph below the `inputs` of
 /// each watch set. Give each source file, and each target, to the first watch set that claims
-/// it. Then say what the requested paths are, and what changed since `request.previous`, from
-/// the files as they are now.
-async fn watch_files(
+/// it.
+async fn claims(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
     watch: &[DevWatchSpec],
-    request: &DevWatchRequest,
-) -> buck2_error::Result<DevWatched> {
+) -> buck2_error::Result<Claims> {
     let cell_resolver = dice.get_cell_resolver().await?;
     let cell = label.target().pkg().cell_name();
     let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?;
@@ -391,7 +555,7 @@ async fn watch_files(
     }
 
     let notify_sets = watch.iter().any(|spec| spec.notify);
-    let mut set_targets: Vec<Vec<&ConfiguredTargetNode>> = vec![Vec::new(); watch.len()];
+    let mut set_targets: Vec<Vec<ConfiguredTargetNode>> = vec![Vec::new(); watch.len()];
     // Each build file, with whether a change to it waits.
     let mut build_files: BTreeMap<ProjectRelativePathBuf, (bool, CellPath)> = BTreeMap::new();
     let mut packages = BTreeSet::new();
@@ -403,7 +567,7 @@ async fn watch_files(
         }
         let set = targets.get(node.label()).copied();
         if let Some(set) = set {
-            set_targets[set].push(node);
+            set_targets[set].push(node.dupe());
         }
         packages.insert(node.label().pkg());
         let buildfile = node.buildfile_path().path();
@@ -413,6 +577,37 @@ async fn watch_files(
         }
     }
     let bzl_files = loaded_files(dice, cell_resolver, packages).await?;
+    // A build file changes the graph, even when a target also uses it as a source file.
+    for path in build_files.keys() {
+        files.remove(path);
+    }
+    Ok(Claims {
+        files,
+        set_targets,
+        build_files,
+        bzl_files,
+        notify_sets,
+        incomplete,
+    })
+}
+
+/// Find what the watch sets claim. Then say what the requested paths are, and what changed since
+/// `request.previous`, from the files as they are now.
+async fn watch_files(
+    dice: &mut DiceComputations<'_>,
+    label: &ConfiguredProvidersLabel,
+    watch: &[DevWatchSpec],
+    request: &DevWatchRequest,
+) -> buck2_error::Result<DevWatched> {
+    let Claims {
+        files,
+        set_targets,
+        build_files,
+        bzl_files,
+        notify_sets,
+        incomplete,
+    } = claims(dice, label, watch).await?;
+    let cell_resolver = dice.get_cell_resolver().await?;
 
     // The contents of every file that the answer depends on, as the daemon knows them.
     let mut cell_paths: Vec<CellPath> = files.values().map(|(_, path)| path.dupe()).collect();
@@ -436,7 +631,7 @@ async fn watch_files(
         .into_iter()
         .zip(&mut set_files)
         .map(|(nodes, files)| DevSetState {
-            targets_digest: targets_digest(nodes),
+            targets_digest: targets_digest(nodes.iter().collect()),
             files_digest: files_digest(files),
         })
         .collect();

@@ -339,20 +339,23 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_change_during_a_build_is_built_after_it(self, buck: Buck) -> None:
+    async def test_change_during_a_build_cancels_it(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow")
         try:
             await dev.wait_for("built")
 
-            # Start a dev build that takes 3 seconds.
-            write(buck, "app/delay.txt", "3\n")
+            # Start a dev build that takes 60 seconds.
+            write(buck, "app/delay.txt", "60\n")
             first = await dev.wait_for("building")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
-            # A change during the build does not stop it. Once it is built, the change is.
+            # A change to a file that the build builds from stops it, and the next build
+            # starts once the files stop changing.
+            start = time.monotonic()
+            write(buck, "app/delay.txt", "0\n")
             write(buck, "app/main.txt", "app v2\n")
-            built = await dev.wait_for("built")
-            assert built["gen"] == first["gen"]
+            cancelled = await dev.wait_for("cancelled")
+            assert cancelled["gen"] == first["gen"]
             building = await dev.wait_for("building")
             assert path(buck, "app/main.txt") in [
                 os.path.realpath(f) for f in building["files"]
@@ -360,27 +363,72 @@ class DevTest(BuckTestCase):
             built = await dev.wait_for("built")
             assert built["gen"] == building["gen"]
             assert site(built) == "app v2\n"
-            assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
+            assert time.monotonic() - start < 30
         finally:
             await dev.stop()
 
     @dev_test()
-    async def test_unrelated_change_during_a_build_builds_nothing_more(
+    async def test_change_that_the_build_does_not_use_does_not_cancel_it(
         self, buck: Buck
     ) -> None:
         dev = await start_dev(buck, "//app:slow")
         try:
             await dev.wait_for("built")
 
-            write(buck, "app/delay.txt", "3\n")
+            write(buck, "app/delay.txt", "4\n")
             first = await dev.wait_for("building")
             await asyncio.sleep(1)
 
-            # A new file that no target uses.
+            # A new file that no target uses, and a file of the build saved unchanged.
             write(buck, "app/unrelated.txt", "unrelated\n")
+            os.utime(buck.cwd / "app/main.txt")
             built = await dev.wait_for("built")
             assert built["gen"] == first["gen"]
             await dev.assert_none("building", 3)
+            assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_change_that_waits_does_not_cancel_a_build(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:auto_slow")
+        try:
+            await dev.wait_for("built")
+
+            write(buck, "app/delay.txt", "4\n")
+            first = await dev.wait_for("building")
+            await asyncio.sleep(1)
+
+            # `lib` is in the `notify` set: its change waits, and does not stop the build.
+            write(buck, "lib/lib.txt", "lib v2\n")
+            built = await dev.wait_for("built")
+            assert built["gen"] == first["gen"]
+            stale = await dev.wait_for("stale")
+            assert stale["files"] != []
+            assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_change_during_a_build_is_built_after_it(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:pages_slow")
+        try:
+            await dev.wait_for("built")
+
+            write(buck, "app/delay.txt", "4\n")
+            first = await dev.wait_for("building")
+            await asyncio.sleep(1)
+
+            # A new file that the build does not use yet: the build goes on, and the next one,
+            # with the file, starts after it.
+            write(buck, "app/pages/b.txt", "page b\n")
+            built = await dev.wait_for("built")
+            assert built["gen"] == first["gen"]
+            await dev.wait_for("graph_changed")
+            built = await dev.wait_for("built")
+            assert built["gen"] > first["gen"]
+            assert site(built) == "page a\npage b\n"
+            assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
         finally:
             await dev.stop()
 

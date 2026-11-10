@@ -111,6 +111,23 @@ dev_app(
 )
 
 dev_app(
+    name = "auto_slow",
+    mode = "auto",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    delay = "delay.txt",
+    server = "server.py",
+)
+
+dev_app(
+    name = "pages_slow",
+    mode = "all",
+    srcs = glob(["pages/*.txt"]),
+    delay = "delay.txt",
+    server = "server.py",
+)
+
+dev_app(
     name = "inputs",
     mode = "inputs",
     srcs = ["main.txt"],

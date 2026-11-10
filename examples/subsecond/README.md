@@ -19,8 +19,7 @@ access for the crates from crates.io.
 `//app:app` is the crate that is patched, and `//app:main` is the binary.
 `//app:app` includes a module that `//app:slow` makes after a 10 second sleep,
 so each build of the crate is slow: change `src/lib.rs` again during a build,
-and `buck2 dev` finishes the build, sends the patch, and then builds the new
-change.
+and the daemon stops the build, and `buck2 dev` starts a new one.
 
 ### ThinLink
 

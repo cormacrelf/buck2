@@ -117,8 +117,8 @@ the default outside Meta, does; `buck2 dev` stops with an error if the
 `file_watcher` in the `[buck2]` section of `.buckconfig` names one that does
 not, such as `fs_hash_crawler`. Files that the project's ignore rules exclude,
 and `buck-out`, are never reported. If the file watcher misses changes, or the
-daemon restarts, `buck2 dev` counts every set as changed: it analyses the
-target again and does what every set asks for.
+daemon restarts, `buck2 dev` asks the daemon in the same way: the daemon
+compares contents, not events, so its answer says what changed all the same.
 
 To find the files of `inputs`, the daemon walks the action graph below them,
 each time `buck2 dev` asks. An action that a
@@ -259,23 +259,31 @@ console, and prints only errors and that the server exited or restarts.
 | `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`       | A build succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. |
 | `failed`        | `gen`, `error`                                            | A build, or the analysis of the target, failed. The errors are also on the terminal.                         |
+| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
 | `stale`         | `files`: the changed files of `notify` sets               | That list changes. An empty list means that nothing waits.                                                   |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, and `buck2 dev` analysed the target again.                   |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
 `gen` is a number that increases with each build. `building` and `built` for
 the same build have the same `gen`. A
-`building` is followed by `built` or `failed`, unless `buck2 dev` exits first.
+`building` is followed by one of `built`, `failed` and `cancelled`, unless
+`buck2 dev` exits first.
 Messages
 are sent only to a server that has sent `hello`. If a file of a `notify` set
 differs when the server sends `hello`, `ready` is followed by `stale`.
 
-`buck2 dev` does one thing at a time. Files that change while it builds, or
-while the daemon analyses the target or says what changed, do not stop that:
-the build finishes, and the server gets `built` or `failed` for it. Then
-`buck2 dev` asks about the changes, which may start the next build at once. If
-analysing fails, it sends `failed`, and analyses again after the next change,
-or before the next build that the server asks for.
+While the daemon builds, it watches the files that the build depends on: the
+files of the sets that build or restart, and the build files and `.bzl` files
+whose change does not wait (see [Changes that wait](#changes-that-wait)). If
+one of them gets different contents, the daemon stops the build, and
+`buck2 dev` sends `cancelled`, asks about the changes once the files stop
+changing, and starts the next build, which builds the stopped build's outputs
+too. Saving a file without changing it, a change to a file that the build does
+not use, and a change that waits do not stop a build. Other
+changes during a build, and changes while the daemon analyses the target or says
+what changed, are asked about once that is done. If analysing fails,
+`buck2 dev` sends `failed`, and analyses again after the next change, or before
+the next build that the server asks for.
 
 ### Requests from the server
 

@@ -841,6 +841,10 @@ struct Session<'a> {
     restart_due: bool,
     /// Changed paths that `buck2 dev` read during a request. They are handled next.
     queued: BTreeSet<String>,
+    /// The outputs and files of a build that the daemon stopped because a file that it builds
+    /// from changed. The next build builds them too.
+    cancelled_outputs: BTreeSet<String>,
+    cancelled_files: BTreeSet<String>,
 }
 
 /// What became of a daemon request.
@@ -914,6 +918,8 @@ impl<'a> Session<'a> {
             graph_dirty: false,
             restart_due: false,
             queued: BTreeSet::new(),
+            cancelled_outputs: BTreeSet::new(),
+            cancelled_files: BTreeSet::new(),
         };
         session.spawn().await?;
         Ok(Ok(session))
@@ -1085,18 +1091,15 @@ impl<'a> Session<'a> {
     async fn on_changes(&mut self, paths: BTreeSet<String>) -> buck2_error::Result<()> {
         self.unacted.extend(paths);
         let missed = self.missed;
-        if self.unacted.is_empty() && !missed {
+        if self.unacted.is_empty() && !missed && self.cancelled_outputs.is_empty() {
             return Ok(());
         }
-        // After missed changes nothing is known to compare with, so every set counts as changed,
-        // and the files whose changes wait are compared one by one.
+        // After missed changes, which files changed is not known, but what the daemon compares
+        // is contents, not changes, so its answer says what changed all the same. Only the files
+        // whose changes wait are compared one by one, all of them.
         let request = DevWatchRequest {
             paths: self.unacted.iter().cloned().collect(),
-            previous: if missed {
-                None
-            } else {
-                self.watched.state.clone()
-            },
+            previous: self.watched.state.clone(),
             waiting_digests: missed,
         };
         let watched = match self.request(|| DevAction::Watch(request.clone())).await? {
@@ -1140,7 +1143,8 @@ impl<'a> Session<'a> {
             return Ok(());
         }
 
-        let (sets, graph_changed) = if missed {
+        let (sets, graph_changed) = if self.watched.state.is_none() {
+            // Nothing to compare with: the session started without an answer.
             ((0..watched.watch.len()).collect(), true)
         } else {
             (
@@ -1208,12 +1212,13 @@ impl<'a> Session<'a> {
             outputs.extend(set.build.iter().cloned());
             restart |= set.restart;
         }
-        if self.link.server.is_none() && (restart || !outputs.is_empty()) {
+        let cancelled = !self.cancelled_outputs.is_empty();
+        if self.link.server.is_none() && (restart || !outputs.is_empty() || cancelled) {
             // The server exited. Start it again, built from the files as they are now. It asks
             // for the outputs it needs.
             return self.restart().await;
         }
-        if !outputs.is_empty() {
+        if !outputs.is_empty() || cancelled {
             self.build(outputs.into_iter().collect(), files).await?;
         }
         if restart {
@@ -1280,8 +1285,16 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Build `outputs`, and tell the server. Changes during the build are handled after it.
+    /// Build `outputs`, and the outputs of a build that the daemon stopped, and tell the server.
+    /// The daemon stops the build if a file that it builds from changes; other changes during
+    /// the build are handled after it.
     async fn build(&mut self, outputs: Vec<String>, files: Vec<String>) -> buck2_error::Result<()> {
+        let mut outputs: BTreeSet<String> = outputs.into_iter().collect();
+        outputs.append(&mut self.cancelled_outputs);
+        let outputs: Vec<String> = outputs.into_iter().collect();
+        let mut files: BTreeSet<String> = files.into_iter().collect();
+        files.append(&mut self.cancelled_files);
+        let files: Vec<String> = files.into_iter().collect();
         self.generation += 1;
         let generation = self.generation;
         self.link.send(json!({
@@ -1316,6 +1329,17 @@ impl<'a> Session<'a> {
                 self.link
                     .send(json!({"type": "built", "gen": generation, "outputs": message}));
                 self.last_build = Some(("succeeded", started.elapsed()));
+            }
+            Outcome::Done(DevResponse::Interrupted(interrupted)) => {
+                self.cancelled_outputs.extend(outputs);
+                self.cancelled_files.extend(files);
+                self.link
+                    .send(json!({"type": "cancelled", "gen": generation}));
+                // `buck2 dev` has these changes from the file watcher too, but asks about them in
+                // any case.
+                self.queued.extend(interrupted.paths);
+                self.missed |= interrupted.missed;
+                self.missed_queued |= interrupted.missed;
             }
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
@@ -1390,6 +1414,8 @@ impl<'a> Session<'a> {
         // The new server asks for what it needs.
         self.link.requests.clear();
         self.digests.clear();
+        self.cancelled_outputs.clear();
+        self.cancelled_files.clear();
         if let Err(e) = self.spawn().await {
             self.link.console.message(format!(
                 "{:#}\n`buck2 dev` starts the server again after the next change.",

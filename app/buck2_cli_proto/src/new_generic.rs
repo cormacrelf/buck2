@@ -153,7 +153,8 @@ pub enum DevAction {
     /// Find what the watch sets claim, with the files as they are now, and what changed since
     /// an earlier answer. Expanding `DevWatch.inputs` may build what dynamic actions need.
     Watch(DevWatchRequest),
-    /// Build the named `DevInfo.outputs`.
+    /// Build the named `DevInfo.outputs`. The build stops if a file that it builds from changes,
+    /// whose change does not wait.
     Build { outputs: Vec<String> },
 }
 
@@ -162,6 +163,17 @@ pub enum DevResponse {
     Server(DevServer),
     Watch(DevWatched),
     Build(DevBuilt),
+    /// The build stopped.
+    Interrupted(DevInterrupted),
+}
+
+/// Why a `Build` stopped.
+#[derive(Serialize, Deserialize)]
+pub struct DevInterrupted {
+    /// Project-relative paths of the files that changed.
+    pub paths: Vec<String>,
+    /// The file watcher missed changes, so anything may have changed.
+    pub missed: bool,
 }
 
 #[derive(Serialize, Deserialize)]

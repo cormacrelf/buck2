@@ -250,6 +250,26 @@ pub trait ServerCommandContextTrait: Send + Sync {
     fn cancellation_context(&self) -> &CancellationContext;
 
     fn command_start(&self) -> Instant;
+
+    /// The files that the daemon's file watcher sees change from now on, as they change. Only
+    /// `buck2 dev` asks, to stop a build when a file that it builds from changes; other commands
+    /// never call this.
+    async fn subscribe_to_file_changes(
+        &self,
+    ) -> buck2_error::Result<futures::stream::BoxStream<'static, FileChangeBatch>> {
+        Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Tier0,
+            "This command context cannot subscribe to file changes"
+        ))
+    }
+}
+
+/// Changes that the daemon's file watcher saw. See
+/// `ServerCommandContextTrait::subscribe_to_file_changes`.
+pub struct FileChangeBatch {
+    pub paths: Vec<buck2_core::fs::project_rel_path::ProjectRelativePathBuf>,
+    /// The watcher missed changes: anything may have changed.
+    pub missed: bool,
 }
 
 pub struct PrivateStruct(());

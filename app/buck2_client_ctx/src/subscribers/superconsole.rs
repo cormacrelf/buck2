@@ -473,10 +473,15 @@ pub struct StatefulSuperConsoleImpl {
     /// `status`.
     idle: bool,
     status: String,
+    /// When the current command of a session started.
+    command_started: Option<std::time::Instant>,
     /// To start the state afresh for each command of a session.
     trace_id: TraceId,
     expect_spans: bool,
 }
+
+/// How long a command of a session runs before the canvas shows its progress.
+const SESSION_PROGRESS_DELAY: Duration = Duration::from_millis(300);
 
 /// The canvas between the commands of a session: the client's status line.
 struct IdleStatus<'a>(&'a str);
@@ -803,6 +808,7 @@ impl StatefulSuperConsole {
             shown_interactive_console_message: false,
             idle: false,
             status: String::new(),
+            command_started: None,
             trace_id,
             expect_spans,
         }))
@@ -1599,9 +1605,17 @@ impl StatefulSuperConsoleImpl {
     }
 
     fn render(&mut self) -> buck2_error::Result<()> {
+        // A session runs many short commands, such as the ones that tell what a file change
+        // means. The status line stays until a command has run long enough to show progress, so
+        // that the canvas does not flicker for each of them.
+        let quick = self
+            .command_started
+            .is_some_and(|started| started.elapsed() < SESSION_PROGRESS_DELAY);
         if self.idle {
             // Between commands no tick draws a skipped frame later, so wait for the output.
             self.canvas.render_all(&IdleStatus(&self.status))?;
+        } else if quick {
+            self.canvas.render(&IdleStatus(&self.status))?;
         } else {
             self.canvas.render(&BuckRootComponent {
                 header: &self.header,
@@ -1616,6 +1630,7 @@ impl StatefulSuperConsoleImpl {
     /// canvas shows only this command.
     fn start_command(&mut self, event: &BuckEvent) {
         self.idle = false;
+        self.command_started = Some(std::time::Instant::now());
         let health = self
             .state
             .simple_console

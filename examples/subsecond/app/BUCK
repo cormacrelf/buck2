@@ -9,7 +9,7 @@
 load("//:defs.bzl", "subsecond_app")
 
 # A slow step in the build of `:app`, to show what happens to a build when a file changes during
-# it: `buck2 dev` finishes the build, and then builds the change. It runs when `src/lib.rs`
+# it: the daemon stops the build, and `buck2 dev` starts again. It runs when `src/lib.rs`
 # changes, and writes an empty module that `:app` includes.
 genrule(
     name = "slow",

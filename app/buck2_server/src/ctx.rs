@@ -121,6 +121,7 @@ use buck2_resource_control::HasResourceControl;
 use buck2_server_ctx::bxl::InitBxlStreamingTracker;
 use buck2_server_ctx::concurrency::DiceUpdater;
 use buck2_server_ctx::ctx::DiceAccessor;
+use buck2_server_ctx::ctx::FileChangeBatch;
 use buck2_server_ctx::ctx::LockedPreviousCommandData;
 use buck2_server_ctx::ctx::PrivateStruct;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
@@ -1559,5 +1560,26 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
 
     fn command_start(&self) -> Instant {
         self.command_start
+    }
+
+    async fn subscribe_to_file_changes(
+        &self,
+    ) -> buck2_error::Result<futures::stream::BoxStream<'static, FileChangeBatch>> {
+        let subscription = self.base_context.repo().file_watcher.subscribe().await?;
+        Ok(futures::StreamExt::boxed(futures::stream::unfold(
+            subscription,
+            async |mut subscription| {
+                let changes = subscription.next().await?;
+                let batch = FileChangeBatch {
+                    paths: changes
+                        .changes
+                        .iter()
+                        .map(|(path, _)| path.clone())
+                        .collect(),
+                    missed: changes.missed,
+                };
+                Some((batch, subscription))
+            },
+        )))
     }
 }
