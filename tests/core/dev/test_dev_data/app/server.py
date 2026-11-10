@@ -7,7 +7,7 @@
 # above-listed licenses.
 
 # A `buck2 dev` server for the tests. It connects to `BUCK2_DEV_SOCKET`, and appends each
-# message it receives, with its process ID and the content of each built output, to
+# message it receives, with its process ID and the content of each built output and sidecar, to
 # `buck-out/dev_events.jsonl`, where the file watcher does not see it. It also logs some events of
 # its own, whose types do not clash with `buck2 dev` messages. With `--log-in-project`, it also
 # appends each to `server.log` in the project root, as a server that logs to the project would.
@@ -39,8 +39,9 @@ def log(message):
     message["pid"] = os.getpid()
     if message["type"] == "built":
         for output in message["outputs"].values():
-            with open(output["path"]) as f:
-                output["content"] = f.read()
+            for artifact in [output, *output.get("sidecars", {}).values()]:
+                with open(artifact["path"]) as f:
+                    artifact["content"] = f.read()
     line = json.dumps(message) + "\n"
     with open(os.path.join("buck-out", "dev_events.jsonl"), "a") as f:
         f.write(line)

@@ -64,6 +64,7 @@ use buck2_build_api::materialize::materialize_and_upload_artifact_group;
 use buck2_cli_proto::new_generic::DevAction;
 use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
+use buck2_cli_proto::new_generic::DevBuiltSidecar;
 use buck2_cli_proto::new_generic::DevInterrupted;
 use buck2_cli_proto::new_generic::DevOutputChanges;
 use buck2_cli_proto::new_generic::DevPath;
@@ -229,6 +230,7 @@ fn dev_policy(info: &DevInfo<'_>) -> buck2_error::Result<(Policy, Vec<Slot>)> {
         return Err(DevError::TooManySlots("outputs and the server", outputs.len() + 1).into());
     }
     let only = info.only();
+    let sidecars = info.sidecars()?;
     let mut visitor = SimpleCommandLineArtifactVisitor::new();
     info.server_command_line().visit_artifacts(&mut visitor)?;
     let mut slots = vec![Slot {
@@ -240,10 +242,15 @@ fn dev_policy(info: &DevInfo<'_>) -> buck2_error::Result<(Policy, Vec<Slot>)> {
     }];
     let mut names = Vec::new();
     for (name, artifact) in outputs.iter() {
+        // What a sidecar is built from counts as what the output is built from.
+        let mut inputs = vec![ArtifactGroup::Artifact(artifact.dupe())];
+        for (_, sidecar) in sidecars.get(name).into_iter().flatten() {
+            inputs.push(ArtifactGroup::Artifact(sidecar.dupe()));
+        }
         slots.push(Slot {
             what: format!("Output `{name}`"),
             targets: Some(Vec::new()),
-            inputs: vec![ArtifactGroup::Artifact(artifact.dupe())],
+            inputs,
             only: only.get(name).cloned(),
             waits: false,
         });
@@ -413,13 +420,18 @@ async fn dev(
             ))
         }
         DevAction::Build { outputs: names } => {
-            let mut wanted: Vec<(String, Artifact)> = Vec::with_capacity(names.len());
+            let sidecars = info.as_ref().value().as_ref().sidecars()?;
+            let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
             for name in names {
                 let artifact = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
                     target: label.dupe(),
                     name: name.clone(),
                 })?;
-                wanted.push((name.clone(), artifact.dupe()));
+                wanted.push(Wanted {
+                    name: name.clone(),
+                    artifact: artifact.dupe(),
+                    sidecars: sidecars.get(name).cloned().unwrap_or_default(),
+                });
             }
             let Some(changes) = changes else {
                 return Ok(DevResponse::Build(
@@ -612,24 +624,50 @@ async fn configured_label(
         .await
 }
 
-/// Build each output on its own: one that fails does not keep the others from the server.
+/// An output to build.
+struct Wanted {
+    name: String,
+    artifact: Artifact,
+    /// The sidecars of the output, by name. They are built with it.
+    sidecars: Vec<(String, Artifact)>,
+}
+
+/// Build each output on its own: one that fails does not keep the others from the server. An
+/// output fails if one of its sidecars does.
 async fn build(
     project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
-    wanted: Vec<(String, Artifact)>,
+    wanted: Vec<Wanted>,
 ) -> buck2_error::Result<DevBuilt> {
     let artifact_fs = dice.get_artifact_fs().await?;
     let built = dice
-        .compute_join(wanted, async |dice, (name, artifact)| {
-            let values = materialize_and_upload_artifact_group(
-                dice,
-                &ArtifactGroup::Artifact(artifact.dupe()),
-                MaterializationAndUploadContext::materialize(),
-                &dice
-                    .per_transaction_data()
-                    .get_materialization_queue_tracker(),
-            )
-            .await;
+        .compute_join(wanted, async |dice, wanted| {
+            let Wanted {
+                name,
+                artifact,
+                sidecars,
+            } = wanted;
+            // The output itself has no name here.
+            let mut artifacts = vec![(None, artifact)];
+            artifacts.extend(
+                sidecars
+                    .into_iter()
+                    .map(|(sidecar, artifact)| (Some(sidecar), artifact)),
+            );
+            let values = dice
+                .try_compute_join(artifacts, async |dice, (sidecar, artifact)| {
+                    let values = materialize_and_upload_artifact_group(
+                        dice,
+                        &ArtifactGroup::Artifact(artifact),
+                        MaterializationAndUploadContext::materialize(),
+                        &dice
+                            .per_transaction_data()
+                            .get_materialization_queue_tracker(),
+                    )
+                    .await?;
+                    buck2_error::Ok((sidecar, values))
+                })
+                .await;
             (name, values)
         })
         .await;
@@ -643,16 +681,31 @@ async fn build(
                 continue;
             }
         };
-        let (artifact, value) = values
-            .iter()
-            .next()
-            .ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
-        let path = artifact.resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
+        let mut output = None;
+        let mut sidecars = BTreeMap::new();
+        for (sidecar, values) in values {
+            let (artifact, value) = values
+                .iter()
+                .next()
+                .ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
+            let path =
+                artifact.resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
+            let path = project_root.resolve(&path).to_string();
+            let digest = value.digest().map(|d| d.to_string());
+            match sidecar {
+                Some(sidecar) => {
+                    sidecars.insert(sidecar, DevBuiltSidecar { path, digest });
+                }
+                None => output = Some((path, digest)),
+            }
+        }
+        let (path, digest) = output.ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
         outputs.insert(
             name,
             DevBuiltOutput {
-                path: project_root.resolve(&path).to_string(),
-                digest: value.digest().map(|d| d.to_string()),
+                path,
+                digest,
+                sidecars,
             },
         );
     }

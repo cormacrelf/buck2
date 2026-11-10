@@ -193,6 +193,50 @@ like any change to a file that a build builds from.
 
 A `DevInfo` with `watch` cannot have outputs with `only`.
 
+## Sidecars
+
+An output is one artifact. A [`DevOutput`](../../api/build/DevOutput) can have
+more with it, by name:
+
+```python
+DevInfo(
+    server = server,
+    outputs = {
+        "patch": DevOutput(patch, sidecars = {"symbols": symbols}),
+    },
+)
+```
+
+`buck2 dev` builds the sidecars whenever it builds the output, in the same
+build, so they are made from the same files. `built` has each of them under
+the output:
+
+```json
+{"type": "built", "gen": 7, "outputs": {"patch": {
+    "path": "/project/buck-out/.../patch.so", "digest": "...", "changed": true,
+    "sidecars": {"symbols": {"path": "/project/buck-out/.../symbols.json", "digest": "...", "changed": false}}}}}
+```
+
+Each sidecar says by itself whether it changed since the last build that the
+server got, and the `changed` of the output is about the output's own artifact.
+
+A sidecar is not an output: `ready` does not name it, and the server cannot ask
+for it. It is held back with its output, and an output whose sidecar fails to
+build has failed. What a sidecar is built from counts as what the output may be
+built from, so a change to it builds the output again. Sidecars work with and
+without a watch list.
+
+Use a sidecar for a file that says what is in an output, such as a manifest
+that the output's action also writes. Or make each file of a directory a
+sidecar, named by its path in the directory: the server then knows which files
+are new without comparing the directory with the last one.
+[`examples/dev_vite`](https://github.com/facebook/buck2/tree/main/examples/dev_vite)
+does that.
+
+A sidecar is built by an action, and an action does not know the last build.
+So a sidecar can say what an output is, but not how it differs from the last
+one, except through `changed`.
+
 ## Watch sets
 
 Each `DevWatch` is a set of source files, and what to do when one of them
@@ -442,7 +486,7 @@ console, and prints only errors and that the server exited or restarts.
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`   | The server sent `hello`.                                                                                     |
 | `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
-| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
+| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
 | `stale`         | `files`: the changed files whose change waits. Without a watch list, also `outputs`: the names of the outputs that are held back, and `files` are the changes that hold them back | That list changes. An empty list means that nothing waits. After missed changes the project root is in the list: any such file may have changed. |

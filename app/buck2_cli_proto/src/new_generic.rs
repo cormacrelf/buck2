@@ -306,4 +306,15 @@ pub struct DevBuiltOutput {
     pub path: String,
     /// The content digest of the output, if it is a file or a directory.
     pub digest: Option<String>,
+    /// The sidecars of the output, by name.
+    #[serde(default)]
+    pub sidecars: BTreeMap<String, DevBuiltSidecar>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevBuiltSidecar {
+    /// Absolute path of the sidecar.
+    pub path: String,
+    /// The content digest of the sidecar, if it is a file or a directory.
+    pub digest: Option<String>,
 }

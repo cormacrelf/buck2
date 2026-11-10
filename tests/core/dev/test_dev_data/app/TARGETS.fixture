@@ -300,3 +300,14 @@ dev_app(
     server = "server.py",
     server_args = ["--all-outputs"],
 )
+
+dev_app(
+    name = "sidecars",
+    mode = "sidecars",
+    srcs = ["main.txt"],
+    extra_outputs = {
+        "check": ["check.txt"],
+        "extra": ["extra.txt"],
+    },
+    server = "server.py",
+)

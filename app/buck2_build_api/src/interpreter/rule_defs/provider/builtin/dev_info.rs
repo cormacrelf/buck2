@@ -88,6 +88,9 @@ pub struct DevInfo<'v> {
     outputs: ValueOfUnchecked<'v, DictType<String, ValueIsInputArtifactAnnotation>>,
     /// For each output that was given as a `DevOutput` with `only`: the target patterns.
     only: ValueOfUnchecked<'v, DictType<String, ListType<String>>>,
+    /// For each output that was given as a `DevOutput` with `sidecars`: those, by name.
+    sidecars:
+        ValueOfUnchecked<'v, DictType<String, DictType<String, ValueIsInputArtifactAnnotation>>>,
     /// The watch policy, as a list of `DevWatch`. Without it, the outputs carry the policy.
     watch: ValueOfUnchecked<'v, NoneOr<ListType<DevWatch<'static>>>>,
     /// Whether the server gets the terminal: its stdin, and the keys typed into it.
@@ -130,12 +133,17 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
         // to a dictionary of its own.
         let mut artifacts: Vec<(Value<'v>, Value<'v>)> = Vec::new();
         let mut only: Vec<(Value<'v>, Value<'v>)> = Vec::new();
+        let mut sidecars: Vec<(Value<'v>, Value<'v>)> = Vec::new();
         for (name, output) in outputs.entries {
             match ValueTyped::<DevOutput>::new(output) {
                 Some(output) => {
                     artifacts.push((name, output.as_ref().artifact()));
                     if let Some(patterns) = output.as_ref().only() {
                         only.push((name, heap.alloc(AllocList(patterns))));
+                    }
+                    let with = output.as_ref().sidecars();
+                    if DictRef::from_value(with).is_some_and(|with| !with.is_empty()) {
+                        sidecars.push((name, with));
                     }
                 }
                 None => artifacts.push((name, output)),
@@ -149,6 +157,7 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
             server: ValueOfUnchecked::new(heap.alloc(server)),
             outputs: ValueOfUnchecked::new(heap.alloc(AllocDict(artifacts))),
             only: ValueOfUnchecked::new(heap.alloc(AllocDict(only))),
+            sidecars: ValueOfUnchecked::new(heap.alloc(AllocDict(sidecars))),
             watch: ValueOfUnchecked::new(watch),
             interactive: heap.alloc_typed_unchecked(interactive).cast(),
         };
@@ -203,6 +212,32 @@ impl<'v> DevInfo<'v> {
                     v.0.get_bound_artifact()
                         .with_buck_error_context(|| format!("For output `{k}`"))?,
                 ))
+            })
+            .collect()
+    }
+
+    /// The sidecars of each output that has some, by name.
+    pub fn sidecars(
+        &self,
+    ) -> buck2_error::Result<BuckMutInsertionMap<String, Vec<(String, Artifact)>>> {
+        DictRef::from_value(self.sidecars.get())
+            .expect("Value is a Dict")
+            .iter()
+            .map(|(output, sidecars)| {
+                let output = output.unpack_str().expect("validated at construction");
+                let sidecars = DictRef::from_value(sidecars).expect("validated at construction");
+                let sidecars = Self::outputs_iter(&sidecars)
+                    .map(|x| {
+                        let (k, v) = x?;
+                        Ok((
+                            k.to_owned(),
+                            v.0.get_bound_artifact().with_buck_error_context(|| {
+                                format!("For sidecar `{k}` of output `{output}`")
+                            })?,
+                        ))
+                    })
+                    .collect::<buck2_error::Result<Vec<_>>>()?;
+                Ok((output.to_owned(), sidecars))
             })
             .collect()
     }

@@ -27,9 +27,20 @@ JavaScript build.
 
 The server, `server/server.py`, asks for both when it starts. Buck builds a new
 directory for each build of `app`, and Vite's file watcher does not follow a
-directory that is replaced. So the server copies each new `app` into
-`buck-out/dev_vite/app`, writes only the files whose content changed, and runs
-Vite there. Vite sees the changed files and sends the updates to the browser.
+directory that is replaced. So the server keeps the app's files in
+`buck-out/dev_vite/app`, and runs Vite there.
+
+The server does not compare the new directory with the old one to find what to
+write. In `defs.bzl`, each file of the app is also a sidecar of the `app`
+output, named by its path in the app:
+
+```python
+outputs = {"app": DevOutput(app, sidecars = files), "packages": packages}
+```
+
+`built` then has the path of each file, and whether it changed since the last
+build. The server writes the changed ones. Vite sees them and sends the updates
+to the browser.
 
 The server's command names only `server/server.py`, so `buck2 dev` restarts
 the server, and so Vite, only when that file gets new contents. `defs.bzl` has

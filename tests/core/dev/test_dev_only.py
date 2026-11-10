@@ -18,9 +18,13 @@
 #   from `app/extra.txt`.
 # - `//app:only` has `site`, `exe` and `patch`, each built from `app/main.txt` and `//lib:lib`.
 #   `exe` has `only = []` and `patch` has `only = [the target]`.
+# - `//app:sidecars` has `site`, built from `app/main.txt`, with three sidecars: `extra` and
+#   `check`, built from `app/extra.txt` and `app/check.txt`, and `src`, which is
+#   `app/main.txt` itself.
 
 import asyncio
 import os
+from typing import Any, Dict, Tuple
 
 from buck2.tests.core.common.dev.dev_util import (
     changed,
@@ -35,6 +39,14 @@ from buck2.tests.core.common.dev.dev_util import (
 )
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.buck_workspace import BuckTestCase
+
+
+def sidecars(output: Dict[str, Any]) -> Dict[str, Tuple[str, bool]]:
+    """The content of each sidecar of a built output, and whether it changed."""
+    return {
+        name: (sidecar["content"], sidecar["changed"])
+        for name, sidecar in output["sidecars"].items()
+    }
 
 
 class DevOnlyTest(BuckTestCase):
@@ -373,5 +385,53 @@ class DevOnlyTest(BuckTestCase):
             }, got
             stale = [e for e in got if e["type"] == "stale"]
             assert stale[-1]["outputs"] == ["patch"], got
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_sidecars_are_built_with_their_output(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:sidecars")
+        try:
+            _, ready, _, built = await dev.expect(
+                "started", "ready", "building", "built"
+            )
+            # A sidecar is not an output.
+            assert ready["outputs"] == ["site"]
+            check = read(buck, "app/check.txt")
+            assert sidecars(built["outputs"]["site"]) == {
+                "check": (check, True),
+                "extra": ("extra v1\n", True),
+                "src": ("app v1\n", True),
+            }
+
+            # A file that only a sidecar is built from builds the output. The sidecar is new,
+            # and the output and the other sidecars are not.
+            write(buck, "app/extra.txt", "extra v2\n")
+            building, built = await dev.expect("building", "built")
+            assert building["outputs"] == ["site"]
+            assert files(buck, building) == ["app/extra.txt"]
+            assert changed(built) == {"site": False}
+            assert sidecars(built["outputs"]["site"]) == {
+                "check": (check, False),
+                "extra": ("extra v2\n", True),
+                "src": ("app v1\n", False),
+            }
+
+            # A file of the output, which is a sidecar itself.
+            write(buck, "app/main.txt", "app v2\n")
+            _, built = await dev.expect("building", "built")
+            assert contents(built) == {"site": "app v2\n"}
+            assert changed(built) == {"site": True}
+            assert sidecars(built["outputs"]["site"]) == {
+                "check": (check, False),
+                "extra": ("extra v2\n", False),
+                "src": ("app v2\n", True),
+            }
+
+            # The server cannot ask for a sidecar by itself.
+            dev.request({"type": "build", "outputs": ["extra"]})
+            _, failed = await dev.expect("building", "failed")
+            assert "no output named `extra`" in failed["error"], failed
+            await dev.quiet()
         finally:
             await dev.stop()

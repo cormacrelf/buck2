@@ -187,6 +187,10 @@ def _dev_app(ctx):
         extra["exe"] = _concat_output(ctx, "exe.txt")
         extra["patch"] = _concat_output(ctx, "patch.txt")
         watch = None
+    elif ctx.attrs.mode == "sidecars":
+        # No watch list, and one output. The extra outputs are its sidecars, and so is its
+        # first source file.
+        watch = None
     else:
         fail("unknown mode " + ctx.attrs.mode)
     outputs = {site_name: site}
@@ -194,6 +198,10 @@ def _dev_app(ctx):
     if ctx.attrs.mode == "only":
         outputs["exe"] = DevOutput(outputs["exe"], only = [])
         outputs["patch"] = DevOutput(outputs["patch"], only = [ctx.label])
+    if ctx.attrs.mode == "sidecars":
+        sidecars = dict(extra)
+        sidecars["src"] = ctx.attrs.srcs[0]
+        outputs = {site_name: DevOutput(site, sidecars = sidecars)}
     if not ctx.attrs.dev_info:
         return [DefaultInfo(default_output = site)]
     return [

@@ -91,8 +91,12 @@ def _vite_app_impl(ctx):
             # lockfile installs the packages again, and the server restarts Vite when they
             # change. A change to the app's files builds them again; the server copies the
             # changed files to where Vite serves them, and Vite updates the browser.
+            #
+            # Each file of the app is also a sidecar of `app`, under its path in the app.
+            # `buck2 dev` tells the server which of them changed, so the server does not
+            # compare the new directory with the old one.
             server = server,
-            outputs = {"app": app, "packages": packages},
+            outputs = {"app": DevOutput(app, sidecars = files), "packages": packages},
             # Vite reads the terminal for its keyboard shortcuts.
             interactive = True,
         ),

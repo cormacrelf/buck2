@@ -864,6 +864,9 @@ struct Session<'a> {
     generation: u64,
     /// The digest of each output when it was last built.
     digests: BuckMutMap<String, Option<String>>,
+    /// The digest of each sidecar, by the names of its output and its own, when it was last
+    /// built.
+    sidecar_digests: BuckMutMap<(String, String), Option<String>>,
     /// The build files and `.bzl` files whose change waits, as the daemon last gave them. They
     /// say that a change waits when the analysis fails, and so cannot.
     waiting_graph: BTreeSet<String>,
@@ -987,6 +990,7 @@ impl<'a> Session<'a> {
             last_build: None,
             generation: 0,
             digests: BuckMutMap::default(),
+            sidecar_digests: BuckMutMap::default(),
             waiting_graph: BTreeSet::new(),
             pending: BTreeSet::new(),
             by_output: false,
@@ -1682,14 +1686,31 @@ impl<'a> Session<'a> {
                     let changed =
                         self.digests.get(&name) != Some(&output.digest) || output.digest.is_none();
                     self.digests.insert(name.clone(), output.digest.clone());
-                    message.insert(
-                        name,
-                        json!({
-                            "path": output.path,
-                            "digest": output.digest,
-                            "changed": changed,
-                        }),
-                    );
+                    let mut built = json!({
+                        "path": output.path,
+                        "digest": output.digest,
+                        "changed": changed,
+                    });
+                    if !output.sidecars.is_empty() {
+                        // Each sidecar says by itself whether it changed.
+                        let mut sidecars = serde_json::Map::new();
+                        for (sidecar, artifact) in output.sidecars {
+                            let key = (name.clone(), sidecar.clone());
+                            let changed = self.sidecar_digests.get(&key) != Some(&artifact.digest)
+                                || artifact.digest.is_none();
+                            self.sidecar_digests.insert(key, artifact.digest.clone());
+                            sidecars.insert(
+                                sidecar,
+                                json!({
+                                    "path": artifact.path,
+                                    "digest": artifact.digest,
+                                    "changed": changed,
+                                }),
+                            );
+                        }
+                        built["sidecars"] = serde_json::Value::Object(sidecars);
+                    }
+                    message.insert(name, built);
                 }
                 if built.failed.is_empty() {
                     self.link.send_result(
@@ -1854,6 +1875,7 @@ impl<'a> Session<'a> {
         // The new server asks for what it needs.
         self.link.requests.clear();
         self.digests.clear();
+        self.sidecar_digests.clear();
         self.cancelled_outputs.clear();
         self.cancelled_files.clear();
         self.cancelled_requested.clear();

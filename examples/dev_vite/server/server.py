@@ -14,10 +14,11 @@
 - `app`: the app's files, sources and generated files together.
 
 Buck replaces an output as a whole when it builds it again, and Vite's file watcher does
-not follow a directory that is replaced. So this server copies each new `app` into a
-directory that stays in place, `buck-out/dev_vite/app`, and writes only the files whose
-content changed. Vite sees those writes and updates the browser with hot module
-replacement. When `packages` changes, the server starts Vite again.
+not follow a directory that is replaced. So this server keeps the app's files in a
+directory that stays in place, `buck-out/dev_vite/app`. Each file of the app is a sidecar
+of `app`, and `built` says where each one is and whether it changed: the server writes the
+changed ones, and reads and compares nothing. Vite sees those writes and updates the
+browser with hot module replacement. When `packages` changes, the server starts Vite again.
 
 Vite runs in this server's process group, so `buck2 dev` stops it with the server.
 """
@@ -25,6 +26,7 @@ Vite runs in this server's process group, so `buck2 dev` stops it with the serve
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -46,39 +48,30 @@ def connect_to_buck2_dev():
     return sock.makefile("rwb")
 
 
-def read(path):
-    with open(path, "rb") as f:
-        return f.read()
+def sync(files, dst):
+    """Make `dst` hold `files`: the sidecars of `app`, by their paths in the app.
 
-
-def sync(src, dst):
-    """Make `dst` hold the files of `src`, writing only files whose content changed.
-
-    `node_modules` and Vite's cache, `.vite`, in `dst` are left alone. Returns the paths
-    written or removed.
+    `buck2 dev` says of each whether it changed since the last build that this server got,
+    so only those are written. `node_modules` and Vite's cache, `.vite`, in `dst` are left
+    alone. Returns the paths written or removed.
     """
     changes = []
-    wanted = set()
-    for root, _dirs, files in os.walk(src, followlinks=True):
-        rel_root = os.path.relpath(root, src)
-        for name in files:
-            rel = os.path.normpath(os.path.join(rel_root, name))
-            wanted.add(rel)
-            new = read(os.path.join(root, name))
-            target = os.path.join(dst, rel)
-            if os.path.isfile(target) and read(target) == new:
-                continue
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            # Write in place so that Vite sees a change to the file, not a new file.
-            with open(target, "wb") as f:
-                f.write(new)
-            changes.append(rel)
-    for root, dirs, files in os.walk(dst):
+    for rel, file in files.items():
+        target = os.path.join(dst, rel)
+        if not file["changed"] and os.path.isfile(target):
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # Write in place so that Vite sees a change to the file, not a new file.
+        with open(file["path"], "rb") as new, open(target, "wb") as f:
+            shutil.copyfileobj(new, f)
+        changes.append(rel)
+    # A file that the app no longer has.
+    for root, dirs, names in os.walk(dst):
         if root == dst:
             dirs[:] = [d for d in dirs if d not in ("node_modules", ".vite")]
-        for name in files:
+        for name in names:
             path = os.path.join(root, name)
-            if os.path.relpath(path, dst) not in wanted:
+            if os.path.relpath(path, dst) not in files:
                 os.remove(path)
                 changes.append("-" + os.path.relpath(path, dst))
     return changes
@@ -140,7 +133,7 @@ def main():
                 outputs = message["outputs"]
                 if "app" in outputs:
                     os.makedirs(STAGE, exist_ok=True)
-                    changes = sync(outputs["app"]["path"], STAGE)
+                    changes = sync(outputs["app"]["sidecars"], STAGE)
                     have_app = True
                     if changes:
                         log("updated " + " ".join(changes))
