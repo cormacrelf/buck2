@@ -27,12 +27,13 @@ def _subsecond_app_impl(ctx):
     return [
         DefaultInfo(default_output = exe, other_outputs = [patch]),
         DevInfo(
+            # The command names the server script and ThinLink, so a change to either
+            # restarts the server, and so the app, which the new server builds again. The
+            # app's binary is not in the command: a new binary would then restart the server.
+            # It is an output, which the server asks for when it starts.
             server = server,
             outputs = {"exe": exe, "patch": patch},
             watch = [
-                # A change to the server script or to ThinLink restarts the server, and so the
-                # app, which the new server builds again.
-                DevWatch(inputs = server, restart = True),
                 # A change to the patched crate builds a patch. The patch does not depend on
                 # the binary, so the binary stays the one that is running.
                 DevWatch(targets = [ctx.attrs.lib.label], build = ["patch"]),

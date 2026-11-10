@@ -286,22 +286,22 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_server_build_fails_with_a_build_set(self, buck: Buck) -> None:
-        """The server's own build broken, with a set that builds: changes still build the
-        output, as long as nothing analyses the target again."""
+        """The server's own build broken, with a set that builds: each change builds the server
+        again, which fails, and the old server keeps running. Changes still build the output."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            building, built = await dev.expect("building", "built")
+            failed, building, built = await dev.expect("failed", "building", "built")
+            assert "Failed to build the `buck2 dev` server" in failed["error"]
             assert files(buck, building) == ["app/check.txt"]
             assert changed(built) == {"site": False}
 
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("failed", "building", "built")
             assert site(built) == "app v2\n"
 
-            # A change to the target analyses it, which builds the server, and fails. The
-            # output still builds.
+            # A change to the target does the same.
             edit_target(
                 buck,
                 APP,
@@ -376,7 +376,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            await dev.expect("building", "built")
+            await dev.expect("failed", "building", "built")
 
             dev.request({"type": "restart"})
             (failed,) = await dev.expect("failed")

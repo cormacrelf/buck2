@@ -76,7 +76,7 @@ enum DevInfoError {
 #[repr(C)]
 #[freeze(validator = validate_dev_info)]
 pub struct DevInfo<'v> {
-    /// The command `buck2 dev` starts once and keeps running.
+    /// The command `buck2 dev` starts and keeps running, and starts again when it changes.
     server: ValueOfUnchecked<'v, FrozenStarlarkCmdArgs<'static>>,
     /// The outputs `buck2 dev` builds by name.
     outputs: ValueOfUnchecked<'v, DictType<String, ValueIsInputArtifactAnnotation>>,
@@ -92,7 +92,10 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     ///
     /// * `server`: a `RunInfo` or command line that `buck2 dev` starts and keeps running. It
     ///   may connect to the socket named in the `BUCK2_DEV_SOCKET` environment variable, to get
-    ///   messages from `buck2 dev` and send it requests, as JSON lines.
+    ///   messages from `buck2 dev` and send it requests, as JSON lines. `buck2 dev` builds the
+    ///   command again after each change, and starts the server again when the command line,
+    ///   or the contents of an artifact that it names, changed. So keep what changes often
+    ///   out of it: make that one of `outputs`, which the server asks for once it runs.
     /// * `outputs`: artifacts that `buck2 dev` builds by name.
     /// * `watch`: a list of `DevWatch`. For a changed file, the first `DevWatch` whose files
     ///   include it decides what happens.

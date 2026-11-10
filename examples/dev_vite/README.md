@@ -31,13 +31,14 @@ directory that is replaced. So the server copies each new `app` into
 `buck-out/dev_vite/app`, writes only the files whose content changed, and runs
 Vite there. Vite sees the changed files and sends the updates to the browser.
 
-The watch sets in `defs.bzl` say what each change does:
+The server's command names only `server/server.py`, so `buck2 dev` restarts
+the server, and so Vite, only when that file gets new contents. The watch sets
+in `defs.bzl` say what the other changes do:
 
-1. A change to `server/server.py` restarts the server, and so Vite.
-2. A change to `node/package.json`, the lockfile or `pnpm-workspace.yaml`
+1. A change to `node/package.json`, the lockfile or `pnpm-workspace.yaml`
    installs the packages again. The server restarts Vite on the new
    `node_modules`.
-3. Any other change builds `app` again.
+2. Any other change builds `app` again.
 
 The server talks to `buck2 dev` over the socket in `BUCK2_DEV_SOCKET`. The
 rule sets `DevInfo(interactive = True)`, so the server, and Vite, which it

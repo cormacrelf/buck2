@@ -72,14 +72,14 @@ def _static_site_impl(ctx):
         DefaultInfo(default_output = www),
         RunInfo(args = cmd_args(server, "--root", www)),
         DevInfo(
-            # `buck2 dev` starts the server once. The server asks for `www` when it starts,
-            # and serves the newest one it has been told about.
+            # `buck2 dev` starts the server, and starts it again only when the server script
+            # changes: the command names nothing else. The site is not in the command. It is
+            # an output, which the server asks for when it starts, and it serves the newest
+            # one it has been told about.
             server = server,
             outputs = {"www": www},
             watch = [
-                # A change to the server restarts it.
-                DevWatch(inputs = server, restart = True),
-                # Any other change, to a page or to the theme, builds the site again.
+                # A change to a page or to the theme builds the site again.
                 DevWatch(targets = None, build = ["www"]),
             ],
         ),

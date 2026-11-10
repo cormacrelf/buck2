@@ -28,12 +28,14 @@ Open <http://localhost:8000/>. To use another port, set `PORT`:
 
 ## What `buck2 dev` does here
 
-`static_site` gives `buck2 dev` two watch sets:
+The server's command names only `server/server.py`. `buck2 dev` builds the
+command again after each change, and when `server.py` has new contents it stops
+the server and starts it again. The site is not in the command: it is the `www`
+output, which the server asks for when it starts.
 
-1. A change to `server/server.py` stops the server, builds it again, and starts
-   it again.
-2. Any other change in the dependency graph, to a page or to the theme, builds
-   the `www` output again and tells the server its new path.
+`static_site` gives `buck2 dev` one watch set: a change in the dependency
+graph, to a page or to the theme, builds the `www` output again and tells the
+server its new path.
 
 See the rule author documentation page for `buck2 dev` for the messages between
 `buck2 dev` and the server.

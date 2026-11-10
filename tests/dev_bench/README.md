@@ -19,8 +19,7 @@ The modes are targets of the project's `app` package, which differ in their watc
 
 - `targets`: one `targets = None` set that builds a small output.
 - `inputs`: before it, a set whose `inputs` are built from every library. It builds too.
-- `restart`: the same, but the `inputs` set restarts the server, so `buck2 dev` compares the
-  contents of its files, which are all of them.
+- `restart`: the same, but the `inputs` set restarts the server.
 
 The daemon logs how long each step of finding what the watch sets claim takes, at the `debug`
 level of `buck2_server_commands::dev`. `bench.py` turns that on with `BUCK_LOG` and prints the

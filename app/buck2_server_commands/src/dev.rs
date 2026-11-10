@@ -93,9 +93,12 @@ use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::BuildResult;
+use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_execute::artifact::fs::ExecutorFs;
+use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::directory::ActionDirectoryMember;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
@@ -225,7 +228,7 @@ async fn dev(
     let outputs = info.as_ref().value().as_ref().outputs()?;
     match &req.action {
         DevAction::Server => {
-            let server = {
+            let (server, digest) = {
                 let mut dice = ctx.ctx();
                 let artifact_fs = dice.get_artifact_fs().await?;
                 let inputs = {
@@ -258,6 +261,15 @@ async fn dev(
                     PathSeparatorKind::Unix
                 };
                 let executor_fs = ExecutorFs::new(&artifact_fs, path_separator);
+                let mut contents = Vec::new();
+                for (_, values) in &ensured {
+                    for (artifact, value) in values.iter() {
+                        let path = artifact
+                            .resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
+                        contents.push((path.to_string(), value_digest(value)));
+                    }
+                }
+                let digest = contents_digest(contents);
                 let mut args = Vec::<String>::new();
                 let mapper = ArtifactPathMapperImpl::from(&ensured);
                 let mut builder = CommandLineBuilder::new_with_options(
@@ -272,11 +284,12 @@ async fn dev(
                     .as_ref()
                     .server_command_line()
                     .add_to_command_line(&mut builder)?;
-                args
+                (args, digest)
             };
             Ok(DevResponse::Server(DevServer {
                 project_root: server_ctx.project_root().root().to_string(),
                 server,
+                digest,
                 outputs: outputs.keys().cloned().collect(),
                 interactive: info.as_ref().value().as_ref().interactive(),
             }))
@@ -1497,6 +1510,39 @@ async fn file_digest(
             Some(RawPathMetadata::Directory) => Some("directory".to_owned()),
         },
     )
+}
+
+/// The contents of a built artifact: of a file, of a directory with all that is in it, or
+/// where a symlink points, and of what the symlinks in it point to.
+fn value_digest(value: &ArtifactValue) -> String {
+    let entry = match value.entry() {
+        DirectoryEntry::Dir(dir) => dir.fingerprint().data().to_string(),
+        DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) => format!(
+            "{}{}",
+            file.digest.data(),
+            if file.is_executable { "+x" } else { "" }
+        ),
+        DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(symlink)) => {
+            format!("-> {:?}", symlink.target())
+        }
+        DirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(symlink)) => {
+            format!("-> {:?}", symlink.to_path_buf())
+        }
+    };
+    match value.deps() {
+        Some(deps) => format!("{} with {}", entry, deps.fingerprint().data()),
+        None => entry,
+    }
+}
+
+/// A digest of artifacts, by their paths and their contents, which is the same in another
+/// daemon.
+fn contents_digest(mut contents: Vec<(String, String)>) -> String {
+    contents.sort();
+    contents.dedup();
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// A digest of a set of files and their contents, which is the same in another daemon.

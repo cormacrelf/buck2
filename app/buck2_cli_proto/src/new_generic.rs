@@ -187,6 +187,10 @@ pub struct DevServer {
     pub project_root: String,
     /// The server command line. Paths in it are relative to the project root.
     pub server: Vec<String>,
+    /// A digest of the contents of the artifacts that the server command line names, hidden
+    /// ones too, which is the same in another daemon. A server that runs is out of date once
+    /// this differs from what it was started with.
+    pub digest: String,
     /// The names of `DevInfo.outputs`.
     pub outputs: Vec<String>,
     /// `DevInfo.interactive`: the server gets the terminal.

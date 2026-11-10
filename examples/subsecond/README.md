@@ -54,12 +54,15 @@ The patch does not depend on the binary, so building it does not build the
 binary again. The jump table must use the binary that is running, so the server
 makes it, not a build action.
 
+The server's command names `server/server.py` and ThinLink, so `buck2 dev`
+restarts the server, and the app with it, when either gets new contents. The
+app's binary is not in the command: it is the `exe` output, which the server
+asks for when it starts. So a new binary restarts the app, not the server.
+
 The watch sets in `defs.bzl`:
 
-1. A change to `server/server.py` or to ThinLink restarts the server and the
-   app.
-2. A change to `//app:app` builds `patch`.
-3. Any other change builds `exe`. The server starts the app again if the binary
+1. A change to `//app:app` builds `patch`.
+2. Any other change builds `exe`. The server starts the app again if the binary
    changed.
 
 If a patch calls a function that the binary does not have, such as a function

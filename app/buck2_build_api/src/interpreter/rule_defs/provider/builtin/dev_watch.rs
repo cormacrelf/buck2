@@ -60,7 +60,8 @@ pub struct DevWatchSpec {
     pub inputs: Vec<ArtifactGroup>,
     /// Names of the `DevInfo.outputs` to build when a file of this set changes.
     pub build: Vec<String>,
-    /// Rebuild and restart the server when a file of this set changes.
+    /// Rebuild and restart the server when a file of this set changes, also if the server's
+    /// command is the same.
     pub restart: bool,
     /// Tell the server about changes to files of this set, and build nothing until it asks.
     pub notify: bool,
@@ -135,12 +136,13 @@ fn dev_watch_creator(globals: &mut GlobalsBuilder) {
     ///   target that owns an input, the files that its actions build the input from, and all the
     ///   source files of the other targets that those actions use, and of their dependencies.
     /// * `build`: names of `DevInfo.outputs` to build after a change.
-    /// * `restart`: rebuild the server and start it again after a change.
+    /// * `restart`: rebuild the server and start it again after a change, also if the server's
+    ///   command is the same. A server whose command changed starts again without this.
     /// * `notify`: only tell the server; build nothing until it asks.
     ///
     /// Without `targets` and `inputs`, the set is the rest of the dependency graph, as with
-    /// `targets = None`. A `DevWatch` that sets none of `build`, `restart` and `notify` makes
-    /// `buck2 dev` ignore changes to its files.
+    /// `targets = None`. A `DevWatch` that sets none of `build`, `restart` and `notify` does
+    /// nothing for its files but keep them from the sets after it.
     #[starlark(as_type = DevWatch<'static>)]
     fn DevWatch<'v>(
         #[starlark(require = named)] targets: Option<NoneOr<UnpackListOrTuple<Value<'v>>>>,

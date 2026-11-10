@@ -152,6 +152,26 @@ def _dev_app(ctx):
         # Each extra output is built when its own source files change, `site` for the rest.
         watch = [DevWatch(inputs = extra[name], build = [name]) for name in sorted(extra)]
         watch.append(DevWatch(targets = None, build = [site_name]))
+    elif ctx.attrs.mode == "patch":
+        # As a rule that patches a running program has it: `patch` is built from `srcs` only,
+        # the files that it is built from build it, and any other change waits.
+        extra["patch"] = _concat_output(ctx, "patch.txt", inputs = ctx.attrs.srcs)
+        watch = [
+            DevWatch(inputs = extra["patch"], build = ["patch"]),
+            DevWatch(targets = None, notify = True),
+        ]
+    elif ctx.attrs.mode == "unwatched":
+        # No set claims any file.
+        watch = []
+    elif ctx.attrs.mode == "wait":
+        # Every change waits, also one to what the server is built from.
+        watch = [DevWatch(targets = None, notify = True)]
+    elif ctx.attrs.mode == "kept":
+        # A set that does nothing keeps the server's files from the `notify` set.
+        watch = [
+            DevWatch(inputs = server),
+            DevWatch(targets = None, notify = True),
+        ]
     elif ctx.attrs.mode == "split":
         watch = [
             DevWatch(targets = [ctx.label], build = [site_name]),

@@ -143,6 +143,44 @@ dev_app(
 )
 
 dev_app(
+    name = "patch",
+    mode = "patch",
+    srcs = glob(["pages/*.txt"]),
+    deps = ["//lib:lib"],
+    server = "server.py",
+    server_args = ["--all-outputs"],
+)
+
+dev_app(
+    name = "pages_auto",
+    mode = "auto",
+    srcs = glob(["pages/*.txt"]),
+    deps = ["//lib:lib"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "unwatched",
+    mode = "unwatched",
+    srcs = ["main.txt"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "wait",
+    mode = "wait",
+    srcs = ["main.txt"],
+    server = "server.py",
+)
+
+dev_app(
+    name = "kept",
+    mode = "kept",
+    srcs = ["main.txt"],
+    server = "server.py",
+)
+
+dev_app(
     name = "split",
     mode = "split",
     srcs = ["main.txt"],

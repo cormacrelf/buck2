@@ -19,7 +19,10 @@ import time
 
 from buck2.tests.core.common.dev.dev_util import (
     alive,
+    assert_kept,
+    changed,
     dev_test,
+    files,
     path,
     site,
     start_dev,
@@ -354,6 +357,133 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
+    async def test_new_server_command_restarts_the_server(self, buck: Buck) -> None:
+        """No set restarts. The server's command names the server script, so new contents of
+        the script start the server again, and a save of it without a change does not."""
+        dev = await start_dev(buck, "//app:all")
+        try:
+            first = await dev.start()
+
+            # The same contents: the set builds, nothing is new, and the server keeps running.
+            os.utime(buck.cwd / "app/server.py")
+            building, built = await dev.expect("building", "built")
+            assert files(buck, building) == ["app/server.py"]
+            assert changed(built) == {"site": False}
+            assert built["pid"] == first["pid"]
+            await dev.quiet()
+
+            # New contents: the old server is stopped, and nothing is built for it. The new
+            # one asks for what it needs.
+            server = (buck.cwd / "app/server.py").read_text()
+            write(buck, "app/server.py", server + "# changed\n")
+            shutdown, started, _ = await dev.expect("shutdown", "started", "ready")
+            assert shutdown["pid"] == first["pid"]
+            assert started["pid"] != first["pid"]
+            building, built = await dev.expect("building", "built")
+            assert building["files"] == []
+            assert built["pid"] == started["pid"]
+            await dev.quiet()
+
+            # A file that the command does not name builds, and the server keeps running.
+            write(buck, "app/main.txt", "app v2\n")
+            _, built = await dev.expect("building", "built")
+            assert site(built) == "app v2\n"
+            assert built["pid"] == started["pid"]
+            await dev.quiet()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_new_server_command_restarts_the_server_without_a_set(
+        self, buck: Buck
+    ) -> None:
+        """No set claims any file. New contents of the server script still start the server
+        again, and a change to another file does nothing."""
+        dev = await start_dev(buck, "//app:unwatched")
+        try:
+            first = await dev.start()
+
+            write(buck, "app/main.txt", "app v2\n")
+            os.utime(buck.cwd / "app/server.py")
+            await dev.quiet()
+            assert_kept(dev, first)
+
+            server = (buck.cwd / "app/server.py").read_text()
+            write(buck, "app/server.py", server + "# changed\n")
+            shutdown, started, _, _, built = await dev.expect(
+                "shutdown", "started", "ready", "building", "built"
+            )
+            assert shutdown["pid"] == first["pid"]
+            assert built["pid"] == started["pid"]
+            assert site(built) == "app v2\n"
+            await dev.quiet()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_new_server_command_that_waits_restarts_at_the_servers_build(
+        self, buck: Buck
+    ) -> None:
+        """Every change waits, also one to the server script: the server gets `stale`, and
+        keeps running. When it asks for a build, `buck2 dev` builds the server again first,
+        and starts the new one instead. The change still waits, so the new server gets `stale`,
+        and its build ends the wait."""
+        dev = await start_dev(buck, "//app:wait")
+        try:
+            first = await dev.start()
+
+            server = (buck.cwd / "app/server.py").read_text()
+            write(buck, "app/server.py", server + "# changed\n")
+            (stale,) = await dev.expect("stale")
+            assert files(buck, stale) == ["app/server.py"]
+            await dev.quiet()
+            assert_kept(dev, first)
+
+            dev.request({"type": "build", "outputs": ["site"]})
+            shutdown, started, _, stale = await dev.expect(
+                "shutdown", "started", "ready", "stale"
+            )
+            assert shutdown["pid"] == first["pid"]
+            assert files(buck, stale) == ["app/server.py"]
+            _, built, stale = await dev.expect("building", "built", "stale")
+            assert built["pid"] == started["pid"]
+            assert stale["files"] == []
+            await dev.quiet()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_set_that_does_nothing_keeps_the_server_from_a_notify_set(
+        self, buck: Buck
+    ) -> None:
+        """A set with no action claims the server script, before a `notify` set for the rest.
+        A change to the script does not wait: the server starts again if the script is new."""
+        dev = await start_dev(buck, "//app:kept")
+        try:
+            first = await dev.start()
+
+            os.utime(buck.cwd / "app/server.py")
+            await dev.quiet()
+            assert_kept(dev, first)
+
+            server = (buck.cwd / "app/server.py").read_text()
+            write(buck, "app/server.py", server + "# changed\n")
+            shutdown, started, _, _, built = await dev.expect(
+                "shutdown", "started", "ready", "building", "built"
+            )
+            assert shutdown["pid"] == first["pid"]
+            assert built["pid"] == started["pid"]
+            await dev.quiet()
+
+            # The rest still waits.
+            write(buck, "app/main.txt", "app v2\n")
+            (stale,) = await dev.expect("stale")
+            assert files(buck, stale) == ["app/main.txt"]
+            await dev.quiet()
+        finally:
+            await dev.stop()
+
+    @dev_test()
     async def test_server_is_read_during_a_build(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow_flood")
         try:
@@ -625,9 +755,10 @@ class DevTest(BuckTestCase):
         try:
             await dev.wait_for("built")
 
-            # Break the server's build, and change the build file, so that `buck2 dev`
-            # analyses the target and builds the server again.
+            # Break the server's build. `buck2 dev` builds the server again after each
+            # change, also to the build file.
             write(buck, "app/check.txt", "broken\n")
+            await dev.wait_for("failed")
             await dev.wait_for("built")
             targets = (buck.cwd / "app/TARGETS.fixture").read_text()
             write(buck, "app/TARGETS.fixture", targets + "# changed\n")

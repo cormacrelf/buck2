@@ -84,13 +84,14 @@ def _vite_app_impl(ctx):
     return [
         DefaultInfo(default_output = app),
         DevInfo(
+            # The command names only the server script, so only a change to the script
+            # restarts the server, and so Vite too. The app's files and the packages are
+            # outputs, which the server asks for when it starts.
             server = server,
             outputs = {"app": app, "packages": packages},
             # Vite reads the terminal for its keyboard shortcuts.
             interactive = True,
             watch = [
-                # A change to the server script restarts it, and so Vite too.
-                DevWatch(inputs = server, restart = True),
                 # A new `package.json` or lockfile installs the packages again. The server
                 # restarts Vite when they change.
                 DevWatch(inputs = packages, build = ["packages"]),

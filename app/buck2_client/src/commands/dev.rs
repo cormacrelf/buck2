@@ -481,6 +481,8 @@ struct Server {
     process: ServerProcess,
     argv: Vec<String>,
     interactive: bool,
+    /// The digest of what the command line names, as it was when the server started.
+    digest: String,
     /// Connections made since the server started that have not sent `hello` yet.
     unintroduced: BuckMutMap<u64, Connection>,
     /// The connection that sent `hello`. Messages to the server go to it.
@@ -856,6 +858,9 @@ struct Session<'a> {
     watch_failed: bool,
     /// The errors of the last `Watch` that failed, to send them only once.
     watch_failure: Option<Vec<String>>,
+    /// The errors of the last analysis or build of the server that failed, to send them only
+    /// once for changes that no set claims.
+    resolve_failure: Option<Vec<String>>,
     /// Paths that changed before the running server was built and started. Their changes do
     /// not restart it.
     started_after: BTreeSet<String>,
@@ -948,6 +953,7 @@ impl<'a> Session<'a> {
             restart_due: false,
             watch_failed: false,
             watch_failure: None,
+            resolve_failure: None,
             started_after: BTreeSet::new(),
             queued: BTreeSet::new(),
             cancelled_outputs: BTreeSet::new(),
@@ -1081,9 +1087,12 @@ impl<'a> Session<'a> {
     async fn on_request(&mut self, request: Request) -> buck2_error::Result<()> {
         match request {
             Request::Build { outputs } => {
-                if self.resolve_due {
-                    let resolved = self.reresolve().await?;
+                // While changes waited, the server was not built again. This build uses those
+                // changes, so the server has to be as new as they are.
+                if self.resolve_due || !self.pending.is_empty() {
+                    let resolved = self.reresolve(true).await?;
                     if let Some(messages) = resolved.failed {
+                        self.resolve_failure = Some(messages.clone());
                         // The analysis that the build needs failed: that is how the build went.
                         self.generation += 1;
                         let generation = self.generation;
@@ -1283,14 +1292,21 @@ impl<'a> Session<'a> {
         self.take_watched(watched)?;
         self.graph_dirty |= graph_changed;
         self.resolve_due |= graph_changed;
-        let mut resolved = Resolved::default();
-        // An analysis that failed fails again unless something that it reads changed, or the
-        // `Watch` that failed now works.
-        if self.resolve_due && (recovered || graph_changed || !sets.is_empty()) {
-            resolved = self.reresolve().await?;
-            if let Some(messages) = resolved.failed.clone() {
-                self.send_failed(messages);
+        // Build the server again from the files as they are, whichever set claims them, or
+        // none: it starts again if what its command line names came out different. A server
+        // that exited starts again here only as before, when the analysis was due and
+        // something that it reads changed; otherwise the sets decide.
+        let relevant = recovered || graph_changed || !sets.is_empty();
+        let start_exited = self.resolve_due && relevant;
+        let resolved = self.reresolve(start_exited).await?;
+        if let Some(messages) = &resolved.failed {
+            // The same errors after a change that no set claims are no news: the change did
+            // not touch what failed. Sending them again would also make a loop of a server
+            // that writes a file in the project for each message.
+            if relevant || self.resolve_failure.as_ref() != Some(messages) {
+                self.send_failed(messages.clone());
             }
+            self.resolve_failure = Some(messages.clone());
         }
         self.apply(sets, files, &resolved, restart_is_news).await
     }
@@ -1559,10 +1575,11 @@ impl<'a> Session<'a> {
         Ok(true)
     }
 
-    /// Analyse the target again: build the server, and start it again if a restart is due or
-    /// its command line changed. If that fails, `buck2 dev` analyses again after the next
-    /// change, and the caller tells the server.
-    async fn reresolve(&mut self) -> buck2_error::Result<Resolved> {
+    /// Analyse the target again: build the server, and start it again if a restart is due, or
+    /// if its command line or the contents of what that names changed. A server that exited
+    /// starts again only with `start_exited`. If the analysis or the build fails, `buck2 dev`
+    /// analyses again after the next change, and the caller tells the server.
+    async fn reresolve(&mut self, start_exited: bool) -> buck2_error::Result<Resolved> {
         self.resolve_due = true;
         let info = match self.request(|| DevAction::Server).await? {
             Outcome::Done(DevResponse::Server(info)) => info,
@@ -1578,11 +1595,18 @@ impl<'a> Session<'a> {
             Outcome::Interrupted => return Ok(Resolved::default()),
         };
         self.resolve_due = false;
-        // Start the server again if a restart is due, it exited, or it would start differently.
+        self.resolve_failure = None;
+        // Start the server again if a restart is due, or it would start differently, or it
+        // would run something else: what its command line names has other contents.
         let restart = std::mem::take(&mut self.restart_due)
-            || self.link.server.as_ref().is_none_or(|server| {
-                server.argv != info.server || server.interactive != info.interactive
-            });
+            || match &self.link.server {
+                Some(server) => {
+                    server.argv != info.server
+                        || server.interactive != info.interactive
+                        || server.digest != info.digest
+                }
+                None => start_exited,
+            };
         self.server_info = info;
         if restart {
             self.respawn().await?;
@@ -1608,7 +1632,8 @@ impl<'a> Session<'a> {
     /// Rebuild the server and start it again. If that fails, the next analysis starts it again.
     async fn restart(&mut self) -> buck2_error::Result<()> {
         self.restart_due = true;
-        if let Some(messages) = self.reresolve().await?.failed {
+        if let Some(messages) = self.reresolve(true).await?.failed {
+            self.resolve_failure = Some(messages.clone());
             self.send_failed(messages);
         }
         Ok(())
@@ -1695,6 +1720,7 @@ impl<'a> Session<'a> {
             process,
             argv: self.server_info.server.clone(),
             interactive: self.server_info.interactive,
+            digest: self.server_info.digest.clone(),
             unintroduced: BuckMutMap::default(),
             conn: None,
             first_conn,

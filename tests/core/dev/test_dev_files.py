@@ -22,6 +22,7 @@ from buck2.tests.core.common.dev.dev_util import (
     APP,
     assert_kept,
     changed,
+    contents,
     dev_test,
     edit_target,
     files,
@@ -199,6 +200,68 @@ class DevFilesTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/pages/notes.md", "notes\n")
+            await dev.quiet()
+            assert_kept(dev, first)
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_new_file_joins_the_inputs_set_of_its_target(self, buck: Buck) -> None:
+        """A set whose `inputs` are built from the files that a `glob` matches builds `patch`,
+        and any other change waits. A new file that the `glob` matches was not among the
+        files of the set when `buck2 dev` found them. It belongs to the set all the same: it
+        builds `patch`, and does not wait. So does a later change to it, and its removal."""
+        dev = await start_dev(buck, "//app:patch")
+        try:
+            first = await dev.start()
+            assert contents(first)["patch"] == "page a\n"
+
+            write(buck, "app/pages/b.txt", "page b\n")
+            _, building, built = await dev.expect("graph_changed", "building", "built")
+            assert building["outputs"] == ["patch"]
+            assert files(buck, building) == ["app/pages/b.txt"]
+            assert contents(built) == {"patch": "page a\npage b\n"}
+            await dev.quiet()
+
+            write(buck, "app/pages/b.txt", "page b v2\n")
+            building, built = await dev.expect("building", "built")
+            assert building["outputs"] == ["patch"]
+            assert contents(built) == {"patch": "page a\npage b v2\n"}
+            await dev.quiet()
+
+            os.unlink(buck.cwd / "app/pages/b.txt")
+            _, building, built = await dev.expect("graph_changed", "building", "built")
+            assert building["outputs"] == ["patch"]
+            assert contents(built) == {"patch": "page a\n"}
+            await dev.quiet()
+
+            # The other set still has the rest: a change to the dependency waits.
+            write(buck, "lib/lib.txt", "lib v2\n")
+            (stale,) = await dev.expect("stale")
+            assert files(buck, stale) == ["lib/lib.txt"]
+            await dev.quiet()
+            assert_kept(dev, first)
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_new_file_joins_the_targets_set_of_its_target(self, buck: Buck) -> None:
+        """The same with a set that names the target: a new file that the target's `glob`
+        matches builds, and does not wait with the `notify` set after it."""
+        dev = await start_dev(buck, "//app:pages_auto")
+        try:
+            first = await dev.start()
+            assert site(first) == "lib v1\npage a\n"
+
+            write(buck, "app/pages/b.txt", "page b\n")
+            _, building, built = await dev.expect("graph_changed", "building", "built")
+            assert files(buck, building) == ["app/pages/b.txt"]
+            assert site(built) == "lib v1\npage a\npage b\n"
+            await dev.quiet()
+
+            os.unlink(buck.cwd / "app/pages/b.txt")
+            _, _, built = await dev.expect("graph_changed", "building", "built")
+            assert site(built) == "lib v1\npage a\n"
             await dev.quiet()
             assert_kept(dev, first)
         finally:
