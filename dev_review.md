@@ -82,6 +82,99 @@ The flag is named for what the server needs rather than `tui`: a REPL or a debug
 
 **There is no default.** Most uses are "run this and restart on change". `buck2 dev` on a target with only `RunInfo` should behave as `DevWatch(inputs = run, restart = True)`, and `buck2 dev //t -- args` should pass arguments. Neither is possible today, and there is no `env`.
 
+## Are the provider and the watch list the right shape?
+
+This section comes from changing the code, not only from reading it. `buck2 dev` now builds the server's command again after every change it acts on, and restarts the server when the command line, or the contents of an artifact it names, is different. The examples dropped their restart sets. That is done; everything else below is a proposal.
+
+**`server` and `outputs` are the right split, and the most important thing in the API.** What is in the server command restarts the server. What is in `outputs` is handed to a running server, which decides what a new build means: start the app again, load a patch, tell the browser. All three examples already work this way: the command names a script (and ThinLink in subsecond), and the app arrives as an output after `ready`. The API does not steer authors there, though. `server = binary[RunInfo]` is the obvious first thing to write, and it turns every reload into a restart without saying so. I would warn at analysis when an artifact in `outputs` is also named by the server command.
+
+**A rule should say only what Buck cannot work out. `restart` failed that test.** Whether the server is out of date is a fact about its command, and Buck can check it exactly. As a rule:
+- It was the same line, `DevWatch(inputs = server, restart = True)`, in every example.
+- It restarted the server on a save that changed nothing.
+- It could only be made exact by hashing every file of the set, which was removed because of what it cost on a large set.
+
+Once Buck checked the command itself, the line went away in all three examples. `restart` is left for a server that reads files its command does not declare, which is a gap in the command more than a policy. I would keep it as an escape hatch and stop presenting it as the normal way.
+
+**`build` mostly fails the same test.** A `build` set maps files to outputs, and the build graph already has that map. Where the author's map names fewer outputs than the graph does, the result is a stale output and no message. Claims are exclusive, so with `DevWatch(targets = ["//styles/..."], build = ["css"])` ahead of `DevWatch(targets = None, build = ["js"])`, a file under `//styles` that the JS bundle also reads builds only `css`. `js` stays old until some other change builds it. (This is from reading the claims code; I did not test it.) The author has to know the build graph to write a correct list, and nothing checks the list against it.
+
+Where the author's map does carry information is exclusion. In subsecond, a change to the crate must build `patch` and must not build `exe`, though `exe` is built from the crate too. That is a real policy, and it needs a list. `notify` is the same kind of thing: a hold, not a trigger.
+
+**So I would invert the default.** With no `watch`, `buck2 dev` builds every output after any change (or every output the server has asked for), and `changed` tells the server which are new. A build that has nothing to do is cheap: about 1ms on the 50k-target project with `-m opt`. `dev_web_server` and `dev_vite` would then need no watch list at all. The list stays for subtraction: "for these files, build only these outputs", and "hold". That also answers "There is no default" above.
+
+**Automatic behaviour and first-match claims do not compose yet.** The server check is the first thing `buck2 dev` does that is not a rule, and it met the list in three places:
+- **A server file that a `build` set claims.** Saving `server/server.py` unchanged in `dev_web_server` falls to `DevWatch(targets = None, build = ["www"])`, and the server is told of a build that built nothing. Observed by running the example.
+- **A server file that a `notify` set claims.** The change waits, so the server is not checked until it asks for a build. The author has to put a set with no action first to keep the file out. So "no action" no longer means "ignore": it means "claim the file, and leave it to the server check".
+- **A server file that no set claims.** It still has to be checked, so the check runs for every reported change, and each one now costs two daemon commands.
+
+I would have the server command claim its own files ahead of the list. Only the precise part of the claim: the source files that the actions of the targets owning the command's artifacts read. That covers `server.py` in all three examples and `thinlink.rs` in subsecond. A save without a change then does nothing, a real change restarts, neither can wait behind `notify`, and the set with no action goes back to meaning "ignore".
+
+**Over-claiming is only safe under an action that does everything.** Below the owning target, an `inputs` set claims whole targets and all their dependencies, whether or not the input is built from each file. Under `restart` that was harmless: the worst case was an extra restart, and the new server asked for everything again. Under `build`, or under the server check, an exclusive claim on a file the set is not built from takes the file away from the set that is. So this is why the implicit server claim above should not use the full `inputs` closure: a dependency shared by the server and an output would go to the server only, and when the server came out the same, the output would stay old. I would make the over-claimed part of any `inputs` claim non-exclusive, so that such a file also goes to the next set that matches it.
+
+| Part | Verdict |
+|---|---|
+| `server` / `outputs` split | Keep, and make it the centre of the docs. Warn when an output is also in the server command |
+| `restart` | An escape hatch for files the command does not declare, not the normal way |
+| `build` sets | Default to every output; keep the list for building fewer |
+| `notify` | A hold, as under Configuration |
+| First-match exclusivity | Right for `targets`, wrong for the over-claimed part of `inputs` |
+| A set with no action | Goes back to "ignore" once the server command claims its own files |
+
+### Proposal: put the policy on the outputs, with `only`
+
+The points above patch the watch list. This goes further and drops it. The list makes the author split the files into parts and give each part an action, but Buck already knows when the server is out of date and which outputs a file can affect. What the author knows is where to hold back. So the policy goes on the output, as one argument:
+
+```python
+# dev_web_server, and dev_vite with its two outputs: no rules at all
+DevInfo(server = server, outputs = {"www": www})
+
+# subsecond
+DevInfo(
+    server = cmd_args("python3", ctx.attrs.server, "--thinlink", thinlink),
+    outputs = {
+        "exe": DevOutput(exe, only = []),
+        "patch": DevOutput(patch, only = [ctx.attrs.lib.label]),
+    },
+)
+```
+
+**How it behaves:**
+- **The server** restarts when its command is new, as now. Its files are found from the command and trigger only that check. The `restart` rule goes; the `restart` request and `hidden` stay.
+- **A plain output** is rebuilt after any change it may be built from. Which files those are comes from the walk that an `inputs` set does today, done once for each output.
+- **Nothing is exclusive.** A file can belong to the server and to several outputs at once. Over-claiming then costs a build that does nothing, and can no longer leave an output stale. First-match order, "the rest of the graph" and the set with no action all go away.
+- **`only = [targets]`**: the output is rebuilt by itself only after a change to the own source files of those targets. After any other change that it may be built from, `buck2 dev` stops rebuilding it and sends `stale` with the output's name, until the server asks for it. `only = []` means never by itself.
+- **`notify` becomes that hold, for one output.** Today one file that waits stops every build and the analysis. Here only the output that the change affects waits, and the others build.
+
+**Subsecond under it.** A change to the crate builds `patch`. A change to a dependency marks `patch` and `exe` stale; the server asks for `exe`, starts the app again, and then asks for `patch`, which lets patches build by themselves again. I think this is more correct than today's rules. As far as I can tell from reading them, a crate edit made while the slow `exe` build runs produces a patch built against the new dependency, and the server applies it to the old binary.
+
+**A file added later** (see below) needs no rule here either: `only` names targets, so a new file that a target's glob takes in is in scope as soon as the target has it.
+
+**What it costs, and what I am unsure of:**
+- **The walks.** One for each output and one for the server at every graph change, where today it is one for each `inputs` set. They cover the same graph and should share work. Not measured.
+- **Holds that were not needed.** Below the owning target, membership is still by whole target, so a hold can start for a file that the output is not built from. The server asks, and gets `changed: false`.
+- **The protocol.** `stale` gets the output names, so every server that reads it changes.
+- **"Ignore these files" cannot be said.** I do not think anything needs it once the server's files are found from its command, but I have not checked every fixture.
+- **Not prototyped.** In particular, whether one output can be held while the others build from the same files is argued here, not shown.
+
+### To think about: a file added after the sets were found
+
+A rule says "changes to these files can be hot patched". Then a file appears that was not among them. What should happen, and do we test it?
+
+**What a set can name.** `DevWatch` takes targets and artifacts, never paths or globs. So a new file belongs to a set only once a target takes it in:
+- **The target's `srcs` is a glob that matches it.** The target changes, which is a change to the graph for the set that has the target: `buck2 dev` analyses again, the set acts, and the server gets `graph_changed`.
+- **The target's `srcs` is a list.** The file belongs to no target, so nothing happens. Editing the build file to add it is the change.
+
+So I think "these files" is the wrong way to think of a set, and the answer to "is that a bad use of the API" is yes. A rule that wants every file matching a glob should name a target whose sources are that glob: the library itself, or a filegroup. The docs should say this outright.
+
+**What is tested.**
+- One set: `test_new_source_file_changes_the_graph` (a glob takes the new file, `targets = None` builds) and `test_file_that_the_glob_does_not_match` (nothing happens).
+- A narrow set that builds `patch`, then a catch-all `notify` set: `test_new_file_joins_the_inputs_set_of_its_target` (the narrow set is named by `inputs`) and `test_new_file_joins_the_targets_set_of_its_target` (by `targets`). In both, a new file that the glob matches sends `graph_changed`, builds, and does not wait; it is in `building.files`. A later change to it builds as any other file of the set does, and removing it builds again. Both pass, so the code already does the right thing here.
+
+**What is still not tested, and partly not decided:**
+1. A new file joins a target of the `notify` set. I expect `stale` with the file. It also changes the target, so does the rule that a build file "waits" apply to it?
+2. A new file that the glob takes in but the input's actions do not read, in a target with several outputs. It falls to the next set. Is that what the author expects?
+3. The server cannot tell what happened. `graph_changed` has no fields, and a hot-patching server needs to know that the patched crate gained a file, since some tools cannot patch that and must restart. This is another reason to name the sets and put the names in `graph_changed`.
+4. A rename, which is a removal and an addition at once.
+
 ## Will it extend?
 
 | Kind | Verdict |
