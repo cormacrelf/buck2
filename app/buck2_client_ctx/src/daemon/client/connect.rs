@@ -272,10 +272,6 @@ pub struct BuckdConnectDaemonOptions {
     pub(crate) daemon_startup_mode: DaemonStartupMode,
     pub(crate) new_isolation_dir_advice: Decision,
     pub(crate) trace_id: TraceId,
-    /// Fail with `DaemonOtherVersion` instead of killing a daemon that another version of
-    /// buck2 started. For a client that connects again after it lost its daemon: the other
-    /// buck2 is in use now, and replacing its daemon would only have it replaced back.
-    pub(crate) keep_other_version: bool,
     /// Start the daemon by asking the installed Buck wrapper to re-exec it
     /// outside of the AI sandbox.
     ///
@@ -915,12 +911,6 @@ async fn establish_connection_inner(
                             }
                         }
 
-                        if options.keep_other_version
-                            && matches!(reason, ConstraintUnsatisfiedReason::Version)
-                        {
-                            return Err(BuckdConnectError::OtherVersion.into());
-                        }
-
                         let message = match reason {
                             ConstraintUnsatisfiedReason::BuckSettings { .. } => {
                                 format!("{reason}; restarting daemon...")
@@ -1291,11 +1281,6 @@ enum BuckdConnectError {
     #[error("buck2 daemon constraint mismatch during nested invocation: {reason}")]
     #[buck2(tag = DaemonNestedConstraintsMismatch)]
     NestedConstraintMismatch { reason: ConstraintUnsatisfiedReason },
-    #[error(
-        "Another version of buck2 replaced the daemon that this command was using, and is running its own"
-    )]
-    #[buck2(tag = DaemonOtherVersion)]
-    OtherVersion,
     #[error("buckd info {path} does not exist")]
     #[buck2(tag = BuckdInfoMissing)]
     BuckdInfoMissing { path: AbsNormPathBuf },

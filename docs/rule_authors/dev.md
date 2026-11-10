@@ -307,7 +307,7 @@ the default outside Meta, does; `buck2 dev` stops with an error if the
 not, such as `fs_hash_crawler`. Files that the project's ignore rules exclude,
 and `buck-out`, are never reported.
 
-If the file watcher misses changes, or the daemon restarts, `buck2 dev` cannot
+If the file watcher misses changes, `buck2 dev` cannot
 tell which files changed. It then builds the server's command again, and
 restarts the server if the command is new or if a set restarts. It builds what
 every set that builds names, and, if there is a `notify` set, sends `stale`
@@ -547,10 +547,10 @@ different files or a different configuration, it does not wait for that
 command. It stops the `buck2 dev` command, and `buck2 dev` sends it again when
 the other command lets it in.
 
-If the daemon goes away, `buck2 dev` connects again, starting a daemon if
-needed, and repeats the request. If a buck2 of another version runs the daemon
-by then, `buck2 dev` stops its server and exits instead: replacing that daemon
-would only have the other buck2 replace it back.
+If the daemon goes away, `buck2 dev` stops its server and exits with an error.
+It does not start the daemon again. A daemon is usually stopped on purpose, by
+`buck2 kill`, by `buck2 clean`, or by running a different version of buck2 in
+the project, and starting it again to carry on building would undo that.
 
 ## Limits
 

@@ -52,11 +52,11 @@ use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
 use buck2_client_ctx::common::ui::CommonConsoleOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
-use buck2_client_ctx::daemon::client::reconnect::DaemonConnection;
+use buck2_client_ctx::daemon::client::shared::DaemonConnection;
+use buck2_client_ctx::daemon::client::shared::lost_daemon;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
-use buck2_client_ctx::streaming::connect_options;
 use buck2_client_ctx::subscribers::subscriber::SessionUpdate;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
@@ -150,12 +150,8 @@ impl StreamingCommand for DevCommand {
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        let paths = ctx.paths()?.clone();
-        let connection = DaemonConnection::new(buckd, connect_options(&self, ctx)?, paths);
-        let result = self.run(connection.clone(), matches, ctx, events_ctx).await;
-        // The daemon may have been replaced; the caller goes on with the connection that works.
-        *buckd = connection.current().1;
-        result
+        let connection = DaemonConnection::new(buckd);
+        self.run(connection, matches, ctx, events_ctx).await
     }
 
     fn handles_ctrl_c(&self) -> bool {
@@ -249,8 +245,8 @@ impl DevCommand {
 
 /// Sends `buck2 dev` requests to the daemon, one daemon command each.
 struct Daemon<'a> {
-    /// The connection to the daemon, shared with the file change subscription. It connects again
-    /// when the daemon goes away, for example when another client restarts it.
+    /// The connection to the daemon, shared with the file change subscription. When the daemon
+    /// goes away, `buck2 dev` ends: it does not start the daemon again.
     connection: DaemonConnection,
     events_ctx: &'a mut EventsCtx,
     console: Console,
@@ -269,7 +265,6 @@ impl Daemon<'_> {
         &mut self,
         action: impl Fn() -> DevAction,
     ) -> buck2_error::Result<Result<DevResponse, Failed>> {
-        let console = &self.console;
         let outcome = self
             .connection
             .new_generic(
@@ -283,12 +278,9 @@ impl Daemon<'_> {
                     })
                 },
                 self.events_ctx,
-                || {
-                    console
-                        .message("`buck2 dev` lost its connection to the daemon; connecting again")
-                },
             )
-            .await?;
+            .await
+            .map_err(|e| if lost_daemon(&e) { daemon_gone(e) } else { e })?;
         match outcome {
             CommandOutcome::Success(NewGenericResponse::Dev(response)) => Ok(Ok(response)),
             CommandOutcome::Success(_) => Err(buck2_error!(
@@ -308,6 +300,13 @@ impl Daemon<'_> {
             }
         }
     }
+}
+
+/// Say why `buck2 dev` ends when it loses the daemon.
+fn daemon_gone(e: buck2_error::Error) -> buck2_error::Error {
+    e.context(
+        "The buck2 daemon went away, so `buck2 dev` is exiting. It does not start the daemon again",
+    )
 }
 
 fn unexpected_response() -> buck2_error::Error {
@@ -1936,8 +1935,7 @@ impl<'a> Session<'a> {
 }
 
 /// Add the path of `change` to `paths`. Returns whether changes were missed instead. If no
-/// more changes will come, because another version of buck2 runs the daemon now, set `exit`:
-/// the session ends.
+/// more changes will come, because the daemon went away, set `exit`: the session ends.
 #[cfg(unix)]
 fn collect_paths(
     change: FileChange,
@@ -1951,7 +1949,7 @@ fn collect_paths(
         }
         FileChange::Missed => true,
         FileChange::Stopped(e) => {
-            exit.get_or_insert_with(|| ExitResult::err(e));
+            exit.get_or_insert_with(|| ExitResult::err(daemon_gone(e)));
             false
         }
     }

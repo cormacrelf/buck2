@@ -110,9 +110,6 @@ enum ErrorTag {
   // The daemon's working directory was replaced underneath it, so the daemon
   // needs restarting
   DAEMON_STALE_WORKING_DIR = 521;
-  // The daemon was started by another version of buck2, and this client was
-  // asked not to replace it.
-  DAEMON_OTHER_VERSION = 522;
   // Too large gRPC message.
   GRPC_RESPONSE_MESSAGE_TOO_LARGE = 6;
   // `visibility`, `within_view`.

@@ -159,21 +159,6 @@ class DevTest(BuckTestCase):
         assert "server started" in output, output
 
     @dev_test()
-    async def test_reconnects_after_the_daemon_restarts(self, buck: Buck) -> None:
-        dev = await start_dev(buck, "//app:all")
-        try:
-            await dev.wait_for("built")
-
-            # Another client may kill or restart the daemon. buck2 dev connects again.
-            await buck.kill()
-            write(buck, "app/main.txt", "app v2\n")
-            built = await dev.wait_for("built")
-            assert site(built) == "app v2\n"
-        finally:
-            output = await dev.stop()
-        assert "connecting again" in output, output
-
-    @dev_test()
     async def test_new_source_file_changes_the_graph(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:pages")
         try:

@@ -25,10 +25,8 @@ use buck2_cli_proto::SubscriptionResponseWrapper;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_client_ctx::command_outcome::CommandOutcome;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
-use buck2_client_ctx::daemon::client::reconnect::DaemonConnection;
-use buck2_client_ctx::daemon::client::reconnect::MAX_RECONNECT_DELAY;
-use buck2_client_ctx::daemon::client::reconnect::RECONNECT_DELAY;
-use buck2_client_ctx::daemon::client::reconnect::other_version;
+use buck2_client_ctx::daemon::client::shared::DaemonConnection;
+use buck2_client_ctx::daemon::client::shared::lost_daemon;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::events_ctx::PartialResultCtx;
 use buck2_client_ctx::events_ctx::PartialResultHandler;
@@ -41,19 +39,22 @@ use futures::StreamExt;
 use futures::future::LocalBoxFuture;
 use tokio::sync::mpsc;
 
+/// How long to wait before subscribing again after the daemon ended the subscription, and the
+/// longest wait between attempts.
+const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(500);
+const MAX_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(5);
+
 /// A change to a project-relative path. The daemon says what it means.
 pub(super) enum FileChange {
     Path(String),
     /// Changes were missed: anything may have changed.
     Missed,
-    /// Another version of buck2 runs the daemon now. No more changes are reported, and
-    /// `buck2 dev` should end.
+    /// The daemon went away. No more changes are reported, and `buck2 dev` should end.
     Stopped(buck2_error::Error),
 }
 
-/// How a subscription ended, and the number of the connection it used, which is the one to
-/// replace if it was lost.
-type Subscription = LocalBoxFuture<'static, (u64, buck2_error::Result<CommandOutcome<()>>)>;
+/// How a subscription ended.
+type Subscription = LocalBoxFuture<'static, buck2_error::Result<CommandOutcome<()>>>;
 
 pub(super) struct FileChanges {
     connect: Connect,
@@ -94,11 +95,11 @@ impl FileChanges {
             session,
         };
         let (sender, mut received) = mpsc::unbounded_channel();
-        let mut subscription = subscription(connect.clone(), sender.clone(), Duration::ZERO, None);
+        let mut subscription = subscription(connect.clone(), sender.clone(), Duration::ZERO);
         tokio::select! {
             // The first message says that the subscription is in place.
             Some(_) = received.recv() => {}
-            (_, result) = &mut subscription => {
+            result = &mut subscription => {
                 return Err(match result {
                     Ok(CommandOutcome::Failure(result)) => {
                         let messages: Vec<String> =
@@ -123,7 +124,7 @@ impl FileChanges {
             sender,
             subscription,
             resubscribing: false,
-            delay: RECONNECT_DELAY,
+            delay: RESUBSCRIBE_DELAY,
             buffered: VecDeque::new(),
         })
     }
@@ -136,27 +137,21 @@ impl FileChanges {
             }
             tokio::select! {
                 Some(changes) = self.received.recv() => self.receive(changes),
-                (connection, result) = &mut self.subscription => {
-                    // The stream ended, as when the daemon restarted. Subscribe again; what changed
-                    // meanwhile is unknown, which the new subscription reports once it is in place.
-                    // An error means that the connection may be lost, so the new subscription
-                    // checks, and connects again if another command has not already.
-                    let lost = match result {
-                        Err(e) if other_version(&e) => {
-                            // Subscribing again would fail the same way.
+                result = &mut self.subscription => {
+                    if let Err(e) = result {
+                        if lost_daemon(&e) {
+                            // The daemon is gone, and `buck2 dev` does not start it again.
                             self.subscription = futures::future::pending().boxed_local();
                             return FileChange::Stopped(e);
                         }
-                        Err(e) => {
-                            tracing::debug!("`buck2 dev` lost its file change subscription: {e:#}");
-                            Some(connection)
-                        }
-                        Ok(_) => None,
-                    };
+                        tracing::debug!("`buck2 dev` lost its file change subscription: {e:#}");
+                    }
+                    // The daemon ended the stream. Subscribe again; what changed meanwhile is
+                    // unknown, which the new subscription reports once it is in place.
                     self.resubscribing = true;
                     self.subscription =
-                        subscription(self.connect.clone(), self.sender.clone(), self.delay, lost);
-                    self.delay = (self.delay * 2).min(MAX_RECONNECT_DELAY);
+                        subscription(self.connect.clone(), self.sender.clone(), self.delay);
+                    self.delay = (self.delay * 2).min(MAX_RESUBSCRIBE_DELAY);
                 }
             }
         }
@@ -165,7 +160,7 @@ impl FileChanges {
     fn receive(&mut self, changes: buck2_subscription_proto::FileChanges) {
         if changes.missed || self.resubscribing {
             self.resubscribing = false;
-            self.delay = RECONNECT_DELAY;
+            self.delay = RESUBSCRIBE_DELAY;
             self.buffered.push_back(FileChange::Missed);
         }
         for change in changes.changes {
@@ -174,35 +169,25 @@ impl FileChanges {
     }
 }
 
-/// Subscribe to the file changes, after `delay`, on the connection to the daemon, or on a new one
-/// if `lost` is the number of a connection that was lost.
+/// Subscribe to the file changes, after `delay`, on the connection to the daemon.
 fn subscription(
     connect: Connect,
     sender: mpsc::UnboundedSender<buck2_subscription_proto::FileChanges>,
     delay: Duration,
-    lost: Option<u64>,
 ) -> Subscription {
     async move {
         tokio::time::sleep(delay).await;
         // No subscribers: the subscription's own events are of no interest.
         let mut events_ctx = EventsCtx::new(None, Vec::new());
-        let (mut number, mut buckd) = connect.connection.current();
-        if let Some(lost) = lost {
-            // A failure to connect is the same as a lost connection: try again.
-            match connect.connection.reconnect(lost, &mut events_ctx).await {
-                Ok(connection) => (number, buckd) = connection,
-                Err(e) => return (lost, Err(e)),
-            }
-        }
-        let result = run(
+        let mut buckd = connect.connection.connector();
+        run(
             &mut buckd,
             connect.context,
             connect.session,
             sender,
             &mut events_ctx,
         )
-        .await;
-        (number, result)
+        .await
     }
     .boxed_local()
 }

@@ -267,7 +267,6 @@ pub fn connect_options<T: StreamingCommand>(
             ctx.agent_advice(Advice::NewIsolationDir)?
         },
         trace_id: ctx.trace_id.dupe(),
-        keep_other_version: false,
         #[cfg(all(fbcode_build, target_os = "linux"))]
         allow_daemon_start_unsandboxed_via_wrapper: ctx
             .immediate_config

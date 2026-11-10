@@ -300,25 +300,6 @@ class DevOnlyTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_missed_changes_hold_the_outputs_with_only(self, buck: Buck) -> None:
-        dev = await start_dev(buck, "//app:only")
-        try:
-            first = await dev.start()
-
-            # A new daemon cannot say what changed while there was none. Anything may have,
-            # so the outputs with `only` are held back, and the others are built.
-            await buck.kill()
-            write(buck, "app/main.txt", "app v2\n")
-            stale, building, built = await dev.expect("stale", "building", "built")
-            assert stale["outputs"] == ["exe", "patch"]
-            assert files(buck, stale) == ["."]
-            assert building["outputs"] == ["site"]
-            assert contents(built) == {"site": "lib v1\napp v2\n"}
-            assert built["pid"] == first["pid"]
-        finally:
-            await dev.stop()
-
-    @dev_test()
     async def test_change_that_holds_an_output_stops_a_build_of_it(
         self, buck: Buck
     ) -> None:
