@@ -261,7 +261,7 @@ console, and prints only errors and that the server exited or restarts.
 | `failed`        | `gen`, `error`                                            | A build, or the analysis of the target, failed. The errors are also on the terminal.                         |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
 | `stale`         | `files`: the changed files of `notify` sets               | That list changes. An empty list means that nothing waits.                                                   |
-| `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, and `buck2 dev` analysed the target again.                   |
+| `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
 `gen` is a number that increases with each build. `building` and `built` for
@@ -283,7 +283,10 @@ not use, and a change that waits do not stop a build. Other
 changes during a build, and changes while the daemon analyses the target or says
 what changed, are asked about once that is done. If analysing fails,
 `buck2 dev` sends `failed`, and analyses again after the next change, or before
-the next build that the server asks for.
+the next build that the server asks for, which then gets `building` and
+`failed`. The same errors again, after a change that did not touch what failed,
+are not sent again. Once the analysis works again, the server gets
+`graph_changed`.
 
 ### Requests from the server
 

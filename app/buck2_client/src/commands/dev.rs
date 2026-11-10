@@ -817,12 +817,26 @@ struct Session<'a> {
     graph_dirty: bool,
     /// Start the server again at the next analysis: a restart did not finish.
     restart_due: bool,
+    /// The last `Watch` failed, so the analysis of the target failed: the next `Watch` that
+    /// works must analyse again, and tell the server.
+    watch_failed: bool,
+    /// The errors of the last `Watch` that failed, to send them only once.
+    watch_failure: Option<Vec<String>>,
     /// Changed paths that `buck2 dev` read during a request. They are handled next.
     queued: BTreeSet<String>,
     /// The outputs and files of a build that the daemon stopped because a file that it builds
     /// from changed. The next build builds them too.
     cancelled_outputs: BTreeSet<String>,
     cancelled_files: BTreeSet<String>,
+}
+
+/// What became of analysing the target again.
+#[derive(Default)]
+struct Resolved {
+    /// The errors, if it failed. The server has not been told.
+    failed: Option<Vec<String>>,
+    /// Whether it started the server again, or tried to.
+    respawned: bool,
 }
 
 /// What became of a daemon request.
@@ -895,6 +909,8 @@ impl<'a> Session<'a> {
             resolve_due: false,
             graph_dirty: false,
             restart_due: false,
+            watch_failed: false,
+            watch_failure: None,
             queued: BTreeSet::new(),
             cancelled_outputs: BTreeSet::new(),
             cancelled_files: BTreeSet::new(),
@@ -1033,7 +1049,29 @@ impl<'a> Session<'a> {
         match request {
             Request::Build { outputs } => {
                 if self.resolve_due {
-                    self.reresolve().await?;
+                    let resolved = self.reresolve().await?;
+                    if let Some(messages) = resolved.failed {
+                        // The analysis that the build needs failed: that is how the build went.
+                        self.generation += 1;
+                        let generation = self.generation;
+                        self.link.send(json!({
+                            "type": "building",
+                            "gen": generation,
+                            "outputs": outputs,
+                            "files": Vec::<String>::new(),
+                        }));
+                        self.link.send(json!({
+                            "type": "failed",
+                            "gen": generation,
+                            "error": messages.join("\n"),
+                        }));
+                        self.last_build = Some(("failed", Duration::ZERO));
+                        return Ok(());
+                    }
+                    if resolved.respawned {
+                        // The server that asked is gone; the new one asks for what it needs.
+                        return Ok(());
+                    }
                 }
                 self.build(outputs, Vec::new()).await?;
                 self.reset_pending();
@@ -1084,13 +1122,24 @@ impl<'a> Session<'a> {
             Outcome::Done(DevResponse::Watch(watched)) => watched,
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
-                // The changes stay in `unacted`, and the next change asks again.
-                self.send_failed(messages);
+                // The changes stay in `unacted`, and the next change asks again. Once the
+                // analysis works again, the server gets `graph_changed`.
                 self.resolve_due = true;
+                self.graph_dirty = true;
+                self.watch_failed = true;
+                // The same errors after another change are no news: the change did not touch
+                // what failed. Sending them again would also make a loop of a server that writes
+                // a file in the project for each message.
+                if self.watch_failure.as_ref() != Some(&messages) {
+                    self.watch_failure = Some(messages.clone());
+                    self.send_failed(messages);
+                }
                 return Ok(());
             }
             Outcome::Interrupted => return Ok(()),
         };
+        let recovered = std::mem::take(&mut self.watch_failed);
+        self.watch_failure = None;
 
         // Track the files that differ from what the server last built.
         let waiting = watched.paths.iter().chain(&watched.waiting);
@@ -1146,10 +1195,16 @@ impl<'a> Session<'a> {
         self.take_watched(watched)?;
         self.graph_dirty |= graph_changed;
         self.resolve_due |= graph_changed;
-        if self.resolve_due {
-            self.reresolve().await?;
+        let mut resolved = Resolved::default();
+        // An analysis that failed fails again unless something that it reads changed, or the
+        // `Watch` that failed now works.
+        if self.resolve_due && (recovered || graph_changed || !sets.is_empty()) {
+            resolved = self.reresolve().await?;
+            if let Some(messages) = resolved.failed.clone() {
+                self.send_failed(messages);
+            }
         }
-        self.apply(sets, files).await
+        self.apply(sets, files, &resolved).await
     }
 
     /// Keep what `watched` says about the watch sets.
@@ -1180,6 +1235,7 @@ impl<'a> Session<'a> {
         &mut self,
         sets: BTreeSet<usize>,
         files: Vec<String>,
+        resolved: &Resolved,
     ) -> buck2_error::Result<()> {
         let mut outputs = BTreeSet::new();
         let mut restart = false;
@@ -1191,16 +1247,31 @@ impl<'a> Session<'a> {
             restart |= set.restart;
         }
         let cancelled = !self.cancelled_outputs.is_empty();
+        if resolved.respawned {
+            // The analysis of this change already started the server again, built from the
+            // files as they are now. It asks for the outputs it needs.
+            return Ok(());
+        }
+        let resolve_failed = resolved.failed.is_some();
         if self.link.server.is_none() && (restart || !outputs.is_empty() || cancelled) {
             // The server exited. Start it again, built from the files as they are now. It asks
-            // for the outputs it needs.
+            // for the outputs it needs. If the analysis of this change failed, the server gets
+            // no second `failed` for it: the next analysis starts it.
+            if resolve_failed {
+                self.restart_due = true;
+                return Ok(());
+            }
             return self.restart().await;
         }
         if !outputs.is_empty() || cancelled {
             self.build(outputs.into_iter().collect(), files).await?;
         }
         if restart {
-            self.restart().await?;
+            if resolve_failed {
+                self.restart_due = true;
+            } else {
+                self.restart().await?;
+            }
         }
         Ok(())
     }
@@ -1336,17 +1407,21 @@ impl<'a> Session<'a> {
 
     /// Analyse the target again: build the server, and start it again if a restart is due or
     /// its command line changed. If that fails, `buck2 dev` analyses again after the next
-    /// change.
-    async fn reresolve(&mut self) -> buck2_error::Result<()> {
+    /// change, and the caller tells the server.
+    async fn reresolve(&mut self) -> buck2_error::Result<Resolved> {
         self.resolve_due = true;
         let info = match self.request(|| DevAction::Server).await? {
             Outcome::Done(DevResponse::Server(info)) => info,
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
-                self.send_failed(messages);
-                return Ok(());
+                // Once the analysis works again, the server gets `graph_changed`.
+                self.graph_dirty = true;
+                return Ok(Resolved {
+                    failed: Some(messages),
+                    respawned: false,
+                });
             }
-            Outcome::Interrupted => return Ok(()),
+            Outcome::Interrupted => return Ok(Resolved::default()),
         };
         self.resolve_due = false;
         // Start the server again if a restart is due, it exited, or it would start differently.
@@ -1361,7 +1436,10 @@ impl<'a> Session<'a> {
         if std::mem::take(&mut self.graph_dirty) {
             self.link.send(json!({"type": "graph_changed"}));
         }
-        Ok(())
+        Ok(Resolved {
+            failed: None,
+            respawned: restart,
+        })
     }
 
     fn send_failed(&mut self, messages: Vec<String>) {
@@ -1376,7 +1454,10 @@ impl<'a> Session<'a> {
     /// Rebuild the server and start it again. If that fails, the next analysis starts it again.
     async fn restart(&mut self) -> buck2_error::Result<()> {
         self.restart_due = true;
-        self.reresolve().await
+        if let Some(messages) = self.reresolve().await?.failed {
+            self.send_failed(messages);
+        }
+        Ok(())
     }
 
     /// Stop the server, if it is running, and start it again. If it does not start, the next

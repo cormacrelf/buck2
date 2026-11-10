@@ -119,7 +119,8 @@ class DevFilesTest(BuckTestCase):
     @dev_test()
     async def test_source_file_deleted_then_recreated(self, buck: Buck) -> None:
         """A source file deleted: loading the build file fails, which sends `failed` without
-        `building`, and the server keeps running. Creating it again builds."""
+        `building`, and the server keeps running. Creating it again sends `graph_changed`, and
+        builds."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
@@ -130,7 +131,7 @@ class DevFilesTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("graph_changed", "building", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -202,7 +203,7 @@ class DevFilesTest(BuckTestCase):
     @dev_test()
     async def test_source_file_replaced_by_a_directory(self, buck: Buck) -> None:
         """A source file replaced by a directory: loading the build file fails, and the server
-        keeps running. A file again builds."""
+        keeps running. A file again sends `graph_changed`, and builds."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
@@ -215,7 +216,7 @@ class DevFilesTest(BuckTestCase):
 
             os.rmdir(buck.cwd / "app/main.txt")
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("graph_changed", "building", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:

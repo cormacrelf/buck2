@@ -123,7 +123,7 @@ class DevGraphTest(BuckTestCase):
     @dev_test()
     async def test_source_changed_while_target_removed(self, buck: Buck) -> None:
         """A source file that changes while the dev target is missing is built once the target is
-        back."""
+        back, after `graph_changed`."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
@@ -134,7 +134,7 @@ class DevGraphTest(BuckTestCase):
             await dev.wait_until_quiet()
 
             write(buck, APP, targets)
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("graph_changed", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             assert built["pid"] == first["pid"]
@@ -295,7 +295,7 @@ class DevGraphTest(BuckTestCase):
     @dev_test()
     async def test_fail_in_analysis_of_a_dependency(self, buck: Buck) -> None:
         """`fail()` in the analysis of a dependency: `failed`, and the server keeps running.
-        A source change made while it fails is built once it is fixed."""
+        A source change made while it fails is built once it is fixed, after `graph_changed`."""
         dev = await start_dev(buck, "//app:with_dep")
         try:
             first = await dev.start()
@@ -316,7 +316,7 @@ class DevGraphTest(BuckTestCase):
             await dev.wait_until_quiet()
 
             write(buck, LIB, lib)
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("graph_changed", "building", "built")
             assert files(buck, building) == ["lib/lib.txt"]
             assert site(built) == "lib v2\napp v1\n"
             assert built["pid"] == first["pid"]
