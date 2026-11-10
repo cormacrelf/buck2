@@ -150,9 +150,9 @@ pub struct DevRequest {
 pub enum DevAction {
     /// Analyse the target and build the server.
     Server,
-    /// Expand the watch policy into files. Expanding `DevWatch.inputs` may build what dynamic
-    /// actions need.
-    Watch,
+    /// Find what the watch sets claim, with the files as they are now, and what changed since
+    /// an earlier answer. Expanding `DevWatch.inputs` may build what dynamic actions need.
+    Watch(DevWatchRequest),
     /// Build the named `DevInfo.outputs`.
     Build { outputs: Vec<String> },
 }
@@ -176,17 +176,51 @@ pub struct DevServer {
     pub interactive: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DevWatchRequest {
+    /// Project-relative paths that changed, to say what each is.
+    pub paths: Vec<String>,
+    /// The `state` of an earlier answer, to say what changed since. `None` at the start, or when
+    /// changes were missed.
+    pub previous: Option<DevWatchState>,
+    /// Also answer the digest of every file whose change waits, in `waiting`.
+    pub waiting_digests: bool,
+}
+
+/// Digests that say whether the watch sets changed. `buck2 dev` keeps them only to send them
+/// back.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevWatchState {
+    pub sets: Vec<DevSetState>,
+    /// The `.bzl` files that the graph loads, and their contents.
+    pub bzl_digest: String,
+    /// The build files of the graph and the `.bzl` files, and their contents.
+    pub graph_digest: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevSetState {
+    /// The targets that belong to the set.
+    pub targets_digest: String,
+    /// The source files that the set claims, and their contents.
+    pub files_digest: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct DevWatched {
-    /// The `DevInfo.watch` sets, in order, with their files.
+    /// The `DevInfo.watch` sets, in order.
     pub watch: Vec<DevWatchSet>,
-    /// Absolute paths of the `.bzl` files that the packages in the dependency graph load.
-    pub bzl_files: Vec<String>,
-    /// The build files of the packages in the dependency graph.
-    pub build_files: Vec<DevBuildFile>,
-    /// Absolute paths of the package directories of the dependency graph. A file added to or
-    /// removed from one may change a target.
-    pub dirs: Vec<String>,
+    pub state: DevWatchState,
+    /// What each of the requested paths is.
+    pub paths: Vec<DevPath>,
+    /// With `waiting_digests`: every file whose change waits.
+    pub waiting: Vec<DevPath>,
+    /// The sets whose targets, or claimed files or their contents, changed since `previous`, and
+    /// every set if a `.bzl` file changed. Empty without `previous`.
+    pub changed_sets: Vec<usize>,
+    /// A build file or a `.bzl` file of the graph, or a target, changed since `previous`, so the
+    /// server may build differently.
+    pub graph_changed: bool,
     /// Why some `inputs` could not be expanded, for example because building what a dynamic
     /// action needs failed. Their sets have the source files of the targets that own those
     /// inputs and of their dependencies instead. Empty when every input was expanded.
@@ -194,24 +228,25 @@ pub struct DevWatched {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DevBuildFile {
-    /// Absolute path.
-    pub path: String,
-    /// A target of this package belongs to a `notify` set, so a change waits like a change to a
-    /// file of that set.
-    pub waits: bool,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct DevWatchSet {
     pub build: Vec<String>,
     pub restart: bool,
     pub notify: bool,
-    /// Absolute paths of the source files that belong to this set.
-    pub files: Vec<String>,
-    /// A digest of the targets that belong to this set. When a build file changes, the sets
-    /// whose digest changed are the ones it changed.
-    pub targets_digest: String,
+    /// How many source files the set claims.
+    pub files: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DevPath {
+    /// Project-relative.
+    pub path: String,
+    /// The watch set that claims the file, if one does.
+    pub set: Option<usize>,
+    /// A change to it waits (see the `buck2 dev` docs): it is a file of a `notify` set, a build
+    /// file of a package with a target in one, or a `.bzl` file when there is a `notify` set.
+    pub waits: bool,
+    /// The digest of its contents as the daemon knows them, or `None` if it does not exist.
+    pub digest: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

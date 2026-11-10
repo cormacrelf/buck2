@@ -232,12 +232,18 @@ class DevTest(BuckTestCase):
             await dev.assert_none("graph_changed", 3)
             await dev.assert_none("building", 0)
 
-            # Undoing it clears `stale`, and the held resolve and build run.
+            # Undoing it clears `stale`. Nothing changed in the end, so nothing is analysed or
+            # built.
             write(buck, "defs.bzl", defs)
             stale = await dev.wait_for("stale")
             assert stale["files"] == []
-            await dev.wait_for("graph_changed")
-            await dev.wait_for("built")
+            await dev.assert_none("graph_changed", 3)
+            await dev.assert_none("building", 0)
+
+            # Later changes build as usual.
+            write(buck, "app/main.txt", "app v2\n")
+            built = await dev.wait_for("built")
+            assert site(built) == "lib v1\napp v2\n"
         finally:
             await dev.stop()
 
@@ -311,14 +317,12 @@ class DevTest(BuckTestCase):
         try:
             await dev.wait_for("built")
 
-            # Start a dev build that takes 60 seconds.
-            write(buck, "app/delay.txt", "60\n")
+            # Start a dev build that takes 15 seconds.
+            write(buck, "app/delay.txt", "15\n")
             await dev.wait_for("building")
             await asyncio.sleep(2)
 
             # A build with different files preempts the dev build instead of waiting for it.
-            # `other.txt` is not a file of the dev target, so buck2 dev does not cancel its
-            # build itself.
             write(buck, "app/other.txt", "other v2\n")
             start = time.monotonic()
             await buck.build("//app:other")
@@ -335,22 +339,20 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_change_during_a_build_cancels_it(self, buck: Buck) -> None:
+    async def test_change_during_a_build_is_built_after_it(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow")
         try:
             await dev.wait_for("built")
 
-            # Start a dev build that takes 60 seconds.
-            write(buck, "app/delay.txt", "60\n")
+            # Start a dev build that takes 3 seconds.
+            write(buck, "app/delay.txt", "3\n")
             first = await dev.wait_for("building")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
-            # A change during the build cancels it, and the next build starts at once.
-            start = time.monotonic()
-            write(buck, "app/delay.txt", "0\n")
+            # A change during the build does not stop it. Once it is built, the change is.
             write(buck, "app/main.txt", "app v2\n")
-            cancelled = await dev.wait_for("cancelled")
-            assert cancelled["gen"] == first["gen"]
+            built = await dev.wait_for("built")
+            assert built["gen"] == first["gen"]
             building = await dev.wait_for("building")
             assert path(buck, "app/main.txt") in [
                 os.path.realpath(f) for f in building["files"]
@@ -358,7 +360,45 @@ class DevTest(BuckTestCase):
             built = await dev.wait_for("built")
             assert built["gen"] == building["gen"]
             assert site(built) == "app v2\n"
-            assert time.monotonic() - start < 30
+            assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_unrelated_change_during_a_build_builds_nothing_more(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:slow")
+        try:
+            await dev.wait_for("built")
+
+            write(buck, "app/delay.txt", "3\n")
+            first = await dev.wait_for("building")
+            await asyncio.sleep(1)
+
+            # A new file that no target uses.
+            write(buck, "app/unrelated.txt", "unrelated\n")
+            built = await dev.wait_for("built")
+            assert built["gen"] == first["gen"]
+            await dev.assert_none("building", 3)
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_touch_does_not_restart_the_server(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:restart")
+        try:
+            first = await dev.wait_for("ready")
+            await dev.wait_for("built")
+
+            # The contents of the file are the same, so nothing changed.
+            os.utime(buck.cwd / "app/main.txt")
+            await dev.assert_none("shutdown", 3)
+            await dev.assert_none("ready", 0)
+
+            write(buck, "app/main.txt", "app v2\n")
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
         finally:
             await dev.stop()
 
@@ -368,23 +408,24 @@ class DevTest(BuckTestCase):
         try:
             await dev.wait_for("built")
 
-            # Start a dev build that takes 60 seconds. The server sends a request far bigger
+            # Start a dev build that takes 10 seconds. The server sends a request far bigger
             # than a socket buffer when it starts, which it can only finish sending if
             # `buck2 dev` reads it during the build.
-            write(buck, "app/delay.txt", "60\n")
+            write(buck, "app/delay.txt", "10\n")
             building = await dev.wait_for("building")
             await dev.wait_for("flooded", timeout=30)
             assert all(
                 e.get("gen") != building["gen"]
                 for e in dev._events()
-                if e["type"] in ("built", "cancelled", "failed")
+                if e["type"] in ("built", "failed")
             ), dev._events()
 
-            # The request is handled after the build.
-            write(buck, "app/delay.txt", "0\n")
-            await dev.wait_for("cancelled")
+            # The build finishes, and then the request is handled.
             built = await dev.wait_for("built")
-            assert site(built) == "app v1\n"
+            assert built["gen"] == building["gen"]
+            second = await dev.wait_for("building")
+            assert second["gen"] > building["gen"]
+            await dev.wait_for("built")
         finally:
             await dev.stop()
 
@@ -664,7 +705,8 @@ class DevTest(BuckTestCase):
             # The daemon watches the whole project, so a file in a directory that did not
             # exist when `buck2 dev` analysed the target is seen too.
             (buck.cwd / "app/tree/new").mkdir()
-            await dev.wait_for("graph_changed")
+            # An empty directory changes no target.
+            await dev.assert_none("graph_changed", 2)
             write(buck, "app/tree/new/b.txt", "tree b\n")
             await dev.wait_for("graph_changed")
             built = await dev.wait_for("built")

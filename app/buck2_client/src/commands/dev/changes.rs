@@ -16,8 +16,6 @@
 //! that its start and end do not show in the console or the event log.
 
 use std::collections::VecDeque;
-use std::path::Path;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,7 +31,6 @@ use buck2_client_ctx::events_ctx::PartialResultHandler;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
-use buck2_subscription_proto::FileChangeKind;
 use buck2_subscription_proto::subscription_response::Response;
 use buck2_wrapper_common::invocation_id::TraceId;
 use futures::FutureExt;
@@ -46,9 +43,9 @@ use tokio::sync::mpsc;
 const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(500);
 const MAX_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(5);
 
-/// A change, with an absolute path.
+/// A change to a project-relative path. The daemon says what it means.
 pub(super) enum FileChange {
-    Path(PathBuf, FileChangeKind),
+    Path(String),
     /// Changes were missed: anything may have changed.
     Missed,
 }
@@ -56,7 +53,6 @@ pub(super) enum FileChange {
 type Subscription = LocalBoxFuture<'static, buck2_error::Result<CommandOutcome<()>>>;
 
 pub(super) struct FileChanges {
-    project_root: PathBuf,
     connect: Connect,
     received: mpsc::UnboundedReceiver<buck2_subscription_proto::FileChanges>,
     sender: mpsc::UnboundedSender<buck2_subscription_proto::FileChanges>,
@@ -79,7 +75,6 @@ impl FileChanges {
     /// Subscribe, and wait until the subscription is in place: every change from then on is
     /// reported. Fails if the daemon's file watcher cannot report changes as they happen.
     pub(super) async fn subscribe(
-        project_root: &str,
         options: BuckdConnectOptions,
         paths: InvocationPaths,
         context: &ClientContext,
@@ -118,7 +113,6 @@ impl FileChanges {
             }
         }
         Ok(FileChanges {
-            project_root: PathBuf::from(project_root),
             connect,
             received,
             sender,
@@ -159,14 +153,8 @@ impl FileChanges {
             self.buffered.push_back(FileChange::Missed);
         }
         for change in changes.changes {
-            let kind = FileChangeKind::try_from(change.kind).unwrap_or(FileChangeKind::Contents);
-            self.buffered
-                .push_back(FileChange::Path(self.absolute(&change.path), kind));
+            self.buffered.push_back(FileChange::Path(change.path));
         }
-    }
-
-    fn absolute(&self, path: &str) -> PathBuf {
-        self.project_root.join(Path::new(path))
     }
 }
 

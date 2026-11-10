@@ -46,15 +46,20 @@ use buck2_build_api::materialize::HasMaterializationQueueTracker;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_build_api::materialize::materialize_and_upload_artifact_group;
 use buck2_cli_proto::new_generic::DevAction;
-use buck2_cli_proto::new_generic::DevBuildFile;
 use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
+use buck2_cli_proto::new_generic::DevPath;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::DevServer;
+use buck2_cli_proto::new_generic::DevSetState;
+use buck2_cli_proto::new_generic::DevWatchRequest;
 use buck2_cli_proto::new_generic::DevWatchSet;
+use buck2_cli_proto::new_generic::DevWatchState;
 use buck2_cli_proto::new_generic::DevWatched;
 use buck2_common::dice::cells::HasCellResolver;
+use buck2_common::file_ops::dice::DiceFileComputations;
+use buck2_common::file_ops::metadata::RawPathMetadata;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::CellResolver;
@@ -63,6 +68,7 @@ use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
@@ -213,10 +219,10 @@ async fn dev(
                 interactive: info.as_ref().value().as_ref().interactive(),
             }))
         }
-        DevAction::Watch => {
+        DevAction::Watch(request) => {
             let watch = info.as_ref().value().as_ref().watch()?;
             Ok(DevResponse::Watch(
-                watch_files(server_ctx.project_root(), &mut ctx.ctx(), &label, &watch).await?,
+                watch_files(&mut ctx.ctx(), &label, &watch, request).await?,
             ))
         }
         DevAction::Build { outputs: names } => {
@@ -296,12 +302,13 @@ async fn build(
 
 /// Walk the configured dependency graph of `label`, and the action graph below the `inputs` of
 /// each watch set. Give each source file, and each target, to the first watch set that claims
-/// it.
+/// it. Then say what the requested paths are, and what changed since `request.previous`, from
+/// the files as they are now.
 async fn watch_files(
-    project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
     watch: &[DevWatchSpec],
+    request: &DevWatchRequest,
 ) -> buck2_error::Result<DevWatched> {
     let cell_resolver = dice.get_cell_resolver().await?;
     let cell = label.target().pkg().cell_name();
@@ -343,7 +350,7 @@ async fn watch_files(
     // targets that own the actions below its `inputs`, but not their other source files: only
     // the ones those actions use. The targets of a set say which sets a build file change
     // changed.
-    let mut files: BuckMutMap<String, usize> = BuckMutMap::default();
+    let mut files: BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)> = BuckMutMap::default();
     let mut targets: BuckMutMap<ConfiguredTargetLabel, usize> = BuckMutMap::default();
     let mut with_own_files: BuckMutMap<ConfiguredTargetLabel, usize> = BuckMutMap::default();
     let mut incomplete = Vec::new();
@@ -363,9 +370,7 @@ async fn watch_files(
         }
         let walk = walk_inputs(dice, &spec.inputs).await;
         for path in walk.sources {
-            if let Some(path) = abs_source_path(project_root, cell_resolver, path)? {
-                claim(&mut files, path, set);
-            }
+            claim_file(&mut files, cell_resolver, path, set)?;
         }
         for owner in walk.owners {
             if by_label.contains_key(&owner) {
@@ -385,16 +390,15 @@ async fn watch_files(
         }
     }
 
+    let notify_sets = watch.iter().any(|spec| spec.notify);
     let mut set_targets: Vec<Vec<&ConfiguredTargetNode>> = vec![Vec::new(); watch.len()];
-    let mut build_files: BTreeMap<String, bool> = BTreeMap::new();
-    let mut dirs = BTreeSet::new();
+    // Each build file, with whether a change to it waits.
+    let mut build_files: BTreeMap<ProjectRelativePathBuf, (bool, CellPath)> = BTreeMap::new();
     let mut packages = BTreeSet::new();
     for node in &nodes {
         if let Some(&set) = with_own_files.get(node.label()) {
             for input in node.inputs() {
-                if let Some(path) = abs_source_path(project_root, cell_resolver, input)? {
-                    claim(&mut files, path, set);
-                }
+                claim_file(&mut files, cell_resolver, input, set)?;
             }
         }
         let set = targets.get(node.label()).copied();
@@ -402,55 +406,213 @@ async fn watch_files(
             set_targets[set].push(node);
         }
         packages.insert(node.label().pkg());
-        if let Some(path) =
-            abs_source_path(project_root, cell_resolver, node.buildfile_path().path())?
-        {
-            *build_files.entry(path).or_default() |= set.is_some_and(|set| watch[set].notify);
-        }
-        if let Some(path) = abs_source_path(
-            project_root,
-            cell_resolver,
-            node.label().pkg().as_cell_path().to_owned(),
-        )? {
-            dirs.insert(path);
+        let buildfile = node.buildfile_path().path();
+        if let Some(path) = project_path(cell_resolver, buildfile.dupe())? {
+            build_files.entry(path).or_insert((false, buildfile)).0 |=
+                set.is_some_and(|set| watch[set].notify);
         }
     }
+    let bzl_files = loaded_files(dice, cell_resolver, packages).await?;
 
-    let mut sets: Vec<DevWatchSet> = watch
-        .iter()
-        .zip(set_targets)
-        .map(|(spec, nodes)| DevWatchSet {
-            build: spec.build.clone(),
-            restart: spec.restart,
-            notify: spec.notify,
-            files: Vec::new(),
+    // The contents of every file that the answer depends on, as the daemon knows them.
+    let mut cell_paths: Vec<CellPath> = files.values().map(|(_, path)| path.dupe()).collect();
+    cell_paths.extend(build_files.values().map(|(_, path)| path.dupe()));
+    cell_paths.extend(bzl_files.values().map(|path| path.dupe()));
+    let digests: BuckMutMap<CellPath, Option<String>> = dice
+        .try_compute_join(cell_paths, async |dice, path| {
+            buck2_error::Ok((path.dupe(), file_digest(dice, path).await?))
+        })
+        .await?
+        .into_iter()
+        .collect();
+    let digest_of = |path: &CellPath| digests.get(path).cloned().flatten();
+
+    let mut set_files: Vec<Vec<(&ProjectRelativePathBuf, Option<String>)>> =
+        vec![Vec::new(); watch.len()];
+    for (path, (set, cell_path)) in &files {
+        set_files[*set].push((path, digest_of(cell_path)));
+    }
+    let sets: Vec<DevSetState> = set_targets
+        .into_iter()
+        .zip(&mut set_files)
+        .map(|(nodes, files)| DevSetState {
             targets_digest: targets_digest(nodes),
+            files_digest: files_digest(files),
         })
         .collect();
-    for (path, set) in files {
-        sets[set].files.push(path);
-    }
-    for set in &mut sets {
-        set.files.sort();
-    }
-
-    let bzl_files = loaded_files(project_root, dice, cell_resolver, packages).await?;
-
-    Ok(DevWatched {
-        watch: sets,
-        bzl_files,
-        build_files: build_files
-            .into_iter()
-            .map(|(path, waits)| DevBuildFile { path, waits })
+    let bzl_digest = files_digest(
+        &mut bzl_files
+            .iter()
+            .map(|(path, cell_path)| (path, digest_of(cell_path)))
             .collect(),
-        dirs: dirs.into_iter().collect(),
+    );
+    let mut graph_files: Vec<(&ProjectRelativePathBuf, Option<String>)> = build_files
+        .iter()
+        .map(|(path, (_, cell_path))| (path, digest_of(cell_path)))
+        .collect();
+    graph_files.extend(
+        bzl_files
+            .iter()
+            .map(|(path, cell_path)| (path, digest_of(cell_path))),
+    );
+    let state = DevWatchState {
+        sets,
+        bzl_digest,
+        graph_digest: files_digest(&mut graph_files),
+    };
+
+    // A change to a file of a `notify` set waits, and so does a change to what may change its
+    // targets: the build file of a package with one of them, and with any `notify` set, any
+    // `.bzl` file.
+    let waits = |path: &ProjectRelativePath| match files.get(path) {
+        Some((set, _)) => watch[*set].notify,
+        None => {
+            build_files.get(path).is_some_and(|(waits, _)| *waits)
+                || (notify_sets && bzl_files.contains_key(path))
+        }
+    };
+    let mut paths = Vec::with_capacity(request.paths.len());
+    for path in &request.paths {
+        let Ok(rel) = ProjectRelativePath::new(path) else {
+            continue;
+        };
+        let set = files.get(rel).map(|(set, _)| *set);
+        let waits = waits(rel);
+        // Only for files that something uses: the others need no digest.
+        let digest = if set.is_some() || waits {
+            file_digest(dice, cell_resolver.get_cell_path(&rel)).await?
+        } else {
+            None
+        };
+        paths.push(DevPath {
+            path: path.clone(),
+            set,
+            waits,
+            digest,
+        });
+    }
+    let mut waiting = Vec::new();
+    if request.waiting_digests && notify_sets {
+        for (path, (set, cell_path)) in &files {
+            if watch[*set].notify {
+                waiting.push(dev_path(path, Some(*set), digest_of(cell_path)));
+            }
+        }
+        for (path, (waits, cell_path)) in &build_files {
+            if *waits {
+                waiting.push(dev_path(path, None, digest_of(cell_path)));
+            }
+        }
+        for (path, cell_path) in &bzl_files {
+            waiting.push(dev_path(path, None, digest_of(cell_path)));
+        }
+    }
+
+    let (changed_sets, graph_changed) = match &request.previous {
+        None => (Vec::new(), false),
+        Some(previous) if previous.sets.len() != state.sets.len() => {
+            ((0..state.sets.len()).collect(), true)
+        }
+        Some(previous) => {
+            // A `.bzl` file may change what any rule does, so it changes every set.
+            let every = previous.bzl_digest != state.bzl_digest;
+            let changed = previous
+                .sets
+                .iter()
+                .zip(&state.sets)
+                .enumerate()
+                .filter(|(_, (old, new))| every || old != new)
+                .map(|(set, _)| set)
+                .collect();
+            let targets_changed = previous
+                .sets
+                .iter()
+                .zip(&state.sets)
+                .any(|(old, new)| old.targets_digest != new.targets_digest);
+            (
+                changed,
+                targets_changed || previous.graph_digest != state.graph_digest,
+            )
+        }
+    };
+
+    let mut files_per_set = vec![0; watch.len()];
+    for (set, _) in files.values() {
+        files_per_set[*set] += 1;
+    }
+    Ok(DevWatched {
+        watch: watch
+            .iter()
+            .zip(files_per_set)
+            .map(|(spec, files)| DevWatchSet {
+                build: spec.build.clone(),
+                restart: spec.restart,
+                notify: spec.notify,
+                files,
+            })
+            .collect(),
+        state,
+        paths,
+        waiting,
+        changed_sets,
+        graph_changed,
         incomplete,
     })
+}
+
+fn dev_path(path: &ProjectRelativePath, set: Option<usize>, digest: Option<String>) -> DevPath {
+    DevPath {
+        path: path.to_string(),
+        set,
+        waits: true,
+        digest,
+    }
+}
+
+/// The contents of a file, as the daemon's file watcher keeps them up to date, or `None` if it
+/// does not exist.
+async fn file_digest(
+    dice: &mut DiceComputations<'_>,
+    path: CellPath,
+) -> buck2_error::Result<Option<String>> {
+    Ok(
+        match DiceFileComputations::read_path_metadata_if_exists(dice, path).await? {
+            None => None,
+            Some(RawPathMetadata::File(file)) => Some(format!(
+                "{}{}",
+                file.digest.data(),
+                if file.is_executable { "+x" } else { "" }
+            )),
+            Some(RawPathMetadata::Symlink { to, .. }) => Some(format!("-> {to:?}")),
+            Some(RawPathMetadata::Directory) => Some("directory".to_owned()),
+        },
+    )
+}
+
+/// A digest of a set of files and their contents, which is the same in another daemon.
+fn files_digest(files: &mut Vec<(&ProjectRelativePathBuf, Option<String>)>) -> String {
+    files.sort();
+    let mut hasher = DefaultHasher::new();
+    files.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn claim<K: Hash + Eq>(map: &mut BuckMutMap<K, usize>, key: K, set: usize) {
     let entry = map.entry(key).or_insert(set);
     *entry = (*entry).min(set);
+}
+
+fn claim_file(
+    files: &mut BuckMutMap<ProjectRelativePathBuf, (usize, CellPath)>,
+    cell_resolver: &CellResolver,
+    path: CellPath,
+    set: usize,
+) -> buck2_error::Result<()> {
+    if let Some(rel) = project_path(cell_resolver, path.dupe())? {
+        let entry = files.entry(rel).or_insert((set, path));
+        entry.0 = entry.0.min(set);
+    }
+    Ok(())
 }
 
 /// A digest of the attributes of `nodes`, which is the same in another daemon.
@@ -591,18 +753,17 @@ fn dependency_closure(root: &ConfiguredTargetNode) -> Vec<ConfiguredTargetNode> 
     nodes
 }
 
-/// The absolute path of a source path, or `None` for a path under `buck-out`, such as a file
-/// of a bundled external cell, which cannot be edited.
-fn abs_source_path(
-    project_root: &ProjectRoot,
+/// The project-relative path of a source path, or `None` for a path under `buck-out`, such as a
+/// file of a bundled external cell, which cannot be edited.
+fn project_path(
     cell_resolver: &CellResolver,
     path: CellPath,
-) -> buck2_error::Result<Option<String>> {
+) -> buck2_error::Result<Option<ProjectRelativePathBuf>> {
     let rel = cell_resolver.resolve_path(path)?;
     if is_buck_out(&rel) {
         return Ok(None);
     }
-    Ok(Some(project_root.resolve(&rel).to_string()))
+    Ok(Some(rel))
 }
 
 fn is_buck_out(path: &ProjectRelativePath) -> bool {
@@ -612,11 +773,10 @@ fn is_buck_out(path: &ProjectRelativePath) -> bool {
 /// The `.bzl` files that the build files of `packages` load, directly or through other `.bzl`
 /// files.
 async fn loaded_files(
-    project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
     cell_resolver: &CellResolver,
     packages: BTreeSet<buck2_core::package::PackageLabel>,
-) -> buck2_error::Result<Vec<String>> {
+) -> buck2_error::Result<BTreeMap<ProjectRelativePathBuf, CellPath>> {
     let mut seen: BuckMutSet<ImportPath> = BuckMutSet::default();
     let mut queue: VecDeque<ImportPath> = VecDeque::new();
     for package in packages {
@@ -634,13 +794,12 @@ async fn loaded_files(
             }
         }
     }
-    let mut files = Vec::new();
+    let mut files = BTreeMap::new();
     for import in seen {
-        if let Some(path) = abs_source_path(project_root, cell_resolver, import.path().to_owned())?
-        {
-            files.push(path);
+        let cell_path = import.path().to_owned();
+        if let Some(path) = project_path(cell_resolver, cell_path.dupe())? {
+            files.insert(path, cell_path);
         }
     }
-    files.sort();
     Ok(files)
 }
