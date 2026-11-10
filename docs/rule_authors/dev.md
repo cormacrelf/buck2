@@ -161,10 +161,17 @@ changes. The changes wait until one of these happens:
   `buck2 dev` sends `stale` with no files, and does what the sets ask for the
   changes that are left.
 - The server asks for a build or a restart. That build uses all the changes.
+  If it fails, the changes still wait: the server has no build with them.
 
 The daemon says which files' changes wait, and their contents. Telling what
 changed takes the daemon a walk of the graph with the changed files, as
-analysing does, but it does not build the server or any output.
+analysing does, but it does not build the server or any output. A change that
+waits and breaks that walk, such as a syntax error in a build file whose change
+waits, waits all the same: the server gets `stale`, not `failed`.
+
+While the server is not running, nothing would ask for the build that ends the
+wait. So then a change that builds or restarts starts the server, built from
+the files as they are, and it gets `stale` after `ready`.
 
 ## The server protocol
 
@@ -293,7 +300,7 @@ are not sent again. Once the analysis works again, the server gets
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`. Send it before anything else.            |
-| `build`   | `outputs`: a list of names | Build these outputs now, with all changes, including those that wait. Clears `stale`.          |
+| `build`   | `outputs`: a list of names | Build these outputs now, with all changes, including those that wait. Clears `stale` if the build succeeds. |
 | `restart` |                           | Build the server again and restart it. Clears `stale`. If the build fails, the old server keeps running until the next analysis restarts it. |
 
 `buck2 dev` reads the connection all the time, also while it builds, so a

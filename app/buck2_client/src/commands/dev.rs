@@ -767,6 +767,10 @@ impl Watched {
     }
 }
 
+/// The digest of a file whose change waits, while the analysis that would say its content fails.
+/// It equals no real digest.
+const UNKNOWN_DIGEST: &str = "unknown";
+
 /// How long `buck2 dev` waits for a server to exit after `shutdown`, and again after `SIGTERM`.
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1073,8 +1077,11 @@ impl<'a> Session<'a> {
                         return Ok(());
                     }
                 }
-                self.build(outputs, Vec::new()).await?;
-                self.reset_pending();
+                // A build that failed is not one the server can use: the changes that wait still
+                // differ from the last build it got.
+                if self.build(outputs, Vec::new()).await? {
+                    self.reset_pending();
+                }
             }
             Request::Restart => {
                 self.restart().await?;
@@ -1122,6 +1129,25 @@ impl<'a> Session<'a> {
             Outcome::Done(DevResponse::Watch(watched)) => watched,
             Outcome::Done(_) => return Err(unexpected_response()),
             Outcome::Failed(messages) => {
+                // A change that waits may break the analysis, which finding what changed needs. It
+                // waits all the same: nothing needs the analysis until it stops waiting or the
+                // server asks for a build. Its content is not known, so it differs from the
+                // baseline until a `Watch` works again.
+                let waiting: Vec<String> = self
+                    .unacted
+                    .iter()
+                    .filter(|path| {
+                        self.baseline.contains_key(*path) || self.pending.contains_key(*path)
+                    })
+                    .cloned()
+                    .collect();
+                if !waiting.is_empty() {
+                    for path in waiting {
+                        self.pending.insert(path, Some(UNKNOWN_DIGEST.to_owned()));
+                    }
+                    self.send_stale();
+                    return Ok(());
+                }
                 // The changes stay in `unacted`, and the next change asks again. Once the
                 // analysis works again, the server gets `graph_changed`.
                 self.resolve_due = true;
@@ -1150,23 +1176,26 @@ impl<'a> Session<'a> {
                 self.pending.insert(path.path.clone(), path.digest.clone());
             }
         }
-        let stale: Vec<String> = self
-            .pending
-            .keys()
-            .map(|path| self.absolute(path))
-            .collect();
-        if stale != self.stale {
-            self.stale = stale;
-            self.link
-                .send(json!({"type": "stale", "files": self.stale}));
-        }
+        self.send_stale();
         if !self.pending.is_empty() {
             // Building now would build the changed files of the `notify` sets too, and so would
             // analysing, which builds the server. Wait until the server asks for a build, or the
             // files go back to what they were. Until then `buck2 dev` keeps comparing with what
             // it last acted on, so that the answer after that says what still changed.
             self.watched.latest = Some(watched.state.clone());
+            // Without a server, nothing asks for the build that ends the wait. A change that
+            // builds or restarts starts it, and it gets `stale` after `ready`.
+            let start = self.link.server.is_none()
+                && watched.changed_sets.iter().any(|set| {
+                    watched
+                        .watch
+                        .get(*set)
+                        .is_some_and(|set| set.restart || !set.build.is_empty())
+                });
             self.watched.sets = watched.watch;
+            if start {
+                self.restart().await?;
+            }
             return Ok(());
         }
 
@@ -1205,6 +1234,21 @@ impl<'a> Session<'a> {
             }
         }
         self.apply(sets, files, &resolved).await
+    }
+
+    /// Tell the server about the files whose changes wait, if they are not what it was last
+    /// told.
+    fn send_stale(&mut self) {
+        let stale: Vec<String> = self
+            .pending
+            .keys()
+            .map(|path| self.absolute(path))
+            .collect();
+        if stale != self.stale {
+            self.stale = stale;
+            self.link
+                .send(json!({"type": "stale", "files": self.stale}));
+        }
     }
 
     /// Keep what `watched` says about the watch sets.
@@ -1337,7 +1381,12 @@ impl<'a> Session<'a> {
     /// Build `outputs`, and the outputs of a build that the daemon stopped, and tell the server.
     /// The daemon stops the build if a file that it builds from changes; other changes during
     /// the build are handled after it.
-    async fn build(&mut self, outputs: Vec<String>, files: Vec<String>) -> buck2_error::Result<()> {
+    /// Returns `false` if the build failed.
+    async fn build(
+        &mut self,
+        outputs: Vec<String>,
+        files: Vec<String>,
+    ) -> buck2_error::Result<bool> {
         let mut outputs: BTreeSet<String> = outputs.into_iter().collect();
         outputs.append(&mut self.cancelled_outputs);
         let outputs: Vec<String> = outputs.into_iter().collect();
@@ -1398,11 +1447,12 @@ impl<'a> Session<'a> {
                     "error": messages.join("\n"),
                 }));
                 self.last_build = Some(("failed", started.elapsed()));
+                return Ok(false);
             }
             // The session is ending: the server is stopping too.
             Outcome::Interrupted => {}
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Analyse the target again: build the server, and start it again if a restart is due or
