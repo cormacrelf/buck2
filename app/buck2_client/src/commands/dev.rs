@@ -1051,7 +1051,7 @@ impl<'a> Session<'a> {
             tokio::select! {
                 change = self.changes.next() => {
                     let mut paths = BTreeSet::new();
-                    self.missed |= collect_paths(change, &mut paths);
+                    self.missed |= collect_paths(change, &mut paths, &mut self.link.exit);
                     let paths = self.debounce(paths).await;
                     self.on_changes(paths).await?;
                 }
@@ -1127,7 +1127,7 @@ impl<'a> Session<'a> {
             let wait_until = quiet_until.min(deadline);
             match tokio::time::timeout_at(wait_until, self.changes.next()).await {
                 Ok(change) => {
-                    self.missed |= collect_paths(change, &mut paths);
+                    self.missed |= collect_paths(change, &mut paths, &mut self.link.exit);
                     quiet_until = tokio::time::Instant::now() + self.debounce;
                 }
                 Err(_) => return paths,
@@ -1597,9 +1597,12 @@ impl<'a> Session<'a> {
                     }
                 }
                 change = changes.next() => {
-                    if collect_paths(change, queued) {
+                    if collect_paths(change, queued, &mut link.exit) {
                         *missed = true;
                         *missed_queued = true;
+                    }
+                    if link.exit.is_some() {
+                        return Ok(Outcome::Interrupted);
                     }
                 }
             }
@@ -1847,10 +1850,13 @@ impl<'a> Session<'a> {
         while let Ok(change) =
             tokio::time::timeout(Duration::from_millis(20), self.changes.next()).await
         {
-            if collect_paths(change, &mut changed) {
+            if collect_paths(change, &mut changed, &mut self.link.exit) {
                 self.missed = true;
                 self.missed_queued = true;
             }
+        }
+        if self.link.exit.is_some() {
+            return Ok(());
         }
         if !changed.is_empty() {
             match self.request(|| DevAction::Server).await? {
@@ -1929,14 +1935,24 @@ impl<'a> Session<'a> {
     }
 }
 
-/// Add the path of `change` to `paths`. Returns whether changes were missed instead.
+/// Add the path of `change` to `paths`. Returns whether changes were missed instead. If no
+/// more changes will come, because another version of buck2 runs the daemon now, set `exit`:
+/// the session ends.
 #[cfg(unix)]
-fn collect_paths(change: FileChange, paths: &mut BTreeSet<String>) -> bool {
+fn collect_paths(
+    change: FileChange,
+    paths: &mut BTreeSet<String>,
+    exit: &mut Option<ExitResult>,
+) -> bool {
     match change {
         FileChange::Path(path) => {
             paths.insert(path);
             false
         }
         FileChange::Missed => true,
+        FileChange::Stopped(e) => {
+            exit.get_or_insert_with(|| ExitResult::err(e));
+            false
+        }
     }
 }

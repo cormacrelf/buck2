@@ -547,9 +547,10 @@ different files or a different configuration, it does not wait for that
 command. It stops the `buck2 dev` command, and `buck2 dev` sends it again when
 the other command lets it in.
 
-If the daemon goes away, for example because a client of another buck2 version
-restarted it, `buck2 dev` connects again, starting a daemon if needed, and
-repeats the request.
+If the daemon goes away, `buck2 dev` connects again, starting a daemon if
+needed, and repeats the request. If a buck2 of another version runs the daemon
+by then, `buck2 dev` stops its server and exits instead: replacing that daemon
+would only have the other buck2 replace it back.
 
 ## Limits
 

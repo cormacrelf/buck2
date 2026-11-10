@@ -28,6 +28,7 @@ use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::reconnect::DaemonConnection;
 use buck2_client_ctx::daemon::client::reconnect::MAX_RECONNECT_DELAY;
 use buck2_client_ctx::daemon::client::reconnect::RECONNECT_DELAY;
+use buck2_client_ctx::daemon::client::reconnect::other_version;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::events_ctx::PartialResultCtx;
 use buck2_client_ctx::events_ctx::PartialResultHandler;
@@ -45,6 +46,9 @@ pub(super) enum FileChange {
     Path(String),
     /// Changes were missed: anything may have changed.
     Missed,
+    /// Another version of buck2 runs the daemon now. No more changes are reported, and
+    /// `buck2 dev` should end.
+    Stopped(buck2_error::Error),
 }
 
 /// How a subscription ended, and the number of the connection it used, which is the one to
@@ -138,6 +142,11 @@ impl FileChanges {
                     // An error means that the connection may be lost, so the new subscription
                     // checks, and connects again if another command has not already.
                     let lost = match result {
+                        Err(e) if other_version(&e) => {
+                            // Subscribing again would fail the same way.
+                            self.subscription = futures::future::pending().boxed_local();
+                            return FileChange::Stopped(e);
+                        }
                         Err(e) => {
                             tracing::debug!("`buck2 dev` lost its file change subscription: {e:#}");
                             Some(connection)

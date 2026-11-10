@@ -12,6 +12,10 @@
 //! command that sends many daemon commands does. The daemon may restart under it, as when another
 //! client restarts it, and may preempt its commands.
 //!
+//! If another version of buck2 replaced the daemon, connecting again fails (see
+//! `other_version`). Otherwise two long-running commands of different versions would each
+//! keep replacing the other's daemon.
+//!
 //! The commands that run at the same time, such as a stream of requests and a subscription, share
 //! one connection. Whichever of them finds it lost connects again, once, and the others use the
 //! new connection.
@@ -50,6 +54,12 @@ pub fn lost_daemon(e: &buck2_error::Error) -> bool {
         || e.has_tag(buck2_error::ErrorTag::ClientGrpcStream)
 }
 
+/// Whether `e` says that another version of buck2 now runs the daemon. Connecting again will
+/// not help, so the command should end.
+pub fn other_version(e: &buck2_error::Error) -> bool {
+    e.has_tag(buck2_error::ErrorTag::DaemonOtherVersion)
+}
+
 /// A connection to the daemon, which commands that run at the same time share, and which is
 /// replaced when the daemon is lost. Clones are the same connection.
 #[derive(Clone)]
@@ -69,12 +79,16 @@ struct Inner {
 }
 
 impl DaemonConnection {
-    /// Share the connection of `buckd`. To connect again, use `options`.
+    /// Share the connection of `buckd`. To connect again, use `options`, but leave a daemon
+    /// of another version of buck2 alone.
     pub fn new(
         buckd: &BuckdClientConnector,
-        options: BuckdConnectOptions,
+        mut options: BuckdConnectOptions,
         paths: InvocationPaths,
     ) -> Self {
+        if let BuckdConnectOptions::Options(options) = &mut options {
+            options.keep_other_version = true;
+        }
         Self {
             inner: Rc::new(Inner {
                 options,
@@ -94,7 +108,8 @@ impl DaemonConnection {
 
     /// Replace the connection numbered `lost`, which has been lost, and return the new one. If
     /// another command has replaced it already, that is the new one, and this does not connect.
-    /// Starts a daemon if there is none.
+    /// Starts a daemon if there is none. Fails with an error that `other_version` knows if
+    /// another version of buck2 runs the daemon now.
     pub async fn reconnect(
         &self,
         lost: u64,

@@ -244,6 +244,7 @@ fn tag_metadata(tag: ErrorTag) -> TagMetadata {
         ErrorTag::MissingHomeDir => rank!(environment),
         // Typically a checkout replaced the directory the daemon was started in.
         ErrorTag::DaemonStaleWorkingDir => rank!(environment),
+        ErrorTag::DaemonOtherVersion => rank!(environment),
         ErrorTag::ActionOom => rank!(environment).root_cause(),
         ErrorTag::DotslashError => rank!(environment),
         ErrorTag::SaplingNotFound => rank!(environment),
