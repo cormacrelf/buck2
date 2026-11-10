@@ -4,10 +4,13 @@
 change to a source file, and a change to a build file.
 
 ```sh
-./bootstrap/buck2 build //:buck2 --show-full-output    # the buck2 to time
+./bootstrap/buck2 build -m opt //:buck2 --show-full-output    # the buck2 to time
 python3 tests/dev_bench/gen.py /tmp/dev_bench 2000 5 10   # 10k targets, 100k source files
 python3 tests/dev_bench/bench.py <buck2> /tmp/dev_bench inputs
 ```
+
+Without `-m opt` the buck2 that is built is not optimised, and takes about five times as long
+for everything but a change to a source file.
 
 The project is outside this repository, with a daemon of its own for each mode, so the run
 does not disturb the daemon of this repository. `bench.py` stops its daemon when it is done.

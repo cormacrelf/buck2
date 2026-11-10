@@ -1,0 +1,15 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("@shim//:cfg.bzl", "SHIM_ALIASES", "set_cfg_constructor")
+
+# https://buck2.build/docs/users/how_tos/modifiers_setup/
+#
+# This is required for `-m MODIFIER` to do anything for the targets of this cell, such as
+# `buck2 build -m opt //:buck2`.
+set_cfg_constructor(SHIM_ALIASES)

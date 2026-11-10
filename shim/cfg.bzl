@@ -10,7 +10,17 @@ load("@prelude//cfg/modifier:cfg_constructor.bzl", "cfg_constructor_post_constra
 load("@prelude//cfg/modifier:common.bzl", "MODIFIER_METADATA_KEY")
 
 SHIM_ALIASES = {
+    # Debug information for Rust, and optimised C++.
+    "dev": [
+        "shim//build_mode:dev",
+        "shim//build_mode/default_opt_cxx:enabled",
+    ],
     "fedora": "shim//os/linux/distro/constraints:distro[fedora]",
+    # Optimised Rust and C++.
+    "opt": [
+        "shim//build_mode:opt",
+        "shim//build_mode/default_opt_cxx:enabled",
+    ],
     "ubuntu": "shim//os/linux/distro/constraints:distro[ubuntu]",
 }
 

@@ -49,6 +49,9 @@ system_cxx_toolchain(
         "DEFAULT": ["-std=c++20"],
         "ovr_config//os:windows": ["/std:c++20", "/EHsc"],
         "ovr_config//os:windows-clang": ["/std:c++20", "/EHsc"],
+    }) + select({
+        "DEFAULT": [],
+        "ovr_config//build_mode/default_opt_cxx:enabled": ["-O2"],
     }),
     # The sandcastle OSS-bootstrap environment has `gcc`/`g++` on PATH but
     # not `clang`/`clang++` or `lld`, which are the defaults pulled in by
@@ -101,6 +104,14 @@ system_python_bootstrap_toolchain(
 system_rust_toolchain(
     name = "rust",
     default_edition = "2024",
+    rustc_flags = select({
+        "DEFAULT": [],
+        "ovr_config//build_mode:dev": [
+            "-C",
+            "debuginfo=2",
+        ],
+        "ovr_config//build_mode:opt": ["-O"],
+    }),
     visibility = ["PUBLIC"],
 )
 
