@@ -12,7 +12,7 @@
 //! `BUCK2_DEV_SOCKET`.
 //!
 //! Tasks read and write each connection, so `buck2 dev` never waits for the server: lines it
-//! reads arrive as `ServerEvent`s, and lines to send go to a channel.
+//! reads arrive as `ServerEvent`s, and lines to send go to a bounded queue.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -27,11 +27,14 @@ use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 
 /// The environment variable with the address of the socket.
@@ -42,11 +45,15 @@ pub(super) const SOCKET_ENV: &str = "BUCK2_DEV_SOCKET";
 pub(super) enum ServerEvent {
     Connected {
         conn: u64,
-        writer: Writer,
+        connection: Connection,
     },
     Line {
         conn: u64,
         line: String,
+    },
+    /// The other end sent a line longer than `MAX_LINE`. The connection is no longer read.
+    TooLong {
+        conn: u64,
     },
     /// The other end closed the connection, or reading it failed.
     Closed {
@@ -54,20 +61,46 @@ pub(super) enum ServerEvent {
     },
 }
 
-/// Sends lines to one connection. Sending never waits: a task writes them. Dropping every
-/// `Writer` of a connection closes it for writing.
-#[derive(Clone)]
-pub(super) struct Writer(mpsc::UnboundedSender<Vec<u8>>);
+/// The longest line `buck2 dev` reads from the server. Requests are small; a longer line is a
+/// server writing something else to the socket.
+const MAX_LINE: usize = 4 << 20;
 
-impl Writer {
-    pub(super) fn send(&self, message: &serde_json::Value) {
+/// How many messages may wait to be written to a server. A server that falls this far behind has
+/// stopped reading.
+const MAX_QUEUED: usize = 1024;
+
+/// One connection. Sending never waits: a task writes the lines. Dropping it closes the
+/// connection.
+pub(super) struct Connection {
+    lines: mpsc::Sender<Vec<u8>>,
+    reader: AbortHandle,
+    writer: AbortHandle,
+}
+
+/// The server did not read the messages `buck2 dev` sent it.
+pub(super) struct Full;
+
+impl Connection {
+    pub(super) fn send(&self, message: &serde_json::Value) -> Result<(), Full> {
         let Ok(mut line) = serde_json::to_vec(message) else {
-            return;
+            return Ok(());
         };
         line.push(b'\n');
-        // The connection is gone if this fails. That is noticed when it closes, or when the
-        // server exits.
-        let _ignored = self.0.send(line);
+        match self.lines.try_send(line) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(Full),
+            // The connection is gone. That is noticed when it closes, or when the server exits.
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Dropping the tasks drops both halves of the socket, which closes it. Messages not yet
+        // written are lost: the server is stopping, or another connection took over.
+        self.reader.abort();
+        self.writer.abort();
     }
 }
 
@@ -126,25 +159,33 @@ fn serve<R, W>(
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let conn = next_conn.fetch_add(1, Ordering::SeqCst);
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(write_lines(write, rx));
-    // Sent before the reader starts, so that `Connected` comes before the connection's lines.
+    let (tx, rx) = mpsc::channel(MAX_QUEUED);
+    let writer = tokio::spawn(write_lines(write, rx)).abort_handle();
+    // The reader waits until the session has `Connected`, so that it comes before the lines.
+    let (start_tx, start_rx) = oneshot::channel();
+    let reader = tokio::spawn({
+        let events = events.clone();
+        async move {
+            if start_rx.await.is_ok() {
+                read_lines(conn, read, events).await;
+            }
+        }
+    })
+    .abort_handle();
+    let connection = Connection {
+        lines: tx,
+        reader,
+        writer,
+    };
     if events
-        .send(ServerEvent::Connected {
-            conn,
-            writer: Writer(tx),
-        })
-        .is_err()
+        .send(ServerEvent::Connected { conn, connection })
+        .is_ok()
     {
-        return;
+        let _ignored = start_tx.send(());
     }
-    tokio::spawn(read_lines(conn, read, events.clone()));
 }
 
-async fn write_lines<W: AsyncWrite + Unpin>(
-    mut write: W,
-    mut lines: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn write_lines<W: AsyncWrite + Unpin>(mut write: W, mut lines: mpsc::Receiver<Vec<u8>>) {
     while let Some(line) = lines.recv().await {
         if write.write_all(&line).await.is_err() || write.flush().await.is_err() {
             return;
@@ -158,8 +199,26 @@ async fn read_lines<R: AsyncRead + Unpin>(
     read: R,
     events: mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut read = BufReader::new(read);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // One more than the longest line, to tell a line of `MAX_LINE` bytes from a longer one.
+        match (&mut read)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        } else if line.len() > MAX_LINE {
+            let _ignored = events.send(ServerEvent::TooLong { conn });
+            return;
+        }
+        let line = String::from_utf8_lossy(&line).into_owned();
         if events.send(ServerEvent::Line { conn, line }).is_err() {
             return;
         }

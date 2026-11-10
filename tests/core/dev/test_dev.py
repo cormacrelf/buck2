@@ -397,6 +397,70 @@ class DevTest(BuckTestCase):
         assert "starts it again after the next change" in output, output
 
     @buck_test()
+    async def test_server_that_exits_successfully_starts_again_after_a_change(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:run_once")
+        try:
+            first = await dev.wait_for("ready")
+            await dev.wait_for("built")
+            await dev.wait_for("exiting")
+
+            # A server that runs to completion does not end the session.
+            await asyncio.sleep(2)
+            assert dev.process.returncode is None
+            await dev.assert_none("ready", 0)
+
+            write(buck, "app/main.txt", "app v2\n")
+            second = await dev.wait_for("ready")
+            assert second["pid"] != first["pid"]
+            built = await dev.wait_for("built")
+            assert site(built) == "app v2\n"
+        finally:
+            output = await dev.stop()
+        assert "server exited. `buck2 dev` starts it again" in output, output
+
+    @buck_test()
+    async def test_files_that_cannot_change_the_graph_are_ignored(
+        self, buck: Buck
+    ) -> None:
+        dev = await start_dev(buck, "//app:all")
+        try:
+            await dev.wait_for("built")
+
+            # Created and removed at once, as vim does when it saves.
+            temp = buck.cwd / "app/4913"
+            temp.write_text("")
+            temp.unlink()
+            # `other.txt` belongs to a target outside the graph of `:all`. Writing to it adds no
+            # file to the package.
+            write(buck, "app/other.txt", "other v2\n")
+            await dev.assert_none("graph_changed", 3)
+            await dev.assert_none("building", 0)
+
+            # A real change still builds.
+            write(buck, "app/main.txt", "app v2\n")
+            built = await dev.wait_for("built")
+            assert site(built) == "app v2\n"
+            await dev.assert_none("graph_changed", 0)
+        finally:
+            await dev.stop()
+
+    @buck_test()
+    async def test_too_long_line_closes_the_connection(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:too_long")
+        try:
+            await dev.wait_for("ready")
+            await asyncio.sleep(2)
+            # The server keeps running, but gets no more messages, and its build request,
+            # sent after the long line, is not read.
+            assert dev.process.returncode is None
+            await dev.assert_none("built", 0)
+        finally:
+            output = await dev.stop()
+        assert "longer than any request" in output, output
+
+    @buck_test()
     async def test_inputs_set_takes_a_source_file_of_the_target(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:inputs")
         try:

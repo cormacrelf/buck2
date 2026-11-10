@@ -15,8 +15,10 @@
 # whenever `buck2 dev` reports files of a `notify` set as changed. With `--bad-request`, it also
 # sends a request of an unknown type on `ready`. With `--no-connect`, it never connects, and only
 # logs `started`. With `--crash-once`, the first server to get `built` exits with an error. With
-# `--flood-on-second-build`, it sends one very long request when the second build starts, and
-# logs `flooded` once `buck2 dev` has read it.
+# `--exit-after-built`, every server exits successfully after `built`. With
+# `--flood-on-second-build`, it sends one long request when the second build starts, and logs
+# `flooded` once `buck2 dev` has read it. With `--too-long`, it sends a line longer than
+# `buck2 dev` accepts on `ready`.
 
 import json
 import os
@@ -64,6 +66,8 @@ def main():
         log(message)
         kind = message["type"]
         if kind == "ready":
+            if "--too-long" in args:
+                request({"type": "build", "pad": "x" * (5 << 20)})
             if "--bad-request" in args:
                 request({"type": "bulid", "outputs": ["site"]})
             request({"type": "build", "outputs": ["site"]})
@@ -72,10 +76,14 @@ def main():
         elif kind == "building":
             builds += 1
             if builds == 2 and "--flood-on-second-build" in args:
-                # Far more than a socket buffer: this returns only once `buck2 dev` reads it,
-                # which it must do while it builds.
-                request({"type": "build", "outputs": ["site"], "pad": "x" * (8 << 20)})
+                # Far more than a socket buffer, but less than the longest line `buck2 dev`
+                # accepts: this returns only once `buck2 dev` reads it, which it must do while it
+                # builds.
+                request({"type": "build", "outputs": ["site"], "pad": "x" * (2 << 20)})
                 log({"type": "flooded"})
+        elif kind == "built" and "--exit-after-built" in args:
+            log({"type": "exiting"})
+            return
         elif kind == "built" and "--crash-once" in args:
             if not os.path.exists("crashed"):
                 open("crashed", "w").close()

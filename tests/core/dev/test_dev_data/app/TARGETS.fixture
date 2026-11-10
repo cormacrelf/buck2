@@ -88,6 +88,22 @@ dev_app(
 )
 
 dev_app(
+    name = "run_once",
+    mode = "all",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--exit-after-built"],
+)
+
+dev_app(
+    name = "too_long",
+    mode = "all",
+    srcs = ["main.txt"],
+    server = "server.py",
+    server_args = ["--too-long"],
+)
+
+dev_app(
     name = "inputs",
     mode = "inputs",
     srcs = ["main.txt"],

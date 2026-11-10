@@ -126,6 +126,10 @@ target again and finds the files of each set again.
   change to every set.
 - If the server's command line changed, `buck2 dev` starts the server again.
 
+Writing to a file that no set has does not change the graph, and neither does a
+file that is created and removed again before `buck2 dev` looks, such as the
+temporary files some editors make when they save.
+
 ## Changes that wait
 
 Buck builds from the files on disk. After a file of a `notify` set changes, any
@@ -153,9 +157,8 @@ variable `BUCK2_DEV_SOCKET` set to the path of a Unix socket. Python connects
 with `socket.AF_UNIX`, and Node with `net.connect(path)`.
 
 The server does not have to connect. A server that never connects is only
-started, and started again when a `restart` set changes or the server exits
-with an error. `buck2 dev` still builds what `build` sets name, but has no one
-to tell.
+started, and started again when a `restart` set changes or after it exits.
+`buck2 dev` still builds what `build` sets name, but has no one to tell.
 
 A server that connects sends `{"type": "hello", "version": 1}`. `buck2 dev`
 answers with `ready`, and from then on writes messages to the connection and
@@ -166,7 +169,10 @@ sends `hello`, it takes over from the first.
 
 `buck2 dev` may add new message types and new fields. A server must ignore
 messages whose `type` it does not know, and fields it does not know.
-`buck2 dev` reports a line that is not a valid request, and ignores it.
+`buck2 dev` reports a line that is not a valid request, and ignores it. It
+closes the connection of a server that sends a line longer than 4 MiB, or that
+stops reading, so that a thousand messages wait for it. The server keeps
+running.
 
 The server's stdout and stderr go to the terminal.
 
@@ -183,13 +189,15 @@ server, before a restart and when `buck2 dev` exits:
 3. It kills what is left.
 
 `buck2 dev` waits for this before it starts the server again, so that the new
-server can use the old one's resources, such as a port, and before it exits. A
-second Ctrl-C while `buck2 dev` waits to exit kills the server at once.
+server can use the old one's resources, such as a port, and before it exits.
+Ctrl-C while it waits kills the server at once.
 
-If the server exits with an error, or fails to start again, `buck2 dev` prints
-that, and keeps watching. The next change that builds or restarts starts the
-server again, built from the files as they are then. `buck2 dev` ends when the
-server exits successfully, or on Ctrl-C, `SIGTERM` or `SIGHUP`.
+When the server exits, or fails to start again, `buck2 dev` prints that, and
+keeps watching. The next change that builds or restarts starts the server
+again, built from the files as they are then. So a server can also run to
+completion on each change, such as a test runner. `buck2 dev` ends on Ctrl-C,
+`SIGTERM` or `SIGHUP`, or when an interactive server (see
+[The terminal](#the-terminal)) exits successfully.
 
 ### The terminal
 

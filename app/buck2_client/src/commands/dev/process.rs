@@ -179,22 +179,23 @@ impl Drop for ServerProcess {
 fn configure(command: &mut tokio::process::Command, interactive: bool) -> bool {
     command.process_group(0);
     let foreground = interactive && std::io::stdin().is_terminal() && in_foreground();
-    if foreground {
-        // SAFETY: only async-signal-safe calls.
-        unsafe {
-            command.pre_exec(|| {
-                // As a shell does, the server takes the terminal itself as well as being
-                // given it, so that it never reads the terminal before it has it: it would be
-                // stopped. It is not yet in the foreground, so ignore `SIGTTOU` while it
-                // takes it, and restore the default, which `exec` would otherwise keep.
+    // SAFETY: only async-signal-safe calls.
+    unsafe {
+        command.pre_exec(move || {
+            if foreground {
+                // As a shell does, the server takes the terminal itself as well as being given
+                // it, so that it never reads the terminal before it has it: it would be stopped.
+                // It is not yet in the foreground, so it ignores `SIGTTOU` while it takes it.
                 // `process_group(0)` has already done this `setpgid`; repeat it in case.
                 libc::setpgid(0, 0);
                 libc::signal(libc::SIGTTOU, libc::SIG_IGN);
                 libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid());
-                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
-                Ok(())
-            });
-        }
+            }
+            // `buck2 dev` ignores `SIGTTOU` while an interactive server has the terminal, and
+            // `exec` keeps a signal ignored. The server starts with the default.
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            Ok(())
+        });
     }
     foreground
 }
@@ -202,17 +203,6 @@ fn configure(command: &mut tokio::process::Command, interactive: bool) -> bool {
 fn in_foreground() -> bool {
     // SAFETY: no memory is passed.
     unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp() }
-}
-
-/// Change the terminal from a process that may be in the background, which is otherwise
-/// stopped by `SIGTTOU`.
-fn with_sigttou_ignored(f: impl FnOnce()) {
-    // SAFETY: restores the previous disposition.
-    unsafe {
-        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-        f();
-        libc::signal(libc::SIGTTOU, previous);
-    }
 }
 
 fn failed_status() -> ExitStatus {
@@ -257,32 +247,41 @@ impl Group {
 struct Terminal {
     pgrp: libc::pid_t,
     termios: Option<libc::termios>,
+    /// `buck2 dev`'s `SIGTTOU` disposition before. While the server has the terminal, `buck2 dev`
+    /// is in the background, where changing the terminal, or writing to it with `stty tostop`,
+    /// would stop it with `SIGTTOU`. So it ignores the signal.
+    sigttou: libc::sighandler_t,
 }
 
 impl Terminal {
     fn give(group: &Group) -> Option<Terminal> {
-        // SAFETY: `termios` is a plain C struct, written by `tcgetattr`.
-        let termios = unsafe {
+        // SAFETY: `termios` is a plain C struct, written by `tcgetattr`. The rest pass no memory.
+        unsafe {
             let mut termios: libc::termios = std::mem::zeroed();
-            (libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0).then_some(termios)
-        };
-        // SAFETY: no memory is passed.
-        let pgrp = unsafe { libc::getpgrp() };
-        with_sigttou_ignored(|| unsafe {
+            let termios =
+                (libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0).then_some(termios);
+            let pgrp = libc::getpgrp();
+            let sigttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(libc::STDIN_FILENO, group.pgid);
-        });
-        Some(Terminal { pgrp, termios })
+            Some(Terminal {
+                pgrp,
+                termios,
+                sigttou,
+            })
+        }
     }
 
     /// Make `buck2 dev`'s group the foreground group again, and undo any change the server
     /// made to the terminal's settings, such as raw mode, in case it exited without undoing
     /// it.
     fn take_back(self) {
-        with_sigttou_ignored(|| unsafe {
+        // SAFETY: `termios` was written by `tcgetattr`. The rest pass no memory.
+        unsafe {
             libc::tcsetpgrp(libc::STDIN_FILENO, self.pgrp);
             if let Some(termios) = &self.termios {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, termios);
             }
-        });
+            libc::signal(libc::SIGTTOU, self.sigttou);
+        }
     }
 }

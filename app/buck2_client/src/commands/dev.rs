@@ -61,15 +61,16 @@ use buck2_hash::BuckMutSet;
 use notify::EventKind;
 use notify::RecursiveMode;
 use notify::Watcher;
+use notify::event::ModifyKind;
 use serde_json::json;
 use tokio::sync::mpsc;
 
 #[cfg(unix)]
+use self::channel::Connection;
+#[cfg(unix)]
 use self::channel::Listener;
 #[cfg(unix)]
 use self::channel::ServerEvent;
-#[cfg(unix)]
-use self::channel::Writer;
 #[cfg(unix)]
 use self::process::ServerProcess;
 
@@ -91,9 +92,8 @@ mod process;
 /// connect is only started, and started again when its files change. See the `buck2 dev` page of
 /// the rule author documentation for the messages.
 ///
-/// If the server exits with an error, `buck2 dev` waits for the next change and starts it again.
-/// `buck2 dev` ends when the server exits successfully, or on Ctrl-C, once it has stopped the
-/// server.
+/// If the server exits, `buck2 dev` waits for the next change and starts it again. `buck2 dev`
+/// ends on Ctrl-C, once it has stopped the server, or when the user quits an interactive server.
 ///
 /// Each build is a separate daemon command that another command may preempt, so `buck2 dev` never
 /// makes other buck2 commands wait.
@@ -391,31 +391,57 @@ struct Server {
     argv: Vec<String>,
     interactive: bool,
     /// Connections made since the server started that have not sent `hello` yet.
-    unintroduced: BuckMutMap<u64, Writer>,
+    unintroduced: BuckMutMap<u64, Connection>,
     /// The connection that sent `hello`. Messages to the server go to it.
-    conn: Option<(u64, Writer)>,
+    conn: Option<(u64, Connection)>,
     /// Connections numbered below this were made to an earlier server.
     first_conn: u64,
 }
 
 #[cfg(unix)]
 impl Server {
-    /// Send `message` to the server. A server that has not connected gets no messages.
-    fn send(&self, message: serde_json::Value) {
-        if let Some((_, writer)) = &self.conn {
-            writer.send(&message);
+    /// Send `message` to the server. A server that has not connected gets no messages. One that
+    /// has stopped reading them is disconnected, rather than have them pile up.
+    fn send(&mut self, message: serde_json::Value) {
+        let Some((_, connection)) = &self.conn else {
+            return;
+        };
+        if connection.send(&message).is_err() {
+            self.conn = None;
+            let _ignored = buck2_client_ctx::eprintln!(
+                "The `buck2 dev` server stopped reading the messages `buck2 dev` sends it, so `buck2 dev` closed its connection"
+            );
         }
     }
 
-    /// Ask the server to stop, and wait for it, killing it if it takes too long.
-    async fn stop(&mut self) {
-        let connected = self.conn.is_some();
-        if connected {
+    /// Ask the server to stop, and wait for it, killing it if it takes too long. Returns whether
+    /// Ctrl-C cut the wait short.
+    async fn stop(&mut self, interrupts: &mut Interrupts) -> bool {
+        if self.conn.is_some() {
             self.send(json!({"type": "shutdown"}));
         }
-        self.process.stop(connected, SERVER_STOP_TIMEOUT).await;
+        let sent_shutdown = self.conn.is_some();
+        let interrupted = stop_process(&mut self.process, sent_shutdown, interrupts).await;
         self.conn = None;
         self.unintroduced.clear();
+        interrupted
+    }
+}
+
+/// Stop `process`, and the processes it left in its group. Ctrl-C while `buck2 dev` waits kills
+/// them at once. Returns whether that happened.
+#[cfg(unix)]
+async fn stop_process(
+    process: &mut ServerProcess,
+    sent_shutdown: bool,
+    interrupts: &mut Interrupts,
+) -> bool {
+    tokio::select! {
+        () = process.stop(sent_shutdown, SERVER_STOP_TIMEOUT) => false,
+        () = interrupts.recv() => {
+            process.kill().await;
+            true
+        }
     }
 }
 
@@ -427,14 +453,14 @@ struct ServerLink {
     server: Option<Server>,
     /// Requests from the server, handled when no daemon request is running.
     requests: VecDeque<Request>,
-    /// Set when the session should end: the server exited successfully, or Ctrl-C.
+    /// Set when the session should end: Ctrl-C, or the user quit an interactive server.
     exit: Option<ExitResult>,
 }
 
 #[cfg(unix)]
 impl ServerLink {
-    fn send(&self, message: serde_json::Value) {
-        if let Some(server) = &self.server {
+    fn send(&mut self, message: serde_json::Value) {
+        if let Some(server) = &mut self.server {
             server.send(message);
         }
     }
@@ -451,9 +477,9 @@ impl ServerLink {
             return Ok(());
         };
         match event {
-            ServerEvent::Connected { conn, writer } => {
+            ServerEvent::Connected { conn, connection } => {
                 if conn >= server.first_conn {
-                    server.unintroduced.insert(conn, writer);
+                    server.unintroduced.insert(conn, connection);
                 }
             }
             ServerEvent::Closed { conn } => {
@@ -461,6 +487,18 @@ impl ServerLink {
                 if server.conn.as_ref().is_some_and(|(c, _)| *c == conn) {
                     // The server keeps running; it gets no more messages.
                     server.conn = None;
+                }
+            }
+            ServerEvent::TooLong { conn } => {
+                let unintroduced = server.unintroduced.remove(&conn).is_some();
+                let introduced = server.conn.as_ref().is_some_and(|(c, _)| *c == conn);
+                if introduced {
+                    server.conn = None;
+                }
+                if introduced || unintroduced {
+                    buck2_client_ctx::eprintln!(
+                        "The `buck2 dev` server sent a line longer than any request, so `buck2 dev` closed its connection"
+                    )?;
                 }
             }
             ServerEvent::Line { conn, line } => {
@@ -481,8 +519,8 @@ impl ServerLink {
                         }
                         // Another connection that sends `hello`, such as the real server behind a
                         // wrapper that connected first, takes over from the first.
-                        if let Some(writer) = server.unintroduced.remove(&conn) {
-                            server.conn = Some((conn, writer));
+                        if let Some(connection) = server.unintroduced.remove(&conn) {
+                            server.conn = Some((conn, connection));
                         }
                         server.send(json!({
                             "type": "ready",
@@ -513,19 +551,30 @@ impl ServerLink {
         Ok(())
     }
 
-    /// The server exited. Stop what it left running in its group, and end the session if it
-    /// exited successfully or after Ctrl-C.
-    async fn on_exit(&mut self, status: ExitStatus) -> buck2_error::Result<()> {
+    /// The server exited. Stop what it left running in its group. The session goes on, and the
+    /// next change starts the server again, unless the user quit an interactive server.
+    async fn on_exit(
+        &mut self,
+        status: ExitStatus,
+        interrupts: &mut Interrupts,
+    ) -> buck2_error::Result<()> {
         let Some(mut server) = self.server.take() else {
             return Ok(());
         };
-        server.process.stop(false, SERVER_STOP_TIMEOUT).await;
         self.requests.clear();
-        if status.success() {
+        if stop_process(&mut server.process, false, interrupts).await {
+            self.exit = Some(ExitResult::signal_interrupt());
+        } else if server.interactive && status.success() {
+            // An interactive server has the terminal, and the user quit it.
             self.exit = Some(ExitResult::success());
         } else if server.interactive && killed_by_sigint(status) {
             // An interactive server has the terminal, so Ctrl-C reaches it and not `buck2 dev`.
             self.exit = Some(ExitResult::signal_interrupt());
+        } else if status.success() {
+            // A server that runs to completion, such as tests that run on each change.
+            buck2_client_ctx::eprintln!(
+                "The `buck2 dev` server exited. `buck2 dev` starts it again after the next change."
+            )?;
         } else {
             buck2_client_ctx::eprintln!(
                 "The `buck2 dev` server exited ({}). `buck2 dev` starts it again after the next change.",
@@ -715,7 +764,41 @@ enum Baseline {
 type Hashes = Arc<Mutex<BuckMutMap<PathBuf, Baseline>>>;
 
 fn hash_file(path: &Path) -> Option<blake3::Hash> {
-    std::fs::read(path).ok().map(|bytes| blake3::hash(&bytes))
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(hasher.finalize())
+}
+
+/// A changed path, as `buck2 dev` found it.
+struct FileState {
+    path: PathBuf,
+    /// The content hash, or `None` if it could not be read.
+    hash: Option<blake3::Hash>,
+    exists: bool,
+}
+
+/// Hash `paths` on a blocking thread, so that a large file does not hold up the session.
+async fn read_files(paths: Vec<PathBuf>) -> Vec<FileState> {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|path| FileState {
+                hash: hash_file(&path),
+                exists: path.symlink_metadata().is_ok(),
+                path,
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// A path that no watch set or graph file owns, and that does not exist now, was created and
+/// removed again since `buck2 dev` last looked, such as a temporary file of an editor: vim saves
+/// by first creating and removing `4913` to test the directory. It cannot have changed a target.
+fn passing(watched: &Watched, file: &FileState) -> bool {
+    !file.exists && !watched.owners.contains_key(&file.path)
 }
 
 /// Hash `files` on another thread and record them in `hashes`, keeping entries already there:
@@ -887,7 +970,7 @@ impl<'a> Session<'a> {
                     self.link.on_event(event, &self.server_info.outputs, &self.pending)?;
                 }
                 status = server_exited(&mut self.link.server) => {
-                    self.link.on_exit(status).await?;
+                    self.link.on_exit(status, &mut self.interrupts).await?;
                 }
                 () = self.interrupts.recv() => {
                     self.link.exit = Some(ExitResult::signal_interrupt());
@@ -898,12 +981,8 @@ impl<'a> Session<'a> {
 
     /// Stop the server before `buck2 dev` exits. Another Ctrl-C kills it at once.
     async fn shutdown(&mut self) {
-        let Some(mut server) = self.link.server.take() else {
-            return;
-        };
-        tokio::select! {
-            () = server.stop() => {}
-            () = self.interrupts.recv() => server.process.kill().await,
+        if let Some(mut server) = self.link.server.take() {
+            server.stop(&mut self.interrupts).await;
         }
     }
 
@@ -934,11 +1013,11 @@ impl<'a> Session<'a> {
                     self.reresolve().await?;
                 }
                 self.build(outputs, Vec::new()).await?;
-                self.reset_pending();
+                self.reset_pending().await;
             }
             Request::Restart => {
                 self.restart().await?;
-                self.reset_pending();
+                self.reset_pending().await;
             }
             // Answered as soon as it arrives.
             Request::Hello { .. } => {}
@@ -948,10 +1027,11 @@ impl<'a> Session<'a> {
 
     /// The server asked for a build or restart, so it now uses the files as they are: they are
     /// the new baseline.
-    fn reset_pending(&mut self) {
+    async fn reset_pending(&mut self) {
+        let files = read_files(self.pending.iter().cloned().collect()).await;
         if let Ok(mut baseline) = self.baseline.lock() {
-            for path in &self.pending {
-                baseline.insert(path.clone(), Baseline::Hash(hash_file(path)));
+            for file in files {
+                baseline.insert(file.path, Baseline::Hash(file.hash));
             }
         }
         self.held.clear();
@@ -969,12 +1049,16 @@ impl<'a> Session<'a> {
         let mut bzl_changed: Vec<PathBuf> = Vec::new();
         let mut graph_changed = false;
 
-        for path in paths {
-            let owner = self.watched.owners.get(&path).copied();
-            if owner.is_none() && !self.watched.in_package(&path) {
+        let paths = paths
+            .into_iter()
+            .filter(|path| self.watched.owners.contains_key(path) || self.watched.in_package(path))
+            .collect();
+        for file in read_files(paths).await {
+            if passing(&self.watched, &file) {
                 continue;
             }
-            let hash = hash_file(&path);
+            let FileState { path, hash, .. } = file;
+            let owner = self.watched.owners.get(&path).copied();
             if self.watched.waits(&path) {
                 waiting.push((path.clone(), hash));
             }
@@ -1135,7 +1219,7 @@ impl<'a> Session<'a> {
                     link.on_event(event, &server_info.outputs, pending)?;
                 }
                 status = server_exited(&mut link.server) => {
-                    link.on_exit(status).await?;
+                    link.on_exit(status, signals).await?;
                     if link.exit.is_some() {
                         return Ok(Outcome::Interrupted);
                     }
@@ -1148,9 +1232,7 @@ impl<'a> Session<'a> {
                     let Some(event) = event else { continue };
                     let mut paths = BTreeSet::new();
                     collect_paths(watched, event, &mut paths);
-                    let interrupt = paths
-                        .iter()
-                        .any(|path| interrupts(watched, last_seen, path));
+                    let interrupt = interrupts(watched, last_seen, &paths).await;
                     queued.append(&mut paths);
                     if interrupt {
                         return Ok(Outcome::Interrupted);
@@ -1302,7 +1384,10 @@ impl<'a> Session<'a> {
     async fn respawn(&mut self) -> buck2_error::Result<()> {
         // Stop the old server first, so that the new one can use its resources, such as a port.
         if let Some(mut server) = self.link.server.take() {
-            server.stop().await;
+            if server.stop(&mut self.interrupts).await {
+                self.link.exit = Some(ExitResult::signal_interrupt());
+                return Ok(());
+            }
         }
         // The new server asks for what it needs.
         self.link.requests.clear();
@@ -1353,20 +1438,34 @@ fn collect_paths(
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
+    // A file that no watch set owns matters only when it is added to or removed from a package.
+    // Writing to one, such as an editor's swap file, cannot change a target.
+    let only_content = matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+    );
     for path in event.paths {
-        if watched.owners.contains_key(&path) || watched.in_package(&path) {
+        if watched.owners.contains_key(&path) || (!only_content && watched.in_package(&path)) {
             paths.insert(path);
         }
     }
 }
 
-/// Whether a change to `path` makes the running request out of date, so that `buck2 dev` should
-/// cancel it and send it again: the file has new content, and a change to it does not wait for
-/// the server.
-fn interrupts(
+/// Whether a change to one of `paths` makes the running request out of date, so that
+/// `buck2 dev` should cancel it and send it again: the file has new content, and a change to it
+/// does not wait for the server.
+async fn interrupts(
     watched: &Watched,
     last_seen: &BuckMutMap<PathBuf, Option<blake3::Hash>>,
-    path: &Path,
+    paths: &BTreeSet<PathBuf>,
 ) -> bool {
-    !watched.waits(path) && last_seen.get(path) != Some(&hash_file(path))
+    let paths = paths
+        .iter()
+        .filter(|path| !watched.waits(path))
+        .cloned()
+        .collect();
+    read_files(paths)
+        .await
+        .iter()
+        .any(|file| !passing(watched, file) && last_seen.get(&file.path) != Some(&file.hash))
 }
