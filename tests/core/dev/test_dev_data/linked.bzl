@@ -91,8 +91,6 @@ hidden_binary = rule(
 
 def _run_info_app(ctx):
     app = ctx.attrs.binary[RunInfo]
-    if ctx.attrs.only != None:
-        app = DevOutput(app, only = ctx.attrs.only)
     return [
         DefaultInfo(),
         DevInfo(
@@ -101,13 +99,11 @@ def _run_info_app(ctx):
         ),
     ]
 
-# A `DevInfo` with one output, `app`: the `RunInfo` of `binary`, as a `DevOutput` with `only`
-# if that is given.
+# A `DevInfo` with one output, `app`: the `RunInfo` of `binary`.
 run_info_app = rule(
     impl = _run_info_app,
     attrs = {
         "binary": attrs.dep(providers = [RunInfo]),
-        "only": attrs.option(attrs.list(attrs.string()), default = None),
         "server": attrs.source(),
     },
 )

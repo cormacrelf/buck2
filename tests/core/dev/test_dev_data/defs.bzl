@@ -132,10 +132,9 @@ def _dev_app(ctx):
             f = _deep,
         )
         extra["deep"] = deep
-    elif ctx.attrs.mode == "only":
-        # As a rule that patches a running program has it. `exe` and `patch` are built from
-        # `srcs` and `deps`, like `site`. `buck2 dev` builds `patch` again by itself only after
-        # a change to this target's own files, and never `exe`.
+    elif ctx.attrs.mode == "patch":
+        # As a rule that patches a running program has it: `exe` and `patch` are built from
+        # `srcs` and `deps`, like `site`.
         extra["exe"] = _concat_output(ctx, "exe.txt")
         extra["patch"] = _concat_output(ctx, "patch.txt")
     elif ctx.attrs.mode == "flood":
@@ -165,9 +164,6 @@ def _dev_app(ctx):
         fail("unknown mode " + ctx.attrs.mode)
     outputs = {site_name: site}
     outputs.update(extra)
-    if ctx.attrs.mode == "only":
-        outputs["exe"] = DevOutput(outputs["exe"], only = [])
-        outputs["patch"] = DevOutput(outputs["patch"], only = [ctx.label])
     if ctx.attrs.mode == "sidecars":
         sidecars = dict(extra)
         sidecars["src"] = ctx.attrs.srcs[0]
@@ -179,6 +175,8 @@ def _dev_app(ctx):
         DevInfo(
             server = server,
             outputs = outputs,
+            # `self` stands for the label of this target.
+            scopes = {name: [ctx.label if target == "self" else target for target in targets] for name, targets in ctx.attrs.scopes.items()},
         ),
     ]
 
@@ -191,6 +189,7 @@ dev_app = rule(
         "dev_info": attrs.bool(default = True),
         "extra_outputs": attrs.dict(attrs.string(), attrs.list(attrs.source()), default = {}),
         "mode": attrs.string(),
+        "scopes": attrs.dict(attrs.string(), attrs.list(attrs.string()), default = {}),
         "server": attrs.source(),
         "server_args": attrs.list(attrs.string(), default = []),
         "server_check": attrs.option(attrs.source(), default = None),

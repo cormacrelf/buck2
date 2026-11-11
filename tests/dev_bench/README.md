@@ -20,10 +20,13 @@ The modes are targets of the project's `app` package, which differ in their outp
 - `outputs`: a small output, and one that is built from every library.
 - `outputs8`: the same, with eight outputs that are built from every library.
 
-Do not run `outputs` or `outputs8` without a limit on memory. In them `buck2 dev` builds the
-large output by itself. Before the notify watcher left `buck-out` out, that build was stopped
-and started again without end, and the daemon's memory grew until the machine ran out. They
-have not been run since. See "a build that `buck2 dev` starts by itself can loop" in
+The project's server asks for every output when it starts, and for every output that
+`buck2 dev` says is stale after a change.
+
+Do not run `outputs` or `outputs8` without a limit on memory. In them the large output is built
+after each change. Before the notify watcher left `buck-out` out, that build was stopped and
+started again without end, and the daemon's memory grew until the machine ran out. They have
+not been run since. See "a build that `buck2 dev` starts by itself can loop" in
 `dev_review.md`.
 
 The daemon logs how long each step of finding what the server and the outputs are built from

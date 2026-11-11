@@ -170,8 +170,8 @@ class DevResourcesTest(BuckTestCase):
             assert dev.running()
             assert alive(first["pid"])
             assert len(events(dev, "started")) == 1
-            # A change that only builds an output sets the resource up again, and the server
-            # starts again with the new one.
+            # A change to a file that only an output is built from sets the resource up again,
+            # and the server starts again with the new one.
             write(buck, "resources/page.txt", "page v2\n")
             second = await dev.wait_for("started")
             [_, new] = setups(dev, "db")

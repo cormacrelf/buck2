@@ -7,7 +7,7 @@
 # above-listed licenses.
 
 # A `buck2 dev` server for `test_dev_linked`. It logs `started`, connects, asks for every output
-# on `ready`, and on `built` runs each output: its `argv`, or else the file at its `path`. It
+# on `ready`, and for every output that `stale` lists, and on `built` runs each output: its `argv`, or else the file at its `path`. It
 # appends each message it gets to `buck-out/dev_events.jsonl`, like `app/server.py`, with what
 # each run printed and its exit code under `ran`, and the content of the output's file under
 # `content`. Like `app/server.py`, it sends each line that the tests add to
@@ -87,6 +87,8 @@ def main():
         log(message)
         if kind == "ready":
             request({"type": "build", "outputs": message["outputs"]})
+        elif kind == "stale":
+            request({"type": "build", "outputs": sorted(message["outputs"])})
         elif kind == "shutdown":
             return
 

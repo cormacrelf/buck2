@@ -66,7 +66,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            building, failed = await dev.expect("building", "failed")
+            _, building, failed = await dev.expect("stale", "building", "failed")
             assert files(buck, building) == ["app/main.txt"]
             assert failed["gen"] == building["gen"]
             await dev.quiet()
@@ -84,7 +84,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            _, failed = await dev.expect("building", "failed")
+            _, _, failed = await dev.expect("stale", "building", "failed")
             assert "an input says FAIL" in failed["error"], (
                 f"`error` of `failed` is {failed['error']!r}"
             )
@@ -98,9 +98,9 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("building", "failed")
+            await dev.expect("stale", "building", "failed")
             write(buck, "app/main.txt", "app v3\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "app v3\n"
             assert changed(built) == {"site": True}
@@ -117,9 +117,9 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("building", "failed")
+            await dev.expect("stale", "building", "failed")
             write(buck, "app/main.txt", "app v1\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "app v1\n"
             assert changed(built) == {"site": False}
             assert built["pid"] == first["pid"]
@@ -129,21 +129,23 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_other_file_changes_while_broken(self, buck: Buck) -> None:
-        """Another source file changes while the build is broken: it builds again and fails
-        again. Fixing the broken file builds both changes."""
+        """Another source file changes while the build is broken: the site is stale with both
+        changes, builds again and fails again. Fixing the broken file builds both changes."""
         dev = await start_dev(buck, "//app:pages")
         try:
             first = await dev.start()
             write(buck, "app/pages/a.txt", "FAIL a\n")
-            await dev.expect("building", "failed")
+            await dev.expect("stale", "building", "failed")
 
             write(buck, "app/pages/b.txt", "page b\n")
-            _, building, _ = await dev.expect("graph_changed", "building", "failed")
-            assert files(buck, building) == ["app/pages/b.txt"], building
+            _, _, building, _ = await dev.expect(
+                "graph_changed", "stale", "building", "failed"
+            )
+            assert files(buck, building) == ["app/pages/a.txt", "app/pages/b.txt"]
 
             write(buck, "app/pages/a.txt", "page a2\n")
-            building, built = await dev.expect("building", "built")
-            assert files(buck, building) == ["app/pages/a.txt"]
+            _, building, built = await dev.expect("stale", "building", "built")
+            assert files(buck, building) == ["app/pages/a.txt", "app/pages/b.txt"]
             assert site(built) == "page a2\npage b\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -153,18 +155,18 @@ class DevFailuresTest(BuckTestCase):
     @dev_test()
     async def test_unrelated_change_while_broken(self, buck: Buck) -> None:
         """A change to a file outside the graph while the build is broken: nothing is built
-        again. A save of the broken file without a change builds again, and fails again:
-        `buck2 dev` does not know that the contents are the same."""
+        again. A save of the broken file without a change makes the site stale, and it builds
+        again and fails again: `buck2 dev` does not know that the contents are the same."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("building", "failed")
+            await dev.expect("stale", "building", "failed")
             write(buck, "app/other.txt", "other v2\n")
             await dev.quiet()
 
             os.utime(buck.cwd / "app/main.txt")
-            building, failed = await dev.expect("building", "failed")
+            _, building, failed = await dev.expect("stale", "building", "failed")
             assert files(buck, building) == ["app/main.txt"]
             assert failed["gen"] == building["gen"]
             await dev.quiet()
@@ -180,10 +182,11 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("building", "failed")
+            await dev.expect("stale", "building", "failed")
             dev.request({"type": "build", "outputs": ["site"]})
             building, failed = await dev.expect("building", "failed")
-            assert building["files"] == []
+            # The site is still stale with the change that broke it.
+            assert files(buck, building) == ["app/main.txt"]
             assert building["outputs"] == ["site"]
             assert failed["gen"] == building["gen"]
             await dev.quiet()
@@ -193,21 +196,24 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_one_of_several_outputs_fails(self, buck: Buck) -> None:
-        """One of two outputs breaks: its build fails; the other still builds on its own."""
+        """One of two outputs breaks: its build fails, and it stays stale; the other still
+        builds."""
         dev = await start_dev(buck, "//app:multi")
         try:
             first = await dev.start()
             assert contents(first) == {"site": "app v1\n", "extra": "extra v1\n"}
 
             write(buck, "app/extra.txt", "FAIL extra\n")
-            building, _ = await dev.expect("building", "failed")
+            _, building, _ = await dev.expect("stale", "building", "failed")
             assert building["outputs"] == ["extra"]
             assert files(buck, building) == ["app/extra.txt"]
 
             write(buck, "app/main.txt", "app v2\n")
-            building, built = await dev.expect("building", "built")
-            assert building["outputs"] == ["site"]
+            stale, building, built = await dev.expect("stale", "building", "built")
+            assert sorted(stale["outputs"]) == ["extra", "site"]
+            assert building["outputs"] == ["extra", "site"]
             assert contents(built) == {"site": "app v2\n"}
+            assert list(built["failed"]) == ["extra"]
             await dev.quiet()
             assert_kept(dev, first)
         finally:
@@ -223,7 +229,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/extra.txt", "FAIL extra\n")
-            await dev.expect("building", "failed")
+            await dev.expect("stale", "building", "failed")
 
             dev.request({"type": "build", "outputs": ["site", "extra"]})
             building, built = await dev.expect(
@@ -291,7 +297,8 @@ class DevFailuresTest(BuckTestCase):
     @dev_test()
     async def test_server_build_fails_while_the_output_builds(self, buck: Buck) -> None:
         """The server's own build broken: each change builds the server again, which fails, and
-        the old server keeps running. Changes still build the output."""
+        the old server keeps running. The output is still stale after a change, and builds when
+        the server asks for it."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
@@ -300,7 +307,7 @@ class DevFailuresTest(BuckTestCase):
             assert "Failed to build the `buck2 dev` server" in failed["error"]
 
             write(buck, "app/main.txt", "app v2\n")
-            _, _, built = await dev.expect("failed", "building", "built")
+            _, _, _, built = await dev.expect("failed", "stale", "building", "built")
             assert site(built) == "app v2\n"
 
             # A change to the target does the same.
@@ -311,7 +318,7 @@ class DevFailuresTest(BuckTestCase):
                 'srcs = ["main.txt"],',
                 'srcs = ["main.txt", "other.txt"],',
             )
-            _, _, built = await dev.expect("failed", "building", "built")
+            _, _, _, built = await dev.expect("failed", "stale", "building", "built")
             assert site(built) == "app v2\nother v1\n"
             await dev.quiet()
             assert_kept(dev, first)
@@ -446,43 +453,6 @@ class DevFailuresTest(BuckTestCase):
             assert building["outputs"] == []
             assert built["outputs"] == {}
             await dev.quiet()
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_failed_requested_build_keeps_the_output_held(self, buck: Buck) -> None:
-        """A build of a held output that the server asked for and that failed does not let the
-        output go: a change inside its `only` does not build it until a build that the server
-        asks for works."""
-        dev = await start_dev(buck, "//app:only")
-        try:
-            first = await dev.start()
-            write(buck, "lib/lib.txt", "FAIL lib\n")
-            stale, building, _ = await dev.expect("stale", "building", "failed")
-            assert stale["outputs"] == ["exe", "patch"]
-            assert building["outputs"] == ["site"]
-
-            dev.request({"type": "build", "outputs": ["patch"]})
-            await dev.expect("building", "failed")
-            await dev.wait_until_quiet()
-
-            write(buck, "app/main.txt", "app v2\n")
-            stale, building, _ = await dev.expect("stale", "building", "failed")
-            assert stale["outputs"] == ["exe", "patch"]
-            assert building["outputs"] == ["site"]
-
-            write(buck, "lib/lib.txt", "lib v1\n")
-            building, _ = await dev.expect("building", "built")
-            assert building["outputs"] == ["site"]
-            await dev.quiet()
-
-            dev.request({"type": "build", "outputs": ["patch"]})
-            _, built, stale = await dev.expect(
-                "building", "built", "stale", timeout=EXPECTED_WITHIN
-            )
-            assert contents(built) == {"patch": "lib v1\napp v2\n"}
-            assert stale["outputs"] == ["exe"]
             assert_kept(dev, first)
         finally:
             await dev.stop()

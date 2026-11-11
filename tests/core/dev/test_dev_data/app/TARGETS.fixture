@@ -199,31 +199,65 @@ dev_app(
 )
 
 dev_app(
-    name = "only",
-    mode = "only",
+    name = "scopes",
+    mode = "patch",
     srcs = ["main.txt"],
     deps = ["//lib:lib"],
+    scopes = {
+        "app": ["self"],
+        "both": ["self", "//lib:lib"],
+        "lib": ["//lib:lib"],
+    },
     server = "server.py",
     server_args = ["--all-outputs"],
 )
 
 dev_app(
-    name = "only_pages",
-    mode = "only",
+    name = "scopes_pages",
+    mode = "patch",
     srcs = glob(["pages/*.txt"]),
     deps = ["//lib:lib"],
+    scopes = {
+        "app": ["self"],
+        "both": ["self", "//lib:lib"],
+        "lib": ["//lib:lib"],
+    },
     server = "server.py",
     server_args = ["--all-outputs"],
 )
 
 dev_app(
-    name = "only_slow",
-    mode = "only",
+    name = "scopes_slow",
+    mode = "patch",
     srcs = ["main.txt"],
     deps = ["//lib:lib"],
     delay = "delay.txt",
+    scopes = {
+        "app": ["self"],
+        "both": ["self", "//lib:lib"],
+        "lib": ["//lib:lib"],
+    },
     server = "server.py",
     server_args = ["--all-outputs"],
+)
+
+dev_app(
+    name = "scopes_site",
+    mode = "patch",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    scopes = {"app": ["self"]},
+    server = "server.py",
+)
+
+dev_app(
+    name = "patcher",
+    mode = "patch",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    scopes = {"lib": ["//lib:lib"]},
+    server = "server.py",
+    server_args = ["--all-outputs", "--patcher"],
 )
 
 dev_app(

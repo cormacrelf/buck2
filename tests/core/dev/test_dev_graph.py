@@ -103,7 +103,7 @@ class DevGraphTest(BuckTestCase):
             write(buck, APP, targets)
             await dev.wait_until_quiet()
             write(buck, "app/main.txt", "app v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             assert built["pid"] == first["pid"]
@@ -134,7 +134,7 @@ class DevGraphTest(BuckTestCase):
             await dev.wait_until_quiet()
 
             write(buck, APP, targets)
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             assert built["pid"] == first["pid"]
@@ -164,7 +164,7 @@ class DevGraphTest(BuckTestCase):
             write(buck, APP, targets)
             await dev.wait_until_quiet()
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert built["pid"] == first["pid"]
         finally:
             await dev.stop()
@@ -238,7 +238,7 @@ class DevGraphTest(BuckTestCase):
             write(buck, "defs.bzl", defs)
             await dev.wait_until_quiet()
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "app v2\n"
             assert built["pid"] == first["pid"]
         finally:
@@ -254,14 +254,14 @@ class DevGraphTest(BuckTestCase):
         )
 
     @dev_test()
-    async def test_bzl_change_builds_every_output(self, buck: Buck) -> None:
-        """A `.bzl` change that changes no output: `graph_changed`, and every output builds,
-        with the `.bzl` file in `files`, and is unchanged."""
+    async def test_bzl_change_makes_every_output_stale(self, buck: Buck) -> None:
+        """A `.bzl` change that changes no output: `graph_changed`, and every output that the
+        server asked for is stale, with the `.bzl` file in `files`. It builds unchanged."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             write(buck, "defs.bzl", read(buck, "defs.bzl") + "# changed\n")
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert files(buck, building) == ["defs.bzl"]
             assert building["outputs"] == ["site"]
             assert changed(built) == {"site": False}
@@ -316,7 +316,7 @@ class DevGraphTest(BuckTestCase):
             await dev.wait_until_quiet()
 
             write(buck, LIB, lib)
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert files(buck, building) == ["lib/lib.txt"]
             assert site(built) == "lib v2\napp v1\n"
             assert built["pid"] == first["pid"]
@@ -361,7 +361,7 @@ class DevGraphTest(BuckTestCase):
             assert_kept(dev, first)
 
             edit_target(buck, APP, "with_dep", '"//lib:lib"', '"//lib:lib2"')
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert building["outputs"] == ["site"]
             assert site(built) == "lib v1\napp v1\n"
             assert built["pid"] == first["pid"]
@@ -384,7 +384,7 @@ class DevGraphTest(BuckTestCase):
             os.rename(buck.cwd / "lib_moved", buck.cwd / "lib")
             await dev.wait_until_quiet()
             write(buck, "lib/lib.txt", "lib v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "lib v2\napp v1\n"
             assert built["pid"] == first["pid"]
         finally:
@@ -412,13 +412,13 @@ class DevGraphTest(BuckTestCase):
                 'mode = "outputs",',
                 'mode = "outputs",\n    deps = ["//lib:lib"],',
             )
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert files(buck, building) == [APP]
             assert site(built) == "lib v1\napp v1\n"
             assert built["pid"] == first["pid"]
 
             write(buck, "lib/lib.txt", "lib v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["lib/lib.txt"]
             assert site(built) == "lib v2\napp v1\n"
             await dev.quiet()
@@ -433,7 +433,7 @@ class DevGraphTest(BuckTestCase):
         try:
             first = await dev.start()
             edit_target(buck, APP, "with_dep", '    deps = ["//lib:lib"],\n', "")
-            _, _, built = await dev.expect("graph_changed", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == "app v1\n"
             assert built["pid"] == first["pid"]
 
@@ -506,8 +506,8 @@ class DevGraphTest(BuckTestCase):
 
     @dev_test()
     async def test_output_added(self, buck: Buck) -> None:
-        """An output added to `DevInfo`: `graph_changed` and a build of every output, the new one
-        too. The server can ask for the new output."""
+        """An output added to `DevInfo`: `graph_changed`, and the output that the server has is
+        stale. The new one is not: the server never asked for it. It can ask for it now."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
@@ -518,9 +518,12 @@ class DevGraphTest(BuckTestCase):
                 'mode = "outputs",',
                 'mode = "outputs",\n    extra_outputs = {"extra": ["extra.txt"]},',
             )
-            _, building, built = await dev.expect("graph_changed", "building", "built")
-            assert building["outputs"] == ["extra", "site"]
-            assert changed(built) == {"extra": True, "site": False}
+            _, stale, building, built = await dev.expect(
+                "graph_changed", "stale", "building", "built"
+            )
+            assert list(stale["outputs"]) == ["site"]
+            assert building["outputs"] == ["site"]
+            assert changed(built) == {"site": False}
             await dev.quiet()
 
             dev.request({"type": "build", "outputs": ["extra"]})
@@ -533,8 +536,9 @@ class DevGraphTest(BuckTestCase):
 
     @dev_test()
     async def test_output_renamed(self, buck: Buck) -> None:
-        """The output that the server uses renamed: changes build the new name, and the server's
-        request for the old name fails. The server keeps running."""
+        """The output that the server uses renamed: the server never asked for the new name, so
+        nothing is stale. It can ask for the new name, and its request for the old name fails.
+        The server keeps running."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
@@ -545,7 +549,11 @@ class DevGraphTest(BuckTestCase):
                 'mode = "outputs",',
                 'mode = "outputs",\n    site_name = "page",',
             )
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            await dev.expect("graph_changed")
+            await dev.quiet()
+
+            dev.request({"type": "build", "outputs": ["page"]})
+            building, built = await dev.expect("building", "built")
             assert building["outputs"] == ["page"]
             assert contents(built) == {"page": "app v1\n"}
             # The digest is that of `site`, but the name is new.
@@ -575,7 +583,7 @@ class DevGraphTest(BuckTestCase):
                 '    extra_outputs = {"extra": ["extra.txt"]},\n',
                 "",
             )
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert building["outputs"] == ["site"]
             assert changed(built) == {"site": False}
 

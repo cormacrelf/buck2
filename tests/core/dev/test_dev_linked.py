@@ -18,7 +18,6 @@
 #   associated artifact, a copy of `linked/extra.txt`. The server runs the sidecar too.
 # - `//linked:run_info` has `app`, the `RunInfo` of `//linked:binary`: a script, an argument,
 #   and a hidden artifact, a copy of `linked/data.txt`, which the script prints.
-# - `//linked:run_info_only` is the same, with `app` a `DevOutput` with `only = []`.
 
 import os
 from typing import Any, Dict
@@ -55,7 +54,7 @@ class DevLinkedTest(BuckTestCase):
             # Only the associated artifact is built from `lib.txt`. A new one is a new output,
             # with the same file.
             write(buck, "linked/lib.txt", "lib v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["app"]
             assert files(buck, building) == ["linked/lib.txt"]
             new = built["outputs"]["app"]
@@ -67,7 +66,7 @@ class DevLinkedTest(BuckTestCase):
 
             # The same contents again are no change.
             write(buck, "linked/lib.txt", "lib v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert not built["outputs"]["app"]["changed"]
             await dev.quiet()
         finally:
@@ -88,7 +87,7 @@ class DevLinkedTest(BuckTestCase):
             # What the sidecar's associated artifact is built from builds the output. The
             # sidecar is new, with the same file, and the output is the same.
             write(buck, "linked/extra.txt", "extra v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["app"]
             assert files(buck, building) == ["linked/extra.txt"]
             new = built["outputs"]["app"]
@@ -118,7 +117,7 @@ class DevLinkedTest(BuckTestCase):
 
             # Only the hidden artifact is built from `data.txt`.
             write(buck, "linked/data.txt", "data v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["app"]
             assert files(buck, building) == ["linked/data.txt"]
             new = built["outputs"]["app"]
@@ -134,31 +133,5 @@ class DevLinkedTest(BuckTestCase):
             assert_ran(other, "data: data v2\nargs: --other\n")
             assert other["digest"] == new["digest"]
             assert other["changed"]
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_run_info_output_with_only(self, buck: Buck) -> None:
-        dev = await start_dev(buck, "//linked:run_info_only")
-        try:
-            built = await dev.start()
-            app = built["outputs"]["app"]
-            assert_ran(app, "data: data v1\nargs: --flag\n")
-
-            # A change to what the hidden artifact is built from holds the output back.
-            write(buck, "linked/data.txt", "data v2\n")
-            (stale,) = await dev.expect("stale")
-            assert stale["outputs"] == ["app"]
-            assert files(buck, stale) == ["linked/data.txt"]
-            await dev.quiet()
-
-            # The server asks for it, and gets it as the files are now.
-            dev.request({"type": "build", "outputs": ["app"]})
-            building, built, stale = await dev.expect("building", "built", "stale")
-            assert building["outputs"] == ["app"]
-            new = built["outputs"]["app"]
-            assert_ran(new, "data: data v2\nargs: --flag\n")
-            assert new["changed"]
-            assert stale["outputs"] == []
         finally:
             await dev.stop()

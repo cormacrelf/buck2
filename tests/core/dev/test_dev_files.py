@@ -46,7 +46,7 @@ class DevFilesTest(BuckTestCase):
             temp = buck.cwd / "app/.main.txt.tmp"
             temp.write_text("app v2\n")
             os.replace(temp, buck.cwd / "app/main.txt")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             assert built["pid"] == first["pid"]
@@ -66,7 +66,7 @@ class DevFilesTest(BuckTestCase):
             temp = buck.cwd / "app/.main.txt.tmp"
             temp.write_text("app v1\n")
             os.replace(temp, buck.cwd / "app/main.txt")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert changed(built) == {"site": False}
             await dev.quiet()
@@ -86,7 +86,7 @@ class DevFilesTest(BuckTestCase):
                 os.fsync(f.fileno())
                 await asyncio.sleep(0.05)
                 f.write("app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -99,7 +99,7 @@ class DevFilesTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/main.txt", "")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == ""
             assert changed(built) == {"site": True}
             await dev.quiet()
@@ -114,7 +114,7 @@ class DevFilesTest(BuckTestCase):
             await dev.start()
             os.unlink(buck.cwd / "app/main.txt")
             write(buck, "app/main.txt", "app v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             await dev.quiet()
@@ -136,7 +136,7 @@ class DevFilesTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, "app/main.txt", "app v2\n")
-            _, _, built = await dev.expect("graph_changed", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -166,10 +166,10 @@ class DevFilesTest(BuckTestCase):
         try:
             first = await dev.start()
             os.rename(buck.cwd / "app/pages", buck.cwd / "app/pages_moved")
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == ""
             os.rename(buck.cwd / "app/pages_moved", buck.cwd / "app/pages")
-            _, _, built = await dev.expect("graph_changed", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == "page a\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -184,10 +184,10 @@ class DevFilesTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/pages/TARGETS.fixture", "")
-            _, _, built = await dev.expect("graph_changed", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == ""
             os.unlink(buck.cwd / "app/pages/TARGETS.fixture")
-            _, _, built = await dev.expect("graph_changed", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == "page a\n"
             await dev.quiet()
         finally:
@@ -217,7 +217,7 @@ class DevFilesTest(BuckTestCase):
             assert contents(first)["patch"] == "page a\n"
 
             write(buck, "app/pages/b.txt", "page b\n")
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert building["outputs"] == ["patch", "site"]
             assert files(buck, building) == ["app/pages/b.txt"]
             assert contents(built) == {
@@ -227,20 +227,20 @@ class DevFilesTest(BuckTestCase):
             await dev.quiet()
 
             write(buck, "app/pages/b.txt", "page b v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["patch", "site"]
             assert contents(built)["patch"] == "page a\npage b v2\n"
             await dev.quiet()
 
             os.unlink(buck.cwd / "app/pages/b.txt")
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert building["outputs"] == ["patch", "site"]
             assert contents(built)["patch"] == "page a\n"
             await dev.quiet()
 
             # `patch` is not built from the dependency.
             write(buck, "lib/lib.txt", "lib v2\n")
-            building, _ = await dev.expect("building", "built")
+            _, building, _ = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["site"]
             assert files(buck, building) == ["lib/lib.txt"]
             await dev.quiet()
@@ -264,7 +264,7 @@ class DevFilesTest(BuckTestCase):
 
             os.rmdir(buck.cwd / "app/main.txt")
             write(buck, "app/main.txt", "app v2\n")
-            _, _, built = await dev.expect("graph_changed", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -278,7 +278,7 @@ class DevFilesTest(BuckTestCase):
         try:
             first = await dev.start()
             os.chmod(buck.cwd / "app/main.txt", 0o755)
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
             assert changed(built) == {"site": False}
             assert built["pid"] == first["pid"]
@@ -301,12 +301,12 @@ class DevFilesTest(BuckTestCase):
             main = buck.cwd / "app/main.txt"
             os.unlink(main)
             os.symlink("target_a.txt", main)
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "target a\n"
 
             os.unlink(main)
             os.symlink("target_b.txt", main)
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "target b\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -324,11 +324,11 @@ class DevFilesTest(BuckTestCase):
             main = buck.cwd / "app/main.txt"
             os.unlink(main)
             os.symlink("target_a.txt", main)
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "target a\n"
 
             write(buck, "app/target_a.txt", "target a2\n")
-            _, built = await dev.expect("building", "built", timeout=10)
+            _, _, built = await dev.expect("stale", "building", "built", timeout=10)
             assert site(built) == "target a2\n"
             assert built["pid"] == first["pid"]
         finally:
@@ -350,7 +350,7 @@ class DevFilesTest(BuckTestCase):
                 'srcs = ["main.txt"],',
                 'srcs = ["main.txt", "other.txt"],',
             )
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert files(buck, building) == [APP, "app/main.txt", "lib/lib.txt"]
             assert site(built) == "lib v2\napp v2\nother v1\n"
             assert built["pid"] == first["pid"]
@@ -367,7 +367,7 @@ class DevFilesTest(BuckTestCase):
             for i in range(10):
                 write(buck, "app/main.txt", f"app v{i + 2}\n")
                 await asyncio.sleep(0.05)
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "app v11\n"
             await dev.quiet()
         finally:
@@ -385,7 +385,7 @@ class DevFilesTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, "app/main.txt", "app v2\n")
-            building, _ = await dev.expect("building", "built")
+            _, building, _ = await dev.expect("stale", "building", "built")
             assert files(buck, building) == ["app/main.txt"]
         finally:
             await dev.stop()
@@ -403,7 +403,7 @@ class DevFilesTest(BuckTestCase):
             )
             # dev.md says that `buck2 dev` does not act on `.buckconfig` changes, but the
             # daemon reads it again when `buck2 dev` asks what changed, and the target changed.
-            _, building, built = await dev.expect("graph_changed", "building", "built")
+            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
             assert site(built) == "other v1\n"
             assert built["pid"] == first["pid"]
 

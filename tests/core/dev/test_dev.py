@@ -144,13 +144,14 @@ class DevTest(BuckTestCase):
             first = await dev.wait_for("building")
             await asyncio.sleep(2)
 
-            # A change to a file that the build builds from stops it, and the next build
-            # starts once the files stop changing.
+            # A change to a file that the build builds from stops it. Once the files stop
+            # changing, the site is stale, and the server asks for it again.
             start = time.monotonic()
             write(buck, "app/delay.txt", "0\n")
             write(buck, "app/main.txt", "app v2\n")
             cancelled = await dev.wait_for("cancelled")
             assert cancelled["gen"] == first["gen"]
+            await dev.wait_for("stale")
             building = await dev.wait_for("building")
             assert path(buck, "app/main.txt") in [
                 os.path.realpath(f) for f in building["files"]
@@ -197,8 +198,8 @@ class DevTest(BuckTestCase):
             first = await dev.wait_for("building")
             await asyncio.sleep(1)
 
-            # A new file that the build does not use yet: the build goes on, and the next one,
-            # with the file, starts after it.
+            # A new file that the build does not use yet: the build goes on, and the site is
+            # stale with the file after it.
             write(buck, "app/pages/b.txt", "page b\n")
             built = await dev.wait_for("built")
             assert built["gen"] == first["gen"]
@@ -236,9 +237,10 @@ class DevTest(BuckTestCase):
             assert built["pid"] == started["pid"]
             await dev.quiet()
 
-            # A file that the command does not name builds, and the server keeps running.
+            # A file that the command does not name makes the site stale, and the server keeps
+            # running.
             write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
+            _, _, built = await dev.expect("stale", "building", "built")
             assert site(built) == "app v2\n"
             assert built["pid"] == started["pid"]
             await dev.quiet()
@@ -470,13 +472,13 @@ class DevTest(BuckTestCase):
             # `lib.txt` is only reachable from `deep` through a dynamic action and a
             # transitive set.
             write(buck, "lib/lib.txt", "lib v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["deep", "site"]
             assert contents(built) == {"site": "lib v2\napp v1\n", "deep": "lib v2\n"}
 
-            # The app's own file is not below `deep`: it only builds the site.
+            # The app's own file is not below `deep`: only the site is stale.
             write(buck, "app/main.txt", "app v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["site"]
             assert site(built) == "lib v2\napp v2\n"
             assert built["pid"] == first["pid"]

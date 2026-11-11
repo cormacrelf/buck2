@@ -12,7 +12,11 @@
 # its own, whose types do not clash with `buck2 dev` messages. With `--log-in-project`, it also
 # appends each to `server.log` in the project root, as a server that logs to the project would.
 #
-# On `ready` it asks for the `site` output. With `--bad-request`, it also sends a request of an
+# On `ready` it asks for the `site` output, and on `stale` for every output that `stale` lists.
+# With `--manual`, it does not answer `stale`: the tests ask for builds themselves. With
+# `--patcher`, it answers `stale` as a server that loads patches into a running program does: it
+# asks for `patch` if every change to `exe` since it got `exe` is in the scope `lib`, and for
+# `exe` and `patch` if not. With `--bad-request`, it also sends a request of an
 # unknown type on `ready`. With `--no-connect`, it never connects, and only logs `started`. With
 # `--crash-once`, the first server to get `built` exits with an error. With `--exit-after-built`,
 # every server exits successfully after `built`. With `--flood-on-second-build`, it sends one
@@ -118,6 +122,14 @@ def main():
                 request({"type": "build", "outputs": message["outputs"]})
             else:
                 request({"type": "build", "outputs": ["site"]})
+        elif kind == "stale" and "--patcher" in args:
+            exe = message["outputs"].get("exe", {})
+            if "lib" in exe.get("within", []):
+                request({"type": "build", "outputs": ["patch"]})
+            else:
+                request({"type": "build", "outputs": ["exe", "patch"]})
+        elif kind == "stale" and "--manual" not in args:
+            request({"type": "build", "outputs": sorted(message["outputs"])})
         elif kind == "building":
             builds += 1
             if builds == 2 and "--flood-on-second-build" in args:

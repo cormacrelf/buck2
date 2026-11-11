@@ -55,13 +55,13 @@ class DevTimingTest(BuckTestCase):
     @dev_test()
     async def test_build_file_change_during_a_build(self, buck: Buck) -> None:
         """A change to the build file during a build stops it: `cancelled`, `graph_changed`,
-        and a new build of the new graph."""
+        `stale`, and the server's build of the new graph."""
         write(buck, "app/zero.txt", "0\n")
         dev = await start_dev(buck, "//app:slow")
         try:
             first = await dev.start()
             write(buck, "app/delay.txt", "30\n")
-            (building,) = await dev.expect("building")
+            _, building = await dev.expect("stale", "building")
             await asyncio.sleep(1)
 
             # The new graph also builds without the delay.
@@ -72,8 +72,8 @@ class DevTimingTest(BuckTestCase):
                 'srcs = ["main.txt"],\n    delay = "delay.txt",',
                 'srcs = ["main.txt", "other.txt"],\n    delay = "zero.txt",',
             )
-            cancelled, _, second, built = await dev.expect(
-                "cancelled", "graph_changed", "building", "built"
+            cancelled, _, _, second, built = await dev.expect(
+                "cancelled", "graph_changed", "stale", "building", "built"
             )
             assert cancelled["gen"] == building["gen"]
             assert files(buck, second) == [APP, "app/delay.txt"], second
@@ -85,18 +85,18 @@ class DevTimingTest(BuckTestCase):
 
     @dev_test()
     async def test_breaking_change_during_a_build(self, buck: Buck) -> None:
-        """A change that breaks the build, during a build: `cancelled`, then a build that
-        fails. The server keeps running."""
+        """A change that breaks the build, during a build: `cancelled`, `stale`, then a build
+        that fails. The server keeps running."""
         dev = await start_dev(buck, "//app:slow")
         try:
             first = await dev.start()
             write(buck, "app/delay.txt", "30\n")
-            await dev.expect("building")
+            await dev.expect("stale", "building")
             await asyncio.sleep(1)
 
             write(buck, "app/delay.txt", "0\n")
             write(buck, "app/main.txt", "FAIL v2\n")
-            _, building, _ = await dev.expect("cancelled", "building", "failed")
+            _, _, building, _ = await dev.expect("cancelled", "stale", "building", "failed")
             assert files(buck, building) == ["app/delay.txt", "app/main.txt"]
             await dev.quiet()
             assert_kept(dev, first)
@@ -114,7 +114,7 @@ class DevTimingTest(BuckTestCase):
             write(buck, "app/watch_delay.txt", "3\n")
             await asyncio.sleep(1.5)
             write(buck, "app/main.txt", "app v2\n")
-            building, built = await dev.expect("building", "built")
+            _, building, built = await dev.expect("stale", "building", "built")
             assert building["outputs"] == ["site"]
             assert files(buck, building) == ["app/main.txt"]
             assert site(built) == "lib v1\napp v2\n"
@@ -130,7 +130,7 @@ class DevTimingTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/delay.txt", "3\n")
-            (first,) = await dev.expect("building")
+            _, first = await dev.expect("stale", "building")
             dev.request({"type": "build", "outputs": ["site"]})
             built, second, built2 = await dev.expect("built", "building", "built")
             assert built["gen"] == first["gen"]
@@ -148,7 +148,7 @@ class DevTimingTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/delay.txt", "3\n")
-            (building,) = await dev.expect("building")
+            _, building = await dev.expect("stale", "building")
             dev.request({"type": "restart"})
             built, shutdown, started, _, _, built2 = await dev.expect(
                 "built", "shutdown", "started", "ready", "building", "built"
@@ -254,7 +254,7 @@ class DevTimingTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/delay.txt", "3\n")
-            (building,) = await dev.expect("building")
+            _, building = await dev.expect("stale", "building")
             await buck.build("//app:slow")
             (built,) = await dev.expect("built")
             assert built["gen"] == building["gen"]

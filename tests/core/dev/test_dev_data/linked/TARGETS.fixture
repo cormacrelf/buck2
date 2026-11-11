@@ -32,10 +32,3 @@ run_info_app(
     binary = ":binary",
     server = "server.py",
 )
-
-run_info_app(
-    name = "run_info_only",
-    binary = ":binary",
-    only = [],
-    server = "server.py",
-)

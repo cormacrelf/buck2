@@ -124,13 +124,18 @@ conn.connect(os.environ["BUCK2_DEV_SOCKET"])
 stream = conn.makefile("rwb")
 stream.write(b'{"type": "hello", "version": 1}\\n')
 stream.flush()
+
+def build(outputs):
+    stream.write((json.dumps({"type": "build", "outputs": outputs}) + "\\n").encode())
+    stream.flush()
+
 for line in stream:
     message = json.loads(line)
-    message.pop("outputs", None)
+    outputs = message.pop("outputs", None)
     say(message)
-    if message["type"] == "ready":
-        stream.write(b'{"type": "build", "outputs": ["small"]}\\n')
-        stream.flush()
+    # Every output when it starts, and every output that is stale after a change.
+    if message["type"] in ("ready", "stale"):
+        build(list(outputs))
     elif message["type"] == "shutdown":
         break
 ''',
