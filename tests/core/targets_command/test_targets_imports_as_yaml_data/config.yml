@@ -1,0 +1,12 @@
+# `.yml` is YAML too. YAML 1.2 core schema: `no` is a string.
+country: no
+enabled: true
+count: 42
+ratio: 0.5
+nothing: ~
+'1': quoted keys are strings
+defaults: &defaults
+  retries: 3
+service:
+  <<: *defaults
+  name: web

@@ -89,6 +89,9 @@ impl std::fmt::Display for StarlarkEvalKind {
                 OwnedStarlarkModulePath::TomlFile(import_path) => {
                     write!(f, "load_toml/{}", import_path)
                 }
+                OwnedStarlarkModulePath::YamlFile(import_path) => {
+                    write!(f, "load_yaml/{}", import_path)
+                }
             },
             StarlarkEvalKind::LoadPackageFile(package_label) => {
                 write!(f, "load_package/{}", package_label)

@@ -4,7 +4,7 @@ title: Loading Data in Starlark
 ---
 
 You can load static data from within `BUCK` or `.bzl` files, as long as that
-static data is stored in a JSON or TOML file in a package.
+static data is stored in a JSON, TOML or YAML file in a package.
 
 ```python
 load("//foo:bar.toml", "value")
@@ -20,11 +20,11 @@ build process, but is necessary for the build itself - like URLs and checksums
 being passed into
 [`http_archive`](https://buck2.build/docs/prelude/rules/core/http_archive/).
 
-By default the file name must end in `.toml` or `.json`, and `load()` can only
-import the name `value` from these files. For TOML, `value` is always going to be
-a dictionary with `str` keys (i.e. a
-[TOML table](https://toml.io/en/v1.0.0#table)), and for JSON it maps to whatever
-value is in the file.
+By default the file name must end in `.json`, `.toml`, `.yaml` or `.yml`, and
+`load()` can only import the name `value` from these files. For TOML, `value` is
+always going to be a dictionary with `str` keys (i.e. a
+[TOML table](https://toml.io/en/v1.0.0#table)), and for JSON and YAML it maps to
+whatever value is in the file.
 
 If a name other than `value` is needed, `load()` allows aliasing:
 
@@ -44,6 +44,18 @@ Starlark like you might expect:
 - objects map to `dict`
 - tables (in TOML) map to `str`-keyed `dict`
 
+YAML maps the same way as JSON, with a few YAML-specific rules:
+
+- A file holds one document. A stream of several (separated by `---`) is an
+  error.
+- Scalars are resolved with the YAML 1.2 core schema: `yes`, `no`, `on` and
+  `off` are strings, not booleans.
+- Mapping keys must be strings. A key that YAML reads as something else (`1:`,
+  `true:`, `null:`, a sequence) is an error; quote it (`'1':`) to make it a
+  string.
+- Anchors, aliases and `<<` merge keys are expanded.
+- Tags such as `!!binary` and `!custom` are not represented in the value.
+
 ## Files with a different extension
 
 Plenty of data files have no usable extension, and some have a misleading one.
@@ -56,7 +68,7 @@ load("//foo:Cargo.lock?as=toml", cargo = "value")
 load("//foo:Pipfile.lock?as=json", pipfile = "value")
 ```
 
-The accepted formats are `json` and `toml`. There is no `?as=bzl`: a file that is
+The accepted formats are `json`, `toml` and `yaml`. There is no `?as=bzl`: a file that is
 Starlark says so by being named `.bzl`.
 
 A `?as=` load only works on files the repo has opted in, via a comma-separated
@@ -93,7 +105,7 @@ too.
 
 The alternative to loading a file during Starlark evaluation is to keep the build
 out of it entirely. Run a tool outside the build, by hand or as a CI step, that
-transforms whatever you have into a `.json`, `.toml`, or `.bzl` file, and commit
+transforms whatever you have into a `.json`, `.toml`, `.yaml` or `.bzl` file, and commit
 the result. The build then loads a file that is known to parse, in a shape you
 chose.
 

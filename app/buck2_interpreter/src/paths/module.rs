@@ -47,6 +47,8 @@ pub enum StarlarkModulePath<'a> {
     JsonFile(&'a ImportPath),
     /// a toml file to be parsed
     TomlFile(&'a ImportPath),
+    /// a yaml file to be parsed
+    YamlFile(&'a ImportPath),
 }
 
 impl Equivalent<OwnedStarlarkModulePath> for StarlarkModulePath<'_> {
@@ -72,6 +74,7 @@ impl<'a> StarlarkModulePath<'a> {
             ImportFormat::Bzl => StarlarkModulePath::LoadFile(path),
             ImportFormat::Json => StarlarkModulePath::JsonFile(path),
             ImportFormat::Toml => StarlarkModulePath::TomlFile(path),
+            ImportFormat::Yaml => StarlarkModulePath::YamlFile(path),
         }
     }
 
@@ -81,7 +84,8 @@ impl<'a> StarlarkModulePath<'a> {
         match self {
             StarlarkModulePath::LoadFile(p)
             | StarlarkModulePath::JsonFile(p)
-            | StarlarkModulePath::TomlFile(p) => Some(p),
+            | StarlarkModulePath::TomlFile(p)
+            | StarlarkModulePath::YamlFile(p) => Some(p),
             StarlarkModulePath::BxlFile(_) => None,
         }
     }
@@ -92,6 +96,7 @@ impl<'a> StarlarkModulePath<'a> {
             StarlarkModulePath::BxlFile(b) => b.cell(),
             StarlarkModulePath::JsonFile(j) => j.cell(),
             StarlarkModulePath::TomlFile(t) => t.cell(),
+            StarlarkModulePath::YamlFile(t) => t.cell(),
         }
     }
 
@@ -101,6 +106,7 @@ impl<'a> StarlarkModulePath<'a> {
             StarlarkModulePath::BxlFile(b) => b.build_file_cell(),
             StarlarkModulePath::JsonFile(j) => j.build_file_cell(),
             StarlarkModulePath::TomlFile(t) => t.build_file_cell(),
+            StarlarkModulePath::YamlFile(t) => t.build_file_cell(),
         }
     }
 
@@ -110,6 +116,7 @@ impl<'a> StarlarkModulePath<'a> {
             StarlarkModulePath::BxlFile(b) => b.path(),
             StarlarkModulePath::JsonFile(j) => j.path(),
             StarlarkModulePath::TomlFile(t) => t.path(),
+            StarlarkModulePath::YamlFile(t) => t.path(),
         }
     }
 
@@ -119,6 +126,7 @@ impl<'a> StarlarkModulePath<'a> {
             StarlarkModulePath::BxlFile(b) => StarlarkPath::BxlFile(b),
             StarlarkModulePath::JsonFile(j) => StarlarkPath::JsonFile(j),
             StarlarkModulePath::TomlFile(t) => StarlarkPath::TomlFile(t),
+            StarlarkModulePath::YamlFile(t) => StarlarkPath::YamlFile(t),
         }
     }
 
@@ -134,6 +142,7 @@ pub enum OwnedStarlarkModulePath {
     BxlFile(BxlFilePath),
     JsonFile(ImportPath),
     TomlFile(ImportPath),
+    YamlFile(ImportPath),
 }
 
 #[allow(clippy::derived_hash_with_manual_eq)]
@@ -156,6 +165,7 @@ impl OwnedStarlarkModulePath {
             StarlarkModulePath::BxlFile(p) => Self::BxlFile(p.clone()),
             StarlarkModulePath::JsonFile(p) => Self::JsonFile(p.clone()),
             StarlarkModulePath::TomlFile(t) => Self::TomlFile(t.clone()),
+            StarlarkModulePath::YamlFile(t) => Self::YamlFile(t.clone()),
         }
     }
 
@@ -170,6 +180,7 @@ impl OwnedStarlarkModulePath {
             OwnedStarlarkModulePath::BxlFile(p) => StarlarkModulePath::BxlFile(p),
             OwnedStarlarkModulePath::JsonFile(p) => StarlarkModulePath::JsonFile(p),
             OwnedStarlarkModulePath::TomlFile(p) => StarlarkModulePath::TomlFile(p),
+            OwnedStarlarkModulePath::YamlFile(p) => StarlarkModulePath::YamlFile(p),
         }
     }
 
@@ -179,6 +190,7 @@ impl OwnedStarlarkModulePath {
             OwnedStarlarkModulePath::BxlFile(p) => *p.path(),
             OwnedStarlarkModulePath::JsonFile(p) => *p.path(),
             OwnedStarlarkModulePath::TomlFile(p) => *p.path(),
+            OwnedStarlarkModulePath::YamlFile(p) => *p.path(),
         }
     }
 
@@ -188,6 +200,7 @@ impl OwnedStarlarkModulePath {
             OwnedStarlarkModulePath::BxlFile(b) => OwnedStarlarkPath::BxlFile(b),
             OwnedStarlarkModulePath::JsonFile(b) => OwnedStarlarkPath::JsonFile(b),
             OwnedStarlarkModulePath::TomlFile(t) => OwnedStarlarkPath::TomlFile(t),
+            OwnedStarlarkModulePath::YamlFile(t) => OwnedStarlarkPath::YamlFile(t),
         }
     }
 }

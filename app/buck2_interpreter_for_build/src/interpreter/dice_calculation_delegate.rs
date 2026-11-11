@@ -72,6 +72,7 @@ use crate::interpreter::global_interpreter_state::HasGlobalInterpreterState;
 use crate::interpreter::interpreter_for_dir::InterpreterForDir;
 use crate::interpreter::interpreter_for_dir::ParseData;
 use crate::interpreter::interpreter_for_dir::ParseResult;
+use crate::interpreter::yaml_data::yaml_to_json;
 use crate::super_package::package_value::SuperPackageValuesImpl;
 
 /// Context for a load-time parse failure. This fails the whole package, so the
@@ -310,7 +311,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         ))
     }
 
-    /// Enforce that a data-file load (`.json`/`.toml`, whether the format comes
+    /// Enforce that a data-file load (`.json`/`.toml`/`.yaml`, whether the format comes
     /// from the extension or an `?as=` override) only references a file owned by
     /// the same package as the file doing the load. Such data files are treated
     /// like source files for isolation: they belong to exactly one package (its
@@ -325,7 +326,8 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             .iter()
             .filter_map(|(_, module)| match module {
                 OwnedStarlarkModulePath::JsonFile(import)
-                | OwnedStarlarkModulePath::TomlFile(import) => {
+                | OwnedStarlarkModulePath::TomlFile(import)
+                | OwnedStarlarkModulePath::YamlFile(import) => {
                     Some((*import.path(), import.format_override()))
                 }
                 _ => None,
@@ -494,62 +496,40 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         starlark_file: StarlarkModulePath<'_>,
         cancellation: &CancellationContext,
     ) -> buck2_error::Result<LoadedModule> {
-        match starlark_file {
-            StarlarkModulePath::JsonFile(_) => self.eval_json_module_uncached(starlark_file).await,
-            StarlarkModulePath::TomlFile(_) => self.eval_toml_file_uncached(starlark_file).await,
-            _ => {
-                self.eval_starlark_module_uncached(starlark_file, cancellation)
-                    .await
+        let parse: fn(&str) -> buck2_error::Result<serde_json::Value> = match starlark_file {
+            StarlarkModulePath::JsonFile(_) => |contents| Ok(serde_json::from_str(contents)?),
+            StarlarkModulePath::TomlFile(_) => {
+                |contents| Ok(toml_value_to_json(toml::from_str(contents)?))
             }
-        }
+            StarlarkModulePath::YamlFile(_) => yaml_to_json,
+            StarlarkModulePath::LoadFile(_) | StarlarkModulePath::BxlFile(_) => {
+                return self
+                    .eval_starlark_module_uncached(starlark_file, cancellation)
+                    .await;
+            }
+        };
+        self.eval_data_file_uncached(starlark_file, parse).await
     }
 
-    async fn eval_json_module_uncached(
+    /// A `.json`, `.toml` or `.yaml` file: a module whose one global, `value`,
+    /// is the file's contents.
+    async fn eval_data_file_uncached(
         &mut self,
         starlark_file: StarlarkModulePath<'_>,
+        parse: fn(&str) -> buck2_error::Result<serde_json::Value>,
     ) -> buck2_error::Result<LoadedModule> {
         let path = starlark_file.path();
         let contents = DiceFileComputations::read_file(self.ctx, *path)
             .await
             .with_package_context_information(path.path().to_string())?;
 
-        let value: serde_json::Value = serde_json::from_str(&contents)
-            .with_buck_error_context(|| parse_error_context(starlark_file))?;
+        let value =
+            parse(&contents).with_buck_error_context(|| parse_error_context(starlark_file))?;
 
         // We expect these to be small + simple
         // ast-grep-ignore: rust/buck2-no-starlark-module
         let frozen = Module::with_temp_heap(|module| {
             module.set("value", module.heap().alloc(value));
-            module
-                .freeze_named(FrozenHeapName::User(Box::new(StarlarkEvalKind::Load(
-                    Arc::new(OwnedStarlarkModulePath::new(starlark_file)),
-                ))))
-                .map_err(from_freeze_error)
-        })?;
-        Ok(LoadedModule::new(
-            OwnedStarlarkModulePath::new(starlark_file),
-            Default::default(),
-            frozen,
-        ))
-    }
-
-    async fn eval_toml_file_uncached(
-        &mut self,
-        starlark_file: StarlarkModulePath<'_>,
-    ) -> buck2_error::Result<LoadedModule> {
-        let path = starlark_file.path();
-        let contents = DiceFileComputations::read_file(self.ctx, *path)
-            .await
-            .with_package_context_information(path.path().to_string())?;
-
-        let value: toml::Value = toml::from_str(&contents)
-            .with_buck_error_context(|| parse_error_context(starlark_file))?;
-        let json_value = toml_value_to_json(value);
-
-        // We expect these to be small + simple
-        // ast-grep-ignore: rust/buck2-no-starlark-module
-        let frozen = Module::with_temp_heap(|module| {
-            module.set("value", module.heap().alloc(json_value));
             module
                 .freeze_named(FrozenHeapName::User(Box::new(StarlarkEvalKind::Load(
                     Arc::new(OwnedStarlarkModulePath::new(starlark_file)),

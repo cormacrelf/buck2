@@ -237,7 +237,8 @@ impl LoadResolver for InterpreterLoadResolver {
                 | StarlarkFileType::Buck
                 | StarlarkFileType::Package
                 | StarlarkFileType::Json
-                | StarlarkFileType::Toml => {
+                | StarlarkFileType::Toml
+                | StarlarkFileType::Yaml => {
                     return Err(LoadResolutionError::BxlLoadNotAllowed(path).into());
                 }
                 StarlarkFileType::Bxl => {
@@ -480,7 +481,9 @@ impl InterpreterForDir {
                         return Some(prelude_import);
                     }
                 }
-                StarlarkPath::JsonFile(_) | StarlarkPath::TomlFile(_) => return None,
+                StarlarkPath::JsonFile(_)
+                | StarlarkPath::TomlFile(_)
+                | StarlarkPath::YamlFile(_) => return None,
             }
         }
 
@@ -652,6 +655,7 @@ impl InterpreterForDir {
                 StarlarkModulePath::BxlFile(bxl) => PerFileTypeContext::Bxl(bxl.clone()),
                 StarlarkModulePath::JsonFile(j) => PerFileTypeContext::Json(j.clone()),
                 StarlarkModulePath::TomlFile(t) => PerFileTypeContext::Toml(t.clone()),
+                StarlarkModulePath::YamlFile(y) => PerFileTypeContext::Yaml(y.clone()),
             };
             let typecheck = self.global_state.unstable_typecheck
                 || matches!(starlark_path, StarlarkModulePath::BxlFile(..))

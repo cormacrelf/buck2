@@ -1,0 +1,4 @@
+load(":int_key.yaml", "value")
+
+# buildifier: disable=print
+print(value)

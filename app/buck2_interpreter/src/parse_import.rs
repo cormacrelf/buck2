@@ -20,7 +20,7 @@ use buck2_core::pattern::parse_package::parse_cell_path;
 use buck2_fs::paths::RelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 
-/// Strip a `?as=toml` or `?as=json` hint from a load string, e.g.
+/// Strip a `?as=json`, `?as=toml` or `?as=yaml` hint from a load string, e.g.
 /// `load(":blah.lock?as=toml", "value")`.
 ///
 /// A `?` suffix we don't understand is an error here rather than left on the
@@ -75,16 +75,20 @@ enum ImportParseError {
         "Unable to parse import spec. Expected format `(@<cell>)//package/name:path/to/filename.bzl` or `:path/to/filename.bzl`, but the part after `:` is not a normalized relative path. Got `{0}`"
     )]
     NotAFileName(String),
-    #[error("Unknown import format `{format}` in `{import}`. Expected `?as=json` or `?as=toml`")]
+    #[error(
+        "Unknown import format `{format}` in `{import}`. Expected `?as=json`, `?as=toml` or `?as=yaml`"
+    )]
     UnknownImportFormat { format: String, import: String },
     #[error(
-        "Import format `{format}` cannot be requested with `?as=` (in `{import}`). Name the file `.{format}` instead; `?as=` is for `json` and `toml` only"
+        "Import format `{format}` cannot be requested with `?as=` (in `{import}`). Name the file `.{format}` instead; `?as=` is for `json`, `toml` and `yaml` only"
     )]
     ImportFormatNotRequestable {
         format: &'static str,
         import: String,
     },
-    #[error("Unknown import option `?{option}` in `{import}`. Expected `?as=json` or `?as=toml`")]
+    #[error(
+        "Unknown import option `?{option}` in `{import}`. Expected `?as=json`, `?as=toml` or `?as=yaml`"
+    )]
     UnknownLoadOption { option: String, import: String },
 }
 
@@ -586,6 +590,10 @@ mod tests {
         assert_eq!(
             ("cell//pkg:Pipfile.lock", Some(ImportFormat::Json)),
             strip_format_hint("cell//pkg:Pipfile.lock?as=json").unwrap()
+        );
+        assert_eq!(
+            (":pnpm-lock.lock", Some(ImportFormat::Yaml)),
+            strip_format_hint(":pnpm-lock.lock?as=yaml").unwrap()
         );
     }
 

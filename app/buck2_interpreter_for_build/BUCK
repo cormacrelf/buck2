@@ -22,6 +22,7 @@ rust_library(
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:quick-xml",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde-saphyr",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:sha1",
         "fbsource//third-party/rust:sha2",

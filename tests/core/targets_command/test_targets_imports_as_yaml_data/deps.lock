@@ -1,0 +1,5 @@
+# YAML, though the extension does not say so: loaded with `?as=yaml`.
+- name: foo
+  version: 1.0.0
+- name: bar
+  version: 2.0.0

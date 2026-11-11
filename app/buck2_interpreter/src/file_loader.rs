@@ -45,7 +45,7 @@ impl LoadedModules {
             module
                 .path()
                 .unpack_import_path()
-                .expect("imports should only be bzl, json, or toml files")
+                .expect("imports should only be bzl, json, toml or yaml files")
         })
     }
 }

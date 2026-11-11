@@ -1,0 +1,13 @@
+load(":config.yml", config = "value")
+load(":deps.lock?as=yaml", deps = "value")
+load(":pnpm-lock.yaml", lock = "value")
+
+# buildifier: disable=print
+print(
+    "DATA_LOAD_TEST_OUTPUT: "
+    + repr({
+        "config": config,
+        "deps": deps,
+        "lock": lock,
+    })
+)

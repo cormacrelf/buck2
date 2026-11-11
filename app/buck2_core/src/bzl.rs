@@ -26,7 +26,7 @@ use crate::cells::paths::CellRelativePath;
 enum ImportPathError {
     #[error("Invalid import path `{0}`")]
     Invalid(CellPath),
-    #[error("Import path must have suffix `.bzl`, `.json`, or `.toml`: `{0}`")]
+    #[error("Import path must have suffix `.bzl`, `.json`, `.toml`, `.yaml` or `.yml`: `{0}`")]
     Suffix(CellPath),
 }
 
@@ -40,6 +40,7 @@ pub enum ImportFormat {
     Bzl,
     Json,
     Toml,
+    Yaml,
 }
 
 impl ImportFormat {
@@ -48,6 +49,7 @@ impl ImportFormat {
             ImportFormat::Bzl => "bzl",
             ImportFormat::Json => "json",
             ImportFormat::Toml => "toml",
+            ImportFormat::Yaml => "yaml",
         }
     }
 
@@ -58,6 +60,7 @@ impl ImportFormat {
             "bzl" => Some(ImportFormat::Bzl),
             "json" => Some(ImportFormat::Json),
             "toml" => Some(ImportFormat::Toml),
+            "yaml" => Some(ImportFormat::Yaml),
             _ => None,
         }
     }
@@ -70,6 +73,7 @@ impl ImportFormat {
             "bzl" => Some(ImportFormat::Bzl),
             "json" => Some(ImportFormat::Json),
             "toml" => Some(ImportFormat::Toml),
+            "yaml" | "yml" => Some(ImportFormat::Yaml),
             _ => None,
         }
     }
@@ -304,6 +308,8 @@ mod tests {
             ("a.bzl", ImportFormat::Bzl),
             ("a.json", ImportFormat::Json),
             ("a.toml", ImportFormat::Toml),
+            ("a.yaml", ImportFormat::Yaml),
+            ("a.yml", ImportFormat::Yaml),
         ] {
             let import = import(filename).unwrap();
             assert_eq!(format, import.format(), "{filename}");
@@ -368,6 +374,8 @@ mod tests {
             ("a.bzl", ImportFormat::Bzl),
             ("a.json", ImportFormat::Json),
             ("a.toml", ImportFormat::Toml),
+            ("a.yaml", ImportFormat::Yaml),
+            ("a.yml", ImportFormat::Yaml),
         ] {
             let explicit = import_as(filename, format).unwrap();
             assert_eq!(import(filename).unwrap(), explicit, "{filename}");

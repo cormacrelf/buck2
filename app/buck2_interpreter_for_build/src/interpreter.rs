@@ -31,3 +31,4 @@ pub mod package_file_calculation;
 pub mod package_file_extra;
 pub mod selector;
 pub mod testing;
+pub(crate) mod yaml_data;
