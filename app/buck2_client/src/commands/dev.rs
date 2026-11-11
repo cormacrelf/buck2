@@ -1196,10 +1196,11 @@ impl<'a> Session<'a> {
             || !changes.build.is_empty()
             || !changes.hold.is_empty();
 
-        // A build since the changes were read has used them already.
+        // A build since the changes were read has used them already. Not a change to the graph,
+        // though: a new file that a target takes in does not stop a build that is running.
         let fresh = std::mem::take(&mut self.fresh);
         let is_news = |name: &String, paths: &mut Vec<String>| {
-            let Some(fresh) = fresh.get(name) else {
+            let Some(fresh) = fresh.get(name).filter(|_| !graph_changed) else {
                 return true;
             };
             let asked = paths.len();
