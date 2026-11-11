@@ -166,4 +166,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C, which reaches this server because it is interactive. `main` has stopped Vite.
+        # Die of SIGINT, without a traceback, so that `buck2 dev` sees the user quit.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
