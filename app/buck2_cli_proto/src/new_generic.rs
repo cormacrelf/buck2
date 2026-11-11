@@ -184,7 +184,7 @@ pub struct DevInterrupted {
 pub struct DevServer {
     /// Absolute path of the project root. The server runs in this directory.
     pub project_root: String,
-    /// The server command line. Paths in it are relative to the project root.
+    /// The server command line. Paths in it are absolute.
     pub server: Vec<String>,
     /// A digest of the contents of the artifacts that the server command line names, hidden
     /// ones too, which is the same in another daemon. A server that runs is out of date once

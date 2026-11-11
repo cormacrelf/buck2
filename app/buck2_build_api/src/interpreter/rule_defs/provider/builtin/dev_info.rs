@@ -20,6 +20,7 @@ use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
+use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
@@ -140,6 +141,9 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
         Ok(info)
     }
 }
+
+/// A `DevInfo` kept alive by its owning frozen heap; usable across threads and awaits.
+pub type OwnedDevInfo = OwnedFrozen<ValueTyped<'static, DevInfo<'static>>>;
 
 impl<'v> DevInfo<'v> {
     pub fn server_command_line(&self) -> &'v dyn CommandLineArgLike<'v> {

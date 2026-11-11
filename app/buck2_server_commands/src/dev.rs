@@ -52,9 +52,14 @@ use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ResolvedArtifactGroup;
 use buck2_build_api::artifact_groups::TransitiveSetProjectionKey;
 use buck2_build_api::interpreter::rule_defs::cmd_args::ArtifactPathMapperImpl;
+use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevInfo;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::OwnedDevInfo;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::OwnedRunInfo;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
+use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::materialize::HasMaterializationQueueTracker;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_build_api::materialize::materialize_and_upload_artifact_group;
@@ -102,6 +107,7 @@ use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::load_module::InterpreterCalculation;
@@ -139,7 +145,9 @@ use pagable::pagable_typetag;
 enum DevError {
     #[error("`buck2 dev` takes exactly one target, but `{0}` matched {1}")]
     NotOneTarget(String, usize),
-    #[error("Target `{0}` has no `DevInfo` provider, so `buck2 dev` cannot use it")]
+    #[error(
+        "Target `{0}` has no `DevInfo` provider and no `RunInfo` provider, so `buck2 dev` cannot use it"
+    )]
     NoDevInfo(ConfiguredProvidersLabel),
     #[error("Target `{target}` has no output named `{name}` in its `DevInfo`")]
     UnknownOutput {
@@ -174,9 +182,82 @@ fn slot_bit(slot: usize) -> u64 {
     1 << slot
 }
 
+/// What `buck2 dev` runs for a target: its `DevInfo`, or, for a target without one, its
+/// `RunInfo`, which is then the server of a `DevInfo` without outputs.
+enum DevProvider {
+    Dev(OwnedDevInfo),
+    Run(OwnedRunInfo),
+}
+
+/// A `DevProvider`, borrowed. It must not be held across an await.
+#[derive(Clone, Copy)]
+enum DevView<'a> {
+    Dev(&'a DevInfo<'a>),
+    Run(&'a RunInfo<'a>),
+}
+
+impl DevProvider {
+    fn of(
+        providers: &FrozenProviderCollectionValue,
+        label: &ConfiguredProvidersLabel,
+    ) -> buck2_error::Result<DevProvider> {
+        if let Some(info) = providers.builtin_provider_value::<DevInfo>()? {
+            return Ok(DevProvider::Dev(info));
+        }
+        if let Some(info) = providers.builtin_provider_value::<RunInfo>()? {
+            return Ok(DevProvider::Run(info));
+        }
+        Err(DevError::NoDevInfo(label.dupe()).into())
+    }
+
+    fn view(&self) -> DevView<'_> {
+        match self {
+            DevProvider::Dev(info) => DevView::Dev(info.as_ref().value().as_ref()),
+            DevProvider::Run(info) => DevView::Run(info.as_ref().value().as_ref()),
+        }
+    }
+}
+
+impl<'a> DevView<'a> {
+    fn server_command_line(self) -> &'a dyn CommandLineArgLike<'a> {
+        match self {
+            DevView::Dev(info) => info.server_command_line(),
+            DevView::Run(info) => info,
+        }
+    }
+
+    fn outputs(self) -> buck2_error::Result<BuckMutInsertionMap<String, Artifact>> {
+        match self {
+            DevView::Dev(info) => info.outputs(),
+            DevView::Run(_) => Ok(BuckMutInsertionMap::default()),
+        }
+    }
+
+    fn sidecars(self) -> buck2_error::Result<BuckMutInsertionMap<String, Vec<(String, Artifact)>>> {
+        match self {
+            DevView::Dev(info) => info.sidecars(),
+            DevView::Run(_) => Ok(BuckMutInsertionMap::default()),
+        }
+    }
+
+    fn only(self) -> BuckMutInsertionMap<String, Vec<String>> {
+        match self {
+            DevView::Dev(info) => info.only(),
+            DevView::Run(_) => BuckMutInsertionMap::default(),
+        }
+    }
+
+    fn interactive(self) -> bool {
+        match self {
+            DevView::Dev(info) => info.interactive(),
+            DevView::Run(_) => false,
+        }
+    }
+}
+
 /// The names of the outputs of a `DevInfo`, and its slots: slot 0 is the server, and slot
 /// `i + 1` is the output with the `i`th of these names.
-fn dev_policy(info: &DevInfo<'_>) -> buck2_error::Result<(Vec<String>, Vec<Slot>)> {
+fn dev_policy(info: DevView<'_>) -> buck2_error::Result<(Vec<String>, Vec<Slot>)> {
     let outputs = info.outputs()?;
     if outputs.len() + 1 > MAX_SLOTS {
         return Err(DevError::TooManySlots("outputs and the server", outputs.len() + 1).into());
@@ -281,80 +362,26 @@ async fn dev(
         .await?
         .require_compatible()?;
     // Held across awaits, so this needs the owned form.
-    let info = providers
-        .builtin_provider_value::<DevInfo>()?
-        .ok_or_else(|| DevError::NoDevInfo(label.dupe()))?;
-    let outputs = info.as_ref().value().as_ref().outputs()?;
+    let info = DevProvider::of(&providers, &label)?;
+    let outputs = info.view().outputs()?;
     match &req.action {
         DevAction::Server => {
-            let (server, digest) = {
-                let mut dice = ctx.ctx();
-                let artifact_fs = dice.get_artifact_fs().await?;
-                let inputs = {
-                    let mut visitor = SimpleCommandLineArtifactVisitor::new();
-                    info.as_ref()
-                        .value()
-                        .as_ref()
-                        .server_command_line()
-                        .visit_artifacts(&mut visitor)?;
-                    visitor.inputs
-                };
-                let ensured = dice
-                    .try_compute_join(inputs, async |dice, input| {
-                        materialize_and_upload_artifact_group(
-                            dice,
-                            &input,
-                            MaterializationAndUploadContext::materialize(),
-                            &dice
-                                .per_transaction_data()
-                                .get_materialization_queue_tracker(),
-                        )
-                        .await
-                        .map(|value| (input, value))
-                    })
-                    .await
-                    .buck_error_context("Failed to build the `buck2 dev` server")?;
-                let path_separator = if cfg!(windows) {
-                    PathSeparatorKind::Windows
-                } else {
-                    PathSeparatorKind::Unix
-                };
-                let executor_fs = ExecutorFs::new(&artifact_fs, path_separator);
-                let mut contents = Vec::new();
-                for (_, values) in &ensured {
-                    for (artifact, value) in values.iter() {
-                        let path = artifact
-                            .resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
-                        contents.push((path.to_string(), value_digest(value)));
-                    }
-                }
-                let digest = contents_digest(contents);
-                let mut args = Vec::<String>::new();
-                let mapper = ArtifactPathMapperImpl::from(&ensured);
-                let mut builder = CommandLineBuilder::new_with_options(
-                    &mut args,
-                    &mapper,
-                    &executor_fs,
-                    true,
-                    None,
-                );
-                info.as_ref()
-                    .value()
-                    .as_ref()
-                    .server_command_line()
-                    .add_to_command_line(&mut builder)?;
-                (args, digest)
-            };
+            let (server, digest) = build_command(
+                &mut ctx.ctx(),
+                || info.view().server_command_line(),
+                "Failed to build the `buck2 dev` server",
+            )
+            .await?;
             Ok(DevResponse::Server(DevServer {
                 project_root: server_ctx.project_root().root().to_string(),
                 server,
                 digest,
                 outputs: outputs.keys().cloned().collect(),
-                interactive: info.as_ref().value().as_ref().interactive(),
+                interactive: info.view().interactive(),
             }))
         }
         DevAction::Watch(request) => {
-            let (names, slots) = dev_policy(info.as_ref().value().as_ref())?;
+            let (names, slots) = dev_policy(info.view())?;
             Ok(DevResponse::Watch(
                 watch_files(
                     &mut ctx.ctx(),
@@ -368,7 +395,7 @@ async fn dev(
             ))
         }
         DevAction::Build { outputs: names } => {
-            let sidecars = info.as_ref().value().as_ref().sidecars()?;
+            let sidecars = info.view().sidecars()?;
             let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
             for name in names {
                 let artifact = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
@@ -388,7 +415,7 @@ async fn dev(
             };
             // The slots that this build is built from. A change to a file of one of them stops
             // it.
-            let (all, _) = dev_policy(info.as_ref().value().as_ref())?;
+            let (all, _) = dev_policy(info.view())?;
             let builds = all
                 .iter()
                 .enumerate()
@@ -440,6 +467,59 @@ async fn dev(
             }
         }
     }
+}
+
+/// Build what a command line names, and return the command line, with absolute paths, and a
+/// digest of the contents of what it names, hidden artifacts too, which is the same in another
+/// daemon. `line` gives the command line; it is called once before the
+/// build and once after.
+async fn build_command<'a>(
+    dice: &mut DiceComputations<'_>,
+    line: impl Send + Sync + Fn() -> &'a dyn CommandLineArgLike<'a>,
+    what: &str,
+) -> buck2_error::Result<(Vec<String>, String)> {
+    let artifact_fs = dice.get_artifact_fs().await?;
+    let inputs = {
+        let mut visitor = SimpleCommandLineArtifactVisitor::new();
+        line().visit_artifacts(&mut visitor)?;
+        visitor.inputs
+    };
+    let ensured = dice
+        .try_compute_join(inputs, async |dice, input| {
+            materialize_and_upload_artifact_group(
+                dice,
+                &input,
+                MaterializationAndUploadContext::materialize(),
+                &dice
+                    .per_transaction_data()
+                    .get_materialization_queue_tracker(),
+            )
+            .await
+            .map(|value| (input, value))
+        })
+        .await
+        .with_buck_error_context(|| what.to_owned())?;
+    let path_separator = if cfg!(windows) {
+        PathSeparatorKind::Windows
+    } else {
+        PathSeparatorKind::Unix
+    };
+    let executor_fs = ExecutorFs::new(&artifact_fs, path_separator);
+    let mut contents = Vec::new();
+    for (_, values) in &ensured {
+        for (artifact, value) in values.iter() {
+            let path =
+                artifact.resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
+            contents.push((path.to_string(), value_digest(value)));
+        }
+    }
+    let digest = contents_digest(contents);
+    let mut args = Vec::<String>::new();
+    let mapper = ArtifactPathMapperImpl::from(&ensured);
+    let mut builder =
+        CommandLineBuilder::new_with_options(&mut args, &mapper, &executor_fs, true, None);
+    line().add_to_command_line(&mut builder)?;
+    Ok((args, digest))
 }
 
 /// What a file is, to tell whether it changed.
@@ -1516,10 +1596,8 @@ async fn dev_slots(
     label: &ConfiguredProvidersLabel,
 ) -> buck2_error::Result<Vec<Slot>> {
     let providers = dice.get_providers(label).await?.require_compatible()?;
-    let info = providers
-        .builtin_provider_value::<DevInfo>()?
-        .ok_or_else(|| DevError::NoDevInfo(label.dupe()))?;
-    Ok(dev_policy(info.as_ref().value().as_ref())?.1)
+    let info = DevProvider::of(&providers, label)?;
+    Ok(dev_policy(info.view())?.1)
 }
 
 /// Say what the requested paths are to the server and to the outputs, and whose targets

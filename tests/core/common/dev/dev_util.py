@@ -234,10 +234,15 @@ def summary(events: List[Dict[str, Any]]) -> List[str]:
 
 
 async def start_dev(
-    buck: Buck, target: str, console: str = "none", *args: str
+    buck: Buck,
+    target: str,
+    console: str = "none",
+    *args: str,
+    env: Optional[Dict[str, str]] = None,
 ) -> DevSession:
+    """Start `buck2 dev`. `env` adds to the environment of the `buck2 dev` client."""
     process = await buck.run_buck_command(
-        "dev", target, "--console", console, "--debounce-ms", "200", *args
+        "dev", target, "--console", console, "--debounce-ms", "200", *args, env=env
     ).start()
     return DevSession(buck, process)
 

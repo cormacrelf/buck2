@@ -88,10 +88,10 @@ mod pty;
 
 /// Run a target's `DevInfo` server, and rebuild as source files change.
 ///
-/// The target must return a `DevInfo` provider. `buck2 dev` builds and starts its server, then
-/// watches the source files of the target's dependency graph. When a file changes, it builds the
-/// `DevInfo` outputs that may be built from it again and tells the server, and starts the server
-/// again if its command changed.
+/// The target must return a `DevInfo` provider, or a `RunInfo` provider, which is then the
+/// server. `buck2 dev` builds and starts its server, then watches the source files of the
+/// target's dependency graph. When a file changes, it builds the `DevInfo` outputs that may be
+/// built from it again and tells the server, and starts the server again if its command changed.
 ///
 /// The server may connect to the socket named in the `BUCK2_DEV_SOCKET` environment variable, and
 /// exchange JSON lines with `buck2 dev` there: it gets messages such as `{"type": "built", ...}`,
@@ -110,6 +110,10 @@ pub struct DevCommand {
     /// The target whose `DevInfo` to run.
     #[clap(name = "TARGET")]
     target: String,
+
+    /// Arguments after `--` are appended to the server's command line, for the whole session.
+    #[clap(name = "SERVER_ARGS", last = true)]
+    server_args: Vec<String>,
 
     /// After a file changes, wait until no file has changed for this many milliseconds before
     /// building.
@@ -221,6 +225,7 @@ impl DevCommand {
         };
         let mut session = match Session::start(
             daemon,
+            self.server_args.clone(),
             Duration::from_millis(self.debounce_ms),
             listener,
             server_rx,
@@ -819,6 +824,8 @@ const MAX_DEBOUNCE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 struct Session<'a> {
     daemon: Daemon<'a>,
+    /// The arguments after `--`, appended to the server's command line.
+    server_args: Vec<String>,
     debounce: Duration,
     /// The changes the daemon's file watcher reports.
     changes: FileChanges,
@@ -909,6 +916,7 @@ impl<'a> Session<'a> {
     /// started.
     async fn start(
         mut daemon: Daemon<'a>,
+        server_args: Vec<String>,
         debounce: Duration,
         listener: Listener,
         server_rx: mpsc::UnboundedReceiver<ServerEvent>,
@@ -938,6 +946,7 @@ impl<'a> Session<'a> {
         };
         let mut session = Session {
             daemon,
+            server_args,
             debounce,
             changes,
             missed: false,
@@ -1667,8 +1676,15 @@ impl<'a> Session<'a> {
         let output = (!interactive && self.link.console.has_canvas())
             .then(|| self.link.console.updates.clone());
         let first_conn = self.listener.next_conn();
+        let argv: Vec<String> = self
+            .server_info
+            .server
+            .iter()
+            .chain(&self.server_args)
+            .cloned()
+            .collect();
         let process = ServerProcess::spawn(
-            &self.server_info.server,
+            &argv,
             &self.server_info.project_root,
             interactive,
             self.listener.address(),

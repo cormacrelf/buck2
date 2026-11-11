@@ -9,7 +9,9 @@ that serves the newest build, a test runner that runs again on save, or a tool
 that loads new code into a running program.
 
 A rule makes its targets work with `buck2 dev` by returning the
-[`DevInfo`](../../api/build/DevInfo) provider. `DevInfo` says three things:
+[`DevInfo`](../../api/build/DevInfo) provider, or only a `RunInfo` (see
+[Arguments and `RunInfo` targets](#arguments-and-runinfo-targets)). `DevInfo`
+says three things:
 
 - `server`: the command that `buck2 dev` starts and keeps running. It starts it
   again when the command changes. See [The server command](#the-server-command).
@@ -126,6 +128,24 @@ If the server reads a file while it runs that its command does not name, add
 the file to the command with `hidden`. A change to a file that the rule cannot
 name as an artifact does not restart the server; the server can ask for a
 restart itself (see [Requests from the server](#requests-from-the-server)).
+
+## Arguments and `RunInfo` targets
+
+`buck2 dev //:site -- --port 8080` appends `--port 8080` to the server's
+command line, as `buck2 run` does. The arguments are the same for the whole
+session. They are not part of the command that `buck2 dev` compares to decide on
+a restart.
+
+A target without `DevInfo` but with a `RunInfo` works too. Its `RunInfo` is the
+server, as in `DevInfo(server = ...)` without outputs. `buck2 dev` starts it,
+and starts it again when its command is new (see
+[The server command](#the-server-command)). So `buck2 dev //:app` runs a binary,
+and runs it again after each change that builds a different binary. A target
+with neither provider is an error.
+
+The server inherits the environment of `buck2 dev`, so
+`PORT=8080 buck2 dev //:site` gives it `PORT`, and a rule can set a variable
+with `cmd_args("env", "PORT=8080", server)`.
 
 ## What is built after a change
 

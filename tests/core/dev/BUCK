@@ -19,6 +19,7 @@ buck2_core_tests(
         "test_dev_files": _DEV_FIXTURE,
         "test_dev_graph": _DEV_FIXTURE,
         "test_dev_only": _DEV_FIXTURE,
+        "test_dev_run": _DEV_FIXTURE,
         "test_dev_timing": _DEV_FIXTURE,
     },
 )
