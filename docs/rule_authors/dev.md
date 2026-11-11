@@ -13,17 +13,17 @@ A rule makes its targets work with `buck2 dev` by returning the
 
 - `server`: the command that `buck2 dev` starts and keeps running. It starts it
   again when the command changes. See [The server command](#the-server-command).
-- `outputs`: the artifacts that `buck2 dev` can build, by name.
-- `watch`: a list of [`DevWatch`](../../api/build/DevWatch) values. They say
-  what to do when a source file changes. Without `watch`, `buck2 dev` works
-  that out itself; see [Without a watch list](#without-a-watch-list).
+- `outputs`: the artifacts that `buck2 dev` can build, by name. It builds them
+  again when the files they are built from change. See
+  [What is built after a change](#what-is-built-after-a-change).
 - `interactive`: whether the server gets the terminal. See
   [The terminal](#the-terminal).
 
-When it starts, `buck2 dev` builds the server and starts it. Then it finds the
-files to watch, which builds what a `DevWatch` with `inputs` needs (see
-[Watch sets](#watch-sets)), and only then handles the server's requests. It
-builds nothing else on its own: the server asks for the outputs it needs.
+When it starts, `buck2 dev` builds the server and starts it. Then it finds what
+the server and each output may be built from, which may build what dynamic
+actions need (see [What an output is built from](#what-an-output-is-built-from)),
+and only then handles the server's requests. Until a file changes, it builds
+nothing else on its own: the server asks for the outputs it needs.
 
 ## A minimal rule
 
@@ -36,9 +36,6 @@ def _site_impl(ctx):
         DevInfo(
             server = server,
             outputs = {"www": www},
-            watch = [
-                DevWatch(targets = None, build = ["www"]),
-            ],
         ),
     ]
 
@@ -53,25 +50,25 @@ site = rule(
 
 With this rule, `buck2 dev //:site` starts `python3 server.py`. When
 `server.py` changes, it starts the server again: the server's command names
-that file. When any other source file in the dependency graph of `//:site`
-changes, it builds `www` again and tells the server where it is, if the server
-has connected to `buck2 dev` (see [The server protocol](#the-server-protocol)).
+that file. When a page changes, it builds `www` again and tells the server
+where it is, if the server has connected to `buck2 dev` (see
+[The server protocol](#the-server-protocol)).
 
 [`examples/dev_web_server`](https://github.com/facebook/buck2/tree/main/examples/dev_web_server)
 has a complete web server that serves the newest build.
 
 ## The server command
 
-`buck2 dev` builds the server's command again after every change that it acts
-on, whichever watch set claims the changed file, and also when none does.
-Usually nothing is new, and that takes a few milliseconds. If the command line
-is different, or an artifact that the command names has different contents,
-`buck2 dev` stops the server and starts it again. The artifacts that a command
-names include the hidden ones (`cmd_args(hidden = ...)`).
+`buck2 dev` builds the server's command again after a change to a file that the
+command may be built from, and after a change to the graph. Usually nothing is
+new, and that takes a few milliseconds. If the command line is different, or an
+artifact that the command names has different contents, `buck2 dev` stops the
+server and starts it again. The artifacts that a command names include the
+hidden ones (`cmd_args(hidden = ...)`).
 
-No watch set is needed for this, and it follows the contents, not the files:
-saving a file without changing it does not restart the server, and neither
-does a change that leaves the command's artifacts as they were.
+This follows the contents, not the files: saving a file without changing it
+does not restart the server, and neither does a change that leaves the
+command's artifacts as they were.
 
 So keep the server's command small, and keep what you are working on out of
 it. The command should name a script or a small program that stays the same
@@ -87,7 +84,6 @@ def _app_impl(ctx):
             # Only the launcher. A new `exe` does not restart it.
             server = cmd_args("python3", ctx.attrs.launcher),
             outputs = {"exe": exe},
-            watch = [DevWatch(targets = None, build = ["exe"])],
         ),
     ]
 ```
@@ -127,34 +123,24 @@ A server that is the app, with nothing around it, works too:
 it and starts it again, and that is all that can happen.
 
 If the server reads a file while it runs that its command does not name, add
-the file to the command with `hidden`. For files that the rule cannot name as
-artifacts, such as the source files of every target in the graph, use a watch
-set with `restart` (see [Watch sets](#watch-sets)). Such a set restarts the
-server at every save of its files, changed or not.
+the file to the command with `hidden`. A change to a file that the rule cannot
+name as an artifact does not restart the server; the server can ask for a
+restart itself (see [Requests from the server](#requests-from-the-server)).
 
-## Without a watch list
+## What is built after a change
 
-This is a prototype.
-
-A `DevInfo` without `watch` has no rules. `buck2 dev` finds the source files
-that the server's command and each output may be built from, and after a
-change:
+`buck2 dev` finds the source files that the server's command and each output
+may be built from, and after a change:
 
 - to a file of the server's command, it builds the command again, and starts
   the server again if the command is new (see
   [The server command](#the-server-command));
 - to a file of an output, it builds that output again, and sends `built`.
 
-```python
-DevInfo(server = server, outputs = {"www": www})
-```
-
 A file may belong to the server and to several outputs, and then all of that
 happens. A file that belongs to none of them changes nothing, and costs no
-build. What an output may be built from is found as for `inputs` in
-[What `inputs` claim](#what-inputs-claim): of the target that owns the output,
-the source files that its actions build the output from, and all the source
-files of the other targets that those actions use, and of their dependencies.
+build. `buck2 dev` builds an output after a change whether or not the server
+has asked for it.
 
 Some outputs must not be built after every change. Give such an output as a
 [`DevOutput`](../../api/build/DevOutput) with `only`, a list of target patterns
@@ -187,11 +173,86 @@ from then on, which is what a server that loads patches into a running `exe`
 expects. A change to any other crate makes `patch` stale too: the server asks
 for both, and starts the app again.
 
-Here nothing waits: [Changes that wait](#changes-that-wait) is about `notify`
-sets. A change that holds an output back stops a build of it that is running,
-like any change to a file that a build builds from.
+A change that holds an output back stops a build of it that is running, like
+any change to a file that a build builds from.
 
-A `DevInfo` with `watch` cannot have outputs with `only`.
+### What an output is built from
+
+`buck2 dev` finds the source files of an output target by target, not file by
+file:
+
+- Of the target that owns the output, the source files that the target's
+  actions build the output from, and no others. So a rule that builds the
+  server and the outputs in one target gives each of them only its own source
+  files of that target.
+- What those actions take from other targets gives the output those targets
+  and all their dependencies, with all of their source files, whether or not
+  the output is built from each one.
+
+The artifacts that the server's command names are followed in the same way,
+and so are the [sidecars](#sidecars) of an output, which count as part of it.
+
+So an output may be built again after a change to a file that it is not built
+from: a source file of a dependency that only another output of that
+dependency uses. Nothing is new then, and `built` says so with `changed`. That
+keeps `buck2 dev` from walking the action graph below the output, which takes
+far longer than walking the targets.
+
+An action that a [dynamic action](dynamic_dependencies.md) of the owning target
+creates is only known once the dynamic action has run, so finding what an
+output is built from builds what such dynamic actions need, with the files as
+they are then, and is done again when what they read changes. If that build
+fails, the output gets the source files of the owning target and of its
+dependencies instead.
+
+`buck2 dev` does not watch or read files itself: the daemon's file watcher
+reports to it the changes in the project that may matter to the target (see
+[Limits](#limits)), and once the files stop changing, `buck2 dev` asks the
+daemon what each changed file is to the server and to each output. Only files
+of the configured dependency graph of the `buck2 dev` target count.
+
+A file that is created and removed again, such as the temporary files some
+editors make when they save, changes nothing. A source file that is a symlink
+to another file in the project is built from that file, so that file counts
+too.
+
+Saving a file without changing it counts as a change: `buck2 dev` does not know
+what the files were. It builds the outputs of the file again, which builds
+nothing new, so that the server gets `built` with `changed` false for each
+output. The server's command is the same after such a save, so the server
+keeps running.
+
+The file watcher must report changes as they happen. The `notify` watcher,
+the default outside Meta, does; `buck2 dev` stops with an error if the
+`file_watcher` in the `[buck2]` section of `.buckconfig` names one that does
+not, such as `fs_hash_crawler`. Files that the project's ignore rules exclude,
+and `buck-out`, are never reported.
+
+If the file watcher misses changes, `buck2 dev` cannot tell which files
+changed. It then builds the server's command again, and restarts the server if
+the command is new. It builds every output without `only`, and holds back the
+others, with the project root in `stale`.
+
+The daemon finds what the server and the outputs are built from once, and again
+only when the graph changes: a target, a build file or a `.bzl` file. A change
+to a source file is looked up in what it found, so what a change costs does not
+grow with the graph. What it finds is which output has which target: it lists
+no source files, since the targets already have them.
+
+### Changes to the graph
+
+The daemon also compares the build files of the packages in the graph, the
+`.bzl` files that they load, and the targets. When one of them changed,
+`buck2 dev` analyses the target again, which builds the server.
+
+- A changed build file, or a file added to or removed from a package, counts
+  as a change to the outputs that may be built from the targets it changed.
+  An output with `only` is built again if those targets are in its `only`,
+  and held back if not.
+- A changed `.bzl` file may change what any rule does, so it counts as a
+  change to every output, and holds back every output with `only`.
+- If the server's command changed, `buck2 dev` starts the server again, as
+  after any change (see [The server command](#the-server-command)).
 
 ## Sidecars
 
@@ -223,8 +284,7 @@ server got, and the `changed` of the output is about the output's own artifact.
 A sidecar is not an output: `ready` does not name it, and the server cannot ask
 for it. It is held back with its output, and an output whose sidecar fails to
 build has failed. What a sidecar is built from counts as what the output may be
-built from, so a change to it builds the output again. Sidecars work with and
-without a watch list.
+built from, so a change to it builds the output again.
 
 Use a sidecar for a file that says what is in an output, such as a manifest
 that the output's action also writes. Or make each file of a directory a
@@ -237,160 +297,6 @@ A sidecar is built by an action, and an action does not know the last build.
 So a sidecar can say what an output is, but not how it differs from the last
 one, except through `changed`.
 
-## Watch sets
-
-Each `DevWatch` is a set of source files, and what to do when one of them
-changes.
-
-| Argument  | Meaning                                                                                                                         |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `targets` | Target patterns (`"root//lib/..."`) or labels (`ctx.label`, `dep.label`). Their own source files belong to the set, not those of their dependencies. `None` means all targets in the dependency graph. |
-| `inputs`  | Artifacts, or anything else `cmd_args` takes, such as a `RunInfo`. The targets they are built from belong to the set, with their source files. See [What `inputs` claim](#what-inputs-claim). |
-| `build`   | Names of `DevInfo.outputs` to build after a change. `buck2 dev` then sends the server a `built` message.                       |
-| `restart` | Build the server again, stop it, and start it again, also when the server's command is the same. See [The server command](#the-server-command). |
-| `notify`  | Tell the server about the change, and build nothing. See [Changes that wait](#changes-that-wait).                                |
-
-A `DevWatch` may have both `targets` and `inputs`. Without either, it means the
-rest of the dependency graph, like `targets = None`. A `DevWatch` with none of
-`build`, `restart` and `notify` does nothing for its files but keep them from
-the sets after it. `buck2 dev` still builds the server's command again after a
-change to one of them, as after any change. `notify` cannot be used with
-`build` or `restart`.
-
-`targets` and `inputs` claim different files. Take a crate that a running
-program loads a new build of. Its patch is built from the crate's own source
-files and from the libraries it uses, but only a change to the crate's own
-files can go into a patch. `targets = [crate.label]` claims those. In contrast,
-`inputs = server` also claims the targets that the server depends on, which
-keeps every file that the server is built from out of a later set.
-
-For each file, the **first** `DevWatch` whose files include it decides. Put
-the narrow sets first, and a `targets = None` set last for the rest of the
-graph:
-
-```python
-watch = [
-    # The server, and everything it is built from: a change to these must not
-    # wait in the last set. `buck2 dev` restarts the server if it is new.
-    DevWatch(inputs = server),
-    # The app's own sources: build a new patch.
-    DevWatch(targets = [ctx.label], build = ["patch"]),
-    # Everything else: only tell the server.
-    DevWatch(targets = None, notify = True),
-]
-```
-
-`buck2 dev` does not watch or read files itself: the daemon's file watcher
-reports to it the changes in the project that may matter to the target (see
-[Limits](#limits)), and once the files stop changing,
-`buck2 dev` asks the daemon what each changed file is: the set that claims it,
-if one does. A set changed when one of its files did, or when its targets did
-(see [Changes to the graph](#changes-to-the-graph)). A set claims only files of
-the configured dependency graph of the `buck2 dev` target: `targets` match only
-targets in that graph. Without a `targets = None` set, the files of targets
-that no set matches are ignored.
-
-A file that no set claims changes nothing, and neither does a file that is
-created and removed again, such as the temporary files some editors make when
-they save. A source file that is a symlink to another file in the project is
-built from that file, so the set that claims the symlink claims that file too.
-
-Saving a file without changing it counts as a change to its set: `buck2 dev`
-does not know what the files were. It does what the file's set asks for: a
-build, which builds nothing new, so that the server gets `built` with `changed`
-false for each output, or a restart. The server's command is the same after
-such a save, so without a `restart` set the server keeps running.
-
-The file watcher must report changes as they happen. The `notify` watcher,
-the default outside Meta, does; `buck2 dev` stops with an error if the
-`file_watcher` in the `[buck2]` section of `.buckconfig` names one that does
-not, such as `fs_hash_crawler`. Files that the project's ignore rules exclude,
-and `buck-out`, are never reported.
-
-If the file watcher misses changes, `buck2 dev` cannot
-tell which files changed. It then builds the server's command again, and
-restarts the server if the command is new or if a set restarts. It builds what
-every set that builds names, and, if there is a `notify` set, sends `stale`
-with the project root (see [Changes that wait](#changes-that-wait)).
-
-The daemon finds what the sets claim once, and again only when the graph
-changes: a target, a build file or a `.bzl` file. A change to a source file is
-looked up in what it found, so what a change costs does not grow with the
-graph. What it finds is which set has which target: it lists no source files,
-since the targets already have them.
-
-### What `inputs` claim
-
-A set claims the source files of `inputs` target by target, not file by file:
-
-- Of the target that owns an input, the set claims the source files that the
-  target's actions build the input from, and no others. So a rule that builds
-  the server and other outputs in one target can give the server's source files
-  to one set and leave the rest to another.
-- What those actions take from other targets gives the set those targets and
-  all their dependencies, with all of their source files, whether or not the
-  input is built from each one.
-
-So a set with `inputs` may claim a file that its input is not built from: a
-source file of a dependency that only another output of that dependency uses.
-A change to it then builds or restarts although nothing is new. That keeps
-`buck2 dev` from walking the action graph below the input, which takes far
-longer than walking the targets.
-
-An action that a [dynamic action](dynamic_dependencies.md) of the owning target
-creates is only known once the dynamic action has run, so finding the claims
-builds what such dynamic actions need, with the files as they are then, and is
-done again when what they read changes. If that build fails, the set gets the
-source files of the owning target and of its dependencies instead.
-
-### Changes to the graph
-
-The daemon also compares the build files of the packages in the graph, the
-`.bzl` files that they load, and the targets. When one of them changed,
-`buck2 dev` analyses the target again, which builds the server.
-
-- A changed build file, or a file added to or removed from a package, counts
-  as a change to the sets whose targets it changed. The targets of a set are
-  those its `targets` match, and the targets that its `inputs` are built from.
-  Each target belongs to the first set that has it.
-- A changed `.bzl` file may change what any rule does, so it counts as a
-  change to every set.
-- If the server's command changed, `buck2 dev` starts the server again, as
-  after any change (see [The server command](#the-server-command)).
-
-## Changes that wait
-
-Buck builds from the files on disk. After a file of a `notify` set changes, any
-build, even of an output that a `build` set names, would build that change too.
-For some tools that is wrong. For example, a tool that loads new code into a
-running program cannot load code built against a changed dependency.
-
-So after a file of a `notify` set changes, `buck2 dev` builds nothing
-automatically until the server asks for a build or a restart. It does not
-analyse the target again either, because that builds the server, so it does
-not find out whether the server's command is new. A build file
-of a package with a target in a `notify` set waits in the same way. A `.bzl`
-file can change any target, so when there is a `notify` set, a changed `.bzl`
-file waits too. `buck2 dev` sends the server a `stale` message with the changed
-files, and remembers the other changes.
-
-The wait ends when the server asks for a build or a restart. That build uses
-all the changes, and `buck2 dev` then sends `stale` with no files. Before the
-build, `buck2 dev` builds the server's command with the changes. If the command
-is new, it restarts the server instead of building for it, and the changes
-still wait: the new server gets `stale` after `ready`, and asks again. If the
-build fails, the changes still wait: the server has no build with them. Changing a
-file back to what it was does not end the wait: `buck2 dev` does not know what
-the files were.
-
-A change that waits and breaks the analysis, such as a syntax error in a build
-file whose change waits, waits all the same: the server gets `stale`, not
-`failed`.
-
-While the server is not running, nothing would ask for the build that ends the
-wait. So then a change that builds or restarts starts the server, built from
-the files as they are, and it gets `stale` after `ready`.
-
 ## The server protocol
 
 `buck2 dev` starts the server in the project root, with the environment
@@ -398,9 +304,8 @@ variable `BUCK2_DEV_SOCKET` set to the path of a Unix socket. Python connects
 with `socket.AF_UNIX`, and Node with `net.connect(path)`.
 
 The server does not have to connect. A server that never connects is only
-started, and started again when its command or a `restart` set changes, or
-after it exits.
-`buck2 dev` still builds what `build` sets name, but has no one to tell.
+started, and started again when its command changes, or after it exits.
+`buck2 dev` still builds the outputs after a change, but has no one to tell.
 
 A server that connects sends `{"type": "hello", "version": 1}`. `buck2 dev`
 answers with `ready`, and from then on writes messages to the connection and
@@ -438,8 +343,8 @@ it starts it, and those changes do not restart the new server.
 Ctrl-C while it waits kills the server at once.
 
 When the server exits, or fails to start again, `buck2 dev` prints that, and
-keeps watching. The next change that builds or restarts starts the server
-again, built from the files as they are then. So a server can also run to
+keeps watching. The next change to what the server or an output is built from
+starts the server again, built from the files as they are then. So a server can also run to
 completion on each change, such as a test runner. `buck2 dev` ends on Ctrl-C,
 `SIGTERM` or `SIGHUP`, or when an interactive server (see
 [The terminal](#the-terminal)) exits successfully.
@@ -489,7 +394,7 @@ console, and prints only errors and that the server exited or restarts.
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
-| `stale`         | `files`: the changed files whose change waits. Without a watch list, also `outputs`: the names of the outputs that are held back, and `files` are the changes that hold them back | That list changes. An empty list means that nothing waits. After missed changes the project root is in the list: any such file may have changed. |
+| `stale`         | `outputs`: the names of the outputs that are held back, `files`: the changed files that hold them back | These lists change. Empty lists mean that nothing is held back. After missed changes the project root is in `files`: any file may have changed. See [What is built after a change](#what-is-built-after-a-change). |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
@@ -502,17 +407,16 @@ build runs hears nothing of that build, and asks for what it needs after
 `ready`. A `failed` without a `building` is about the analysis of the target,
 or the build of the server's command.
 Messages
-are sent only to a server that has sent `hello`. If a change waits when the
-server sends `hello`, `ready` is followed by `stale`.
+are sent only to a server that has sent `hello`. If outputs are held back when
+the server sends `hello`, `ready` is followed by `stale`.
 
 While the daemon builds, it watches the files that the build depends on: the
-files of the sets that build or restart, and the build files and `.bzl` files
-whose change does not wait (see [Changes that wait](#changes-that-wait)). If
-one of them gets different contents, the daemon stops the build, and
-`buck2 dev` sends `cancelled`, asks about the changes once the files stop
-changing, and starts the next build, which builds the stopped build's outputs
-too. Saving a file without changing it, a change to a file that the build does
-not use, and a change that waits do not stop a build. Other
+files that the outputs it builds may be built from, and the build files and
+`.bzl` files of the graph. If one of them gets different contents, the daemon
+stops the build, and `buck2 dev` sends `cancelled`, asks about the changes once
+the files stop changing, and starts the next build, which builds the stopped
+build's outputs too. Saving a file without changing it, and a change to a file
+that the build does not use, do not stop a build. Other
 changes during a build, and changes while the daemon analyses the target or says
 what changed, are asked about once that is done. If analysing fails,
 `buck2 dev` sends `failed`, and analyses again after the next change, or before
@@ -526,7 +430,7 @@ are not sent again. Once the analysis works again, the server gets
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`. Send it before anything else.            |
-| `build`   | `outputs`: a list of names | Build these outputs now, with all changes, including those that wait. Clears `stale` if the build succeeds. If changes waited and the server's command is new with them, `buck2 dev` restarts the server instead. |
+| `build`   | `outputs`: a list of names | Build these outputs now, with all changes. An output that is held back is let go if its build succeeds, and `stale` says so. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. |
 | `restart` |                           | Build the server again and restart it. Clears `stale`. If the build fails, the old server keeps running until the next analysis restarts it. |
 
 `buck2 dev` reads the connection all the time, also while it builds, so a
@@ -555,19 +459,19 @@ the project, and starting it again to carry on building would undo that.
 ## Limits
 
 - `buck2 dev` takes one target.
-- A change to a file in a package of the graph costs two short daemon commands,
-  even if no set claims the file: one says what the file is, and one builds the
-  server's command again. A server that keeps writing files in such a
-  package keeps `buck2 dev` asking. Changes elsewhere cost nothing: the daemon
+- A change to a file in a package of the graph costs a short daemon command,
+  even if nothing is built from the file: it says what the file is. A server
+  that keeps writing files in such a package keeps `buck2 dev` asking. Changes elsewhere cost nothing: the daemon
   does not report them to `buck2 dev`, except to build files and `.bzl` files
   of the graph, `PACKAGE` files, `.buckconfig` files, and the directories
   above the packages.
 - When a target, a build file or a `.bzl` file of the graph changes, the daemon
-  walks the graph of the target again to find what the sets claim.
+  walks the graph of the target again to find what the server and the outputs
+  are built from.
 - A file that a `.buckconfig` includes under another name is not reported, so
   a change to it is only seen with the next change that is.
-- A `.buckconfig` change is not a change of any watch set, but `buck2 dev` asks
-  the daemon about it as about any other file, and the daemon reads the
+- A `.buckconfig` change is not a change to what the server or an output is
+  built from, but `buck2 dev` asks the daemon about it as about any other file, and the daemon reads the
   configuration again. If that changes the targets of the graph, such as a
   source file that `read_config` names, it is a change to them, as in
   [Changes to the graph](#changes-to-the-graph). Other configuration changes
