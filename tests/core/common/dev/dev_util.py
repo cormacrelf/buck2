@@ -266,12 +266,14 @@ async def start_dev(
     console: str = "none",
     *args: str,
     env: Optional[Dict[str, str]] = None,
+    debounce_ms: int = 20,
 ) -> DevSession:
-    """Start `buck2 dev`. `env` adds to the environment of the `buck2 dev` client."""
+    """Start `buck2 dev`. `env` adds to the environment of the `buck2 dev` client. The debounce
+    is short, so that tests do not wait for it; a test of what the debounce does sets it."""
     # The fixture server may send `_sync` (see `DevSession.sync`).
     env = {"BUCK2_DEV_TEST_SYNC": "true", **(env or {})}
     process = await buck.run_buck_command(
-        "dev", target, "--console", console, "--debounce-ms", "200", *args, env=env
+        "dev", target, "--console", console, "--debounce-ms", str(debounce_ms), *args, env=env
     ).start()
     return DevSession(buck, process)
 

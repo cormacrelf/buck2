@@ -78,7 +78,7 @@ class DevFilesTest(BuckTestCase):
     async def test_truncate_then_write(self, buck: Buck) -> None:
         """A save that truncates the file and then writes it, in two steps: one build, of the
         final content."""
-        dev = await start_dev(buck, "//app:all")
+        dev = await start_dev(buck, "//app:all", debounce_ms=200)
         try:
             await dev.start()
             with open(buck.cwd / "app/main.txt", "w") as f:
@@ -361,7 +361,7 @@ class DevFilesTest(BuckTestCase):
     @dev_test()
     async def test_rapid_saves(self, buck: Buck) -> None:
         """Ten saves 50 ms apart, less than the debounce: one build, of the last content."""
-        dev = await start_dev(buck, "//app:all")
+        dev = await start_dev(buck, "//app:all", debounce_ms=200)
         try:
             await dev.start()
             for i in range(10):
