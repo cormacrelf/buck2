@@ -3,21 +3,23 @@ id: dev
 title: buck2 dev
 ---
 
-`buck2 dev <target>` starts a long-running process, the _server_, and builds
-outputs for it again when source files change. Use it for a development server
-that serves the newest build, a test runner that runs again on save, or a tool
-that loads new code into a running program.
+`buck2 dev <target>` starts a long-running process, the _server_, builds
+outputs for it when it asks, and tells it when source files change. Use it for a
+development server that serves the newest build, a test runner that runs again
+on save, or a tool that loads new code into a running program.
 
 A rule makes its targets work with `buck2 dev` by returning the
 [`DevInfo`](../../api/build/DevInfo) provider, or only a `RunInfo` (see
 [Arguments and `RunInfo` targets](#arguments-and-runinfo-targets)). `DevInfo`
-says three things:
+says:
 
 - `server`: the command that `buck2 dev` starts and keeps running. It starts it
   again when the command changes. See [The server command](#the-server-command).
-- `outputs`: the artifacts that `buck2 dev` can build, by name. It builds them
-  again when the files they are built from change. See
-  [What is built after a change](#what-is-built-after-a-change).
+- `outputs`: the artifacts that `buck2 dev` can build, by name. It builds one
+  only when the server asks for it, and tells the server when one that it asked
+  for is stale. See [Stale outputs](#stale-outputs).
+- `scopes`: named sets of targets, which say where a change was. See
+  [Scopes](#scopes).
 - `interactive`: whether the server gets the terminal. See
   [The terminal](#the-terminal).
 - `local_resources`: processes that the server needs. See
@@ -26,8 +28,8 @@ says three things:
 When it starts, `buck2 dev` builds the server and starts it. Then it finds what
 the server and each output may be built from, which may build what dynamic
 actions need (see [What an output is built from](#what-an-output-is-built-from)),
-and only then handles the server's requests. Until a file changes, it builds
-nothing else on its own: the server asks for the outputs it needs.
+and only then handles the server's requests. It builds no output on its own:
+the server asks for the outputs it needs.
 
 ## A minimal rule
 
@@ -54,9 +56,10 @@ site = rule(
 
 With this rule, `buck2 dev //:site` starts `python3 server.py`. When
 `server.py` changes, it starts the server again: the server's command names
-that file. When a page changes, it builds `www` again and tells the server
-where it is, if the server has connected to `buck2 dev` (see
-[The server protocol](#the-server-protocol)).
+that file. The server connects to `buck2 dev` (see
+[The server protocol](#the-server-protocol)) and asks for `www`. When a page
+changes, `buck2 dev` sends the server `stale`, the server asks for `www` again,
+and `buck2 dev` builds it and tells the server where it is.
 
 [`examples/dev_web_server`](https://github.com/facebook/buck2/tree/main/examples/dev_web_server)
 has a complete web server that serves the newest build.
@@ -94,11 +97,12 @@ def _app_impl(ctx):
 
 The launcher connects to `buck2 dev` (see
 [The server protocol](#the-server-protocol)), asks for `exe` when it gets
-`ready`, and runs the program at the `path` that `built` gives:
+`ready` and when `exe` is stale, and runs the program at the `path` that
+`built` gives:
 
 ```python
 for message in messages:
-    if message["type"] == "ready":
+    if message["type"] in ("ready", "stale"):
         send({"type": "build", "outputs": ["exe"]})
     elif message["type"] == "built":
         exe = message["outputs"]["exe"]
@@ -116,10 +120,12 @@ whole server for every new `exe`:
 - A build that fails leaves the app running, and the server gets `failed`.
 - `changed` says whether the output is new, so an edit that builds the same
   output does nothing.
+- The server decides when to build: at once, after a pause, or when a browser
+  asks for a page.
 
 [`examples/subsecond`](https://github.com/facebook/buck2/tree/main/examples/subsecond)
 does this: its server starts the app's binary from the `exe` output, and sends
-the running app each new `patch`. Buck may write a new build to the path of the
+the running app each new `patch` (see [Scopes](#scopes)). Buck may write a new build to the path of the
 old one, so that server runs a copy of the binary.
 
 A server that is the app, with nothing around it, works too:
@@ -206,54 +212,87 @@ connection to it ends. When the daemon is stopped on purpose, by `buck2 kill`,
 `SIGTERM` to the resources of every session as it shuts down, but does not wait
 for them to exit. Ctrl-Z does not pause the resources.
 
-## What is built after a change
+## Stale outputs
 
-`buck2 dev` finds the source files that the server's command and each output
-may be built from, and after a change:
+`buck2 dev` builds an output only when the server sends `build` for it. It never
+builds one by itself after a change.
 
-- to a file of the server's command, it builds the command again, and starts
-  the server again if the command is new (see
-  [The server command](#the-server-command));
-- to a file of an output, it builds that output again, and sends `built`.
+From the first time that the server asks for an output, `buck2 dev` _tracks_ it:
+it keeps the changes that the output may be built from since the last build of
+it that the server got, or since the server asked for it, if it never got one.
+After the files stop changing, if a change may affect an output that it tracks,
+`buck2 dev` sends `stale`, with each tracked output that has such changes:
+
+```json
+{"type": "stale", "outputs": {
+  "patch": {"within": ["lib"], "files": ["/project/lib/src/a.rs"]},
+  "exe":   {"within": ["lib"], "files": ["/project/lib/src/a.rs"]}}}
+```
+
+`files` are the changed files since the server got the output, all of them, not
+only the last ones. `within` is described in [Scopes](#scopes). The server
+decides what to do, usually to ask for some of the outputs with `build`.
+
+- `stale` comes after every change that may affect a tracked output, also when
+  it says what the last one said, such as after a file was saved twice.
+- `built` for an output clears its changes. An output that is in `built.failed`,
+  or whose build was `failed` or `cancelled`, keeps them.
+- A build does not send `stale`: the server got `built`, and knows.
+- An output that the server never asked for is never in `stale`, and never
+  built.
+- A server that starts, or starts again, has asked for nothing.
+
+The server's command is not an output: `buck2 dev` builds it again after a
+change that it may be built from, and starts the server again if it is new (see
+[The server command](#the-server-command)).
 
 A file may belong to the server and to several outputs, and then all of that
-happens. A file that belongs to none of them changes nothing, and costs no
-build. `buck2 dev` builds an output after a change whether or not the server
-has asked for it.
+happens. A file that belongs to none of them changes nothing.
 
-Some outputs must not be built after every change. Give such an output as a
-[`DevOutput`](../../api/build/DevOutput) with `only`, a list of target patterns
-or labels:
+A build that the daemon stops, because a file that it uses changed, ends in
+`cancelled`. The change makes its outputs stale, so `stale` follows once
+`buck2 dev` has looked at the change. A server needs one rule: on `stale`,
+decide, and send `build`.
+
+## Scopes
+
+A scope is a named set of targets. It is never built and never asked for: it
+only says where a change was.
 
 ```python
 DevInfo(
     server = server,
-    outputs = {
-        "exe": DevOutput(exe, only = []),
-        "patch": DevOutput(patch, only = [ctx.attrs.lib.label]),
-    },
+    outputs = {"exe": exe, "patch": patch},
+    scopes = {"lib": [ctx.attrs.lib.label]},
 )
 ```
 
-`buck2 dev` builds an output with `only` again by itself only after a change to
-the own source files of those targets, or to those targets. After any other
-change that the output may be built from, to a file, a target or a `.bzl` file,
-it _holds the output back_: it stops building it, also after changes inside its
-`only`, and sends `stale` with the output's name and the changed files. The
-other outputs are still built, from the same files. `only = []` means that
-`buck2 dev` never builds the output by itself.
+A scope is a list of target patterns (`"root//lib/..."`) or labels. They are
+matched against the configured dependency graph of the `buck2 dev` target, and
+matched again when the graph changes. Scopes may overlap. A change is in a scope
+when it is to an own source file of one of the scope's targets, or to one of
+those targets themselves. A change to a `.bzl` file is in no scope.
 
-An output is held back until the server asks for it with `build`, and that
-build succeeds. `buck2 dev` then sends `stale` again, without it. A server that
-starts has no outputs, so none is held back for it.
+For each output in `stale`, `within` lists the scopes that hold every one of the
+output's changes: not the scopes that some change touched, but those that all of
+them are in. It is empty when the changes are not all in one scope, when there
+are no scopes, after missed changes, and for an output that the server never
+got. `ready` names the scopes.
 
-In the example, a change to the crate `lib` builds `patch`, and `exe` is stale
-from then on, which is what a server that loads patches into a running `exe`
-expects. A change to any other crate makes `patch` stale too: the server asks
-for both, and starts the app again.
+A server that loads patches into a running program uses this. A patch can carry
+a change to the patched crate, but not to the code it is linked against:
 
-A change that holds an output back stops a build of it that is running, like
-any change to a file that a build builds from.
+```python
+def on_stale(outputs):
+    if "lib" in outputs["exe"]["within"]:
+        build(["patch"])           # everything since the binary was built is in lib
+    else:
+        build(["exe", "patch"])    # something else changed: rebuild, restart the app
+```
+
+It reads the entry of `exe`, not of `patch`: `exe`'s changes are those since the
+running binary was built, which is what a patch is built against. A patch build
+clears `patch`'s changes, and leaves `exe`'s.
 
 ### What an output is built from
 
@@ -271,11 +310,11 @@ file:
 The artifacts that the server's command names are followed in the same way,
 and so are the [sidecars](#sidecars) of an output, which count as part of it.
 
-So an output may be built again after a change to a file that it is not built
-from: a source file of a dependency that only another output of that
-dependency uses. Nothing is new then, and `built` says so with `changed`. That
-keeps `buck2 dev` from walking the action graph below the output, which takes
-far longer than walking the targets.
+So an output may be stale after a change to a file that it is not built from:
+a source file of a dependency that only another output of that dependency uses.
+Nothing is new if the server asks for it then, and `built` says so with
+`changed`. That keeps `buck2 dev` from walking the action graph below the
+output, which takes far longer than walking the targets.
 
 An action that a [dynamic action](dynamic_dependencies.md) of the owning target
 creates is only known once the dynamic action has run, so finding what an
@@ -296,10 +335,10 @@ to another file in the project is built from that file, so that file counts
 too.
 
 Saving a file without changing it counts as a change: `buck2 dev` does not know
-what the files were. It builds the outputs of the file again, which builds
-nothing new, so that the server gets `built` with `changed` false for each
-output. The server's command is the same after such a save, so the server
-keeps running.
+what the files were. The outputs of the file are stale; a build of them builds
+nothing new, and the server gets `built` with `changed` false for each output.
+The server's command is the same after such a save, so the server keeps
+running.
 
 The file watcher must report changes as they happen. The `notify` watcher,
 the default outside Meta, does; `buck2 dev` stops with an error if the
@@ -309,8 +348,8 @@ and `buck-out`, are never reported.
 
 If the file watcher misses changes, `buck2 dev` cannot tell which files
 changed. It then builds the server's command again, and restarts the server if
-the command is new. It builds every output without `only`, and holds back the
-others, with the project root in `stale`.
+the command is new. Every tracked output is stale, with the project root in
+`files`, and in no scope.
 
 The daemon finds what the server and the outputs are built from once, and again
 only when the graph changes: a target, a build file or a `.bzl` file. A change
@@ -325,11 +364,10 @@ The daemon also compares the build files of the packages in the graph, the
 `buck2 dev` analyses the target again, which builds the server.
 
 - A changed build file, or a file added to or removed from a package, counts
-  as a change to the outputs that may be built from the targets it changed.
-  An output with `only` is built again if those targets are in its `only`,
-  and held back if not.
+  as a change to the outputs that may be built from the targets it changed,
+  in the scopes of those targets.
 - A changed `.bzl` file may change what any rule does, so it counts as a
-  change to every output, and holds back every output with `only`.
+  change to every output, in no scope.
 - If the server's command changed, `buck2 dev` starts the server again, as
   after any change (see [The server command](#the-server-command)).
 
@@ -361,9 +399,9 @@ Each sidecar says by itself whether it changed since the last build that the
 server got, and the `changed` of the output is about the output's own artifact.
 
 A sidecar is not an output: `ready` does not name it, and the server cannot ask
-for it. It is held back with its output, and an output whose sidecar fails to
-build has failed. What a sidecar is built from counts as what the output may be
-built from, so a change to it builds the output again.
+for it. An output whose sidecar fails to build has failed. What a sidecar is
+built from counts as what the output may be built from, so a change to it makes
+the output stale.
 
 Use a sidecar for a file that says what is in an output, such as a manifest
 that the output's action also writes. Or make each file of a directory a
@@ -434,10 +472,9 @@ covers the contents of every artifact that the command line names, as for the
 server's command. `changed` is true when the digest or `argv` is new.
 
 An output that is a command line works as an artifact does in all else. It may
-be a `DevOutput` with `only` and `sidecars`. What its artifacts are built from
-counts as what the output may be built from, and it is held back in the same
-way. Only an artifact by itself is an artifact output: `cmd_args(exe)` is a
-command line, whose `argv` is the path of `exe`.
+be a `DevOutput` with `sidecars`. What its artifacts are built from counts as
+what the output may be built from. Only an artifact by itself is an artifact
+output: `cmd_args(exe)` is a command line, whose `argv` is the path of `exe`.
 
 ## The server protocol
 
@@ -446,8 +483,8 @@ variable `BUCK2_DEV_SOCKET` set to the path of a Unix socket. Python connects
 with `socket.AF_UNIX`, and Node with `net.connect(path)`.
 
 The server does not have to connect. A server that never connects is only
-started, and started again when its command changes, or after it exits.
-`buck2 dev` still builds the outputs after a change, but has no one to tell.
+started, and started again when its command changes, or after it exits. It
+asks for no outputs, so none is built.
 
 A server that connects sends `{"type": "hello", "version": 1}`. `buck2 dev`
 answers with `ready`, and from then on writes messages to the connection and
@@ -486,8 +523,8 @@ Ctrl-C while it waits kills the server at once.
 
 When the server exits, or fails to start again, `buck2 dev` prints that, and
 keeps watching. The next change to what the server or an output is built from
-starts the server again, built from the files as they are then. So a server can also run to
-completion on each change, such as a test runner. `buck2 dev` ends on Ctrl-C,
+starts the server again, built from the files as they are then. So a server can
+also run to completion on each change, such as a test runner. `buck2 dev` ends on Ctrl-C,
 `SIGTERM` or `SIGHUP`, or when an interactive server (see
 [The terminal](#the-terminal)) exits successfully.
 
@@ -531,12 +568,12 @@ console, and prints only errors and that the server exited or restarts.
 
 | `type`          | Fields                                                    | Sent when                                                                                                    |
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`   | The server sent `hello`.                                                                                     |
-| `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
+| `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`, `scopes`: the names in `DevInfo.scopes` | The server sent `hello`.                                                              |
+| `building`      | `gen`, `outputs`: names, `files`: the changes of these outputs since the server got them | The server asked for a build, and it starts.                                     |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
-| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
-| `stale`         | `outputs`: the names of the outputs that are held back, `files`: the changed files that hold them back | These lists change. Empty lists mean that nothing is held back. After missed changes the project root is in `files`: any file may have changed. See [What is built after a change](#what-is-built-after-a-change). |
+| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. Its outputs are in the next `stale`.             |
+| `stale`         | `outputs`: name to `{within, files}`, for each output that the server asked for and that changes since it got it may affect. `within`: the scopes that hold all of those changes. `files`: the changed files, absolute | Files changed that may affect an output that the server asked for. After missed changes the project root is in `files`. See [Stale outputs](#stale-outputs) and [Scopes](#scopes). |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
@@ -549,21 +586,21 @@ build runs hears nothing of that build, and asks for what it needs after
 `ready`. A `failed` without a `building` is about the analysis of the target,
 or the build of the server's command.
 Messages
-are sent only to a server that has sent `hello`. If outputs are held back when
-the server sends `hello`, `ready` is followed by `stale`.
+are sent only to a server that has sent `hello`. If a second connection sends
+`hello` while outputs are stale, its `ready` is followed by `stale`.
 
 While the daemon builds, it watches the files that the build depends on: the
 files that the outputs it builds may be built from, and the build files and
 `.bzl` files of the graph. If one of them gets different contents, the daemon
 stops the build, and `buck2 dev` sends `cancelled`, asks about the changes once
-the files stop changing, and starts the next build, which builds the stopped
-build's outputs too. Saving a file without changing it, and a change to a file
-that the build does not use, do not stop a build. Other
+the files stop changing, and sends `stale` with the stopped build's outputs.
+Saving a file without changing it, and a change to a file that the build does
+not use, do not stop a build. Other
 changes during a build, and changes while the daemon analyses the target or says
 what changed, are asked about once that is done. If analysing fails,
-`buck2 dev` sends `failed`, and analyses again after the next change, or before
-the next build that the server asks for, which then gets `building` and
-`failed`. The same errors again, after a change that did not touch what failed,
+`buck2 dev` sends `failed`, and analyses again after the next change, and
+before the next build that the server asks for, which then gets `building` and
+`failed` if the analysis still fails. The same errors again, after a change that did not touch what failed,
 are not sent again. Once the analysis works again, the server gets
 `graph_changed`.
 
@@ -572,15 +609,26 @@ are not sent again. Once the analysis works again, the server gets
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`. Send it before anything else.            |
-| `build`   | `outputs`: a list of names | Build these outputs now, with all changes. An output that is held back is let go if its build succeeds, and `stale` says so. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. |
-| `restart` |                           | Build the server again and restart it. Clears `stale`. If the build fails, the old server keeps running until the next analysis restarts it. |
+| `build`   | `outputs`: a list of names | Build these outputs now, with all changes, and track them from now on. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. |
+| `restart` |                           | Build the server again and restart it. The new server has asked for nothing. If the build fails, the old server keeps running until the next analysis restarts it. |
 
 `buck2 dev` reads the connection all the time, also while it builds, so a
 server never waits for it to read. Requests that arrive during a build are
 handled after it.
 
 A typical server sends `hello`, then `{"type": "build", "outputs": [...]}` when
-it gets `ready`, and uses each `built` message.
+it gets `ready`, and again for the outputs that it wants when it gets `stale`.
+It uses each `built` message. A server for a site needs no more than this:
+
+```python
+for message in messages:
+    if message["type"] == "ready":
+        send({"type": "build", "outputs": ["www"]})
+    elif message["type"] == "stale":
+        send({"type": "build", "outputs": list(message["outputs"])})
+    elif message["type"] == "built":
+        serve(message["outputs"]["www"]["path"])
+```
 
 ## Other buck2 commands
 
@@ -604,18 +652,18 @@ the project, and starting it again to carry on building would undo that.
 - `buck2 dev` takes one target.
 - A change to a file in a package of the graph costs a short daemon command,
   even if nothing is built from the file: it says what the file is. A server
-  that keeps writing files in such a package keeps `buck2 dev` asking. Changes elsewhere cost nothing: the daemon
-  does not report them to `buck2 dev`, except to build files and `.bzl` files
-  of the graph, `PACKAGE` files, `.buckconfig` files, and the directories
-  above the packages.
+  that keeps writing files in such a package keeps `buck2 dev` asking. Changes
+  elsewhere cost nothing: the daemon does not report them to `buck2 dev`,
+  except to build files and `.bzl` files of the graph, `PACKAGE` files,
+  `.buckconfig` files, and the directories above the packages.
 - When a target, a build file or a `.bzl` file of the graph changes, the daemon
   walks the graph of the target again to find what the server and the outputs
   are built from.
 - A file that a `.buckconfig` includes under another name is not reported, so
   a change to it is only seen with the next change that is.
 - A `.buckconfig` change is not a change to what the server or an output is
-  built from, but `buck2 dev` asks the daemon about it as about any other file, and the daemon reads the
-  configuration again. If that changes the targets of the graph, such as a
+  built from, but `buck2 dev` asks the daemon about it as about any other file,
+  and the daemon reads the configuration again. If that changes the targets of the graph, such as a
   source file that `read_config` names, it is a change to them, as in
   [Changes to the graph](#changes-to-the-graph). Other configuration changes
   are used by the next build.
