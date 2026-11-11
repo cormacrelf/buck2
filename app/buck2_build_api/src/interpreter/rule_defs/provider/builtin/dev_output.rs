@@ -8,8 +8,7 @@
  * above-listed licenses.
  */
 
-//! `DevOutput`: one of `DevInfo.outputs`, with the changes after which `buck2 dev` builds it
-//! again by itself, and the other artifacts that are built with it.
+//! `DevOutput`: one of `DevInfo.outputs`, with the other artifacts that are built with it.
 
 use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
@@ -30,11 +29,6 @@ use starlark::values::ValueOfUnchecked;
 use starlark::values::dict::AllocDict;
 use starlark::values::dict::DictType;
 use starlark::values::dict::UnpackDictEntries;
-use starlark::values::list::AllocList;
-use starlark::values::list::ListRef;
-use starlark::values::list::ListType;
-use starlark::values::list_or_tuple::UnpackListOrTuple;
-use starlark::values::none::NoneOr;
 
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
@@ -51,7 +45,8 @@ enum DevOutputError {
     BadTarget(String),
 }
 
-fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
+/// A target pattern as a string, or a target label as a pattern for that target.
+pub(crate) fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
     if let Some(s) = value.unpack_str() {
         return Ok(s.to_owned());
     }
@@ -70,7 +65,7 @@ fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
     Err(DevOutputError::BadTarget(value.to_repr()).into())
 }
 
-/// One of `DevInfo.outputs`, with the changes after which `buck2 dev` builds it again by itself.
+/// One of `DevInfo.outputs`, with the other artifacts that are built with it.
 #[internal_provider(dev_output_creator)]
 #[derive(
     Clone,
@@ -88,26 +83,17 @@ pub struct DevOutput<'v> {
         'v,
         Either<ValueIsInputArtifactAnnotation, FrozenStarlarkCmdArgs<'static>>,
     >,
-    /// Target patterns, or `None` for an output that is built again after any change.
-    only: ValueOfUnchecked<'v, NoneOr<ListType<String>>>,
     /// Other artifacts that are built with this one, by name.
     sidecars: ValueOfUnchecked<'v, DictType<String, ValueIsInputArtifactAnnotation>>,
 }
 
 #[starlark_module]
 fn dev_output_creator(globals: &mut GlobalsBuilder) {
-    /// An output of `DevInfo`, with the changes after which `buck2 dev` builds it again by
-    /// itself.
+    /// An output of `DevInfo`, with the other artifacts that are built with it.
     ///
-    /// * `artifact`: the artifact to build, with its associated artifacts. Or a `RunInfo` or
+    /// * `output`: the artifact to build, with its associated artifacts. Or a `RunInfo` or
     ///   another command line: `buck2 dev` builds what it names, and gives the server its
     ///   `argv`.
-    /// * `only`: target patterns (`"root//lib/..."`) or labels. `buck2 dev` builds the output
-    ///   again by itself only after a change to the own source files of these targets. After
-    ///   any other change that the output may be built from, it stops building the output and
-    ///   tells the server that the output is stale, until the server asks for it. An empty
-    ///   list means that `buck2 dev` never builds the output by itself. Without `only`, the
-    ///   output is built again after every change that it may be built from.
     /// * `sidecars`: other artifacts, by name, that belong to the output: files that say what
     ///   is in it, or the files of a directory one by one. `buck2 dev` builds them whenever
     ///   it builds the output, from the same files, and `built` has the path and the digest
@@ -115,10 +101,7 @@ fn dev_output_creator(globals: &mut GlobalsBuilder) {
     ///   output is built from. The server cannot ask for a sidecar by itself.
     #[starlark(as_type = DevOutput<'static>)]
     fn DevOutput<'v>(
-        #[starlark(require = pos)] artifact: Value<'v>,
-        #[starlark(require = named, default = NoneOr::None)] only: NoneOr<
-            UnpackListOrTuple<Value<'v>>,
-        >,
+        #[starlark(require = pos)] output: Value<'v>,
         #[starlark(require = named, default = UnpackDictEntries::default())]
         sidecars: UnpackDictEntries<&'v str, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -133,21 +116,9 @@ fn dev_output_creator(globals: &mut GlobalsBuilder) {
                 .into());
             }
         }
-        let only = match only {
-            NoneOr::None => Value::new_none(),
-            NoneOr::Other(targets) => {
-                let patterns = targets
-                    .items
-                    .into_iter()
-                    .map(target_to_pattern)
-                    .collect::<buck2_error::Result<Vec<_>>>()?;
-                heap.alloc(AllocList(patterns))
-            }
-        };
-        let artifact = dev_output_value(heap, artifact)?;
+        let artifact = dev_output_value(heap, output)?;
         Ok(DevOutput {
             artifact: ValueOfUnchecked::new(artifact),
-            only: ValueOfUnchecked::new(only),
             sidecars: ValueOfUnchecked::new(heap.alloc(AllocDict(sidecars.entries))),
         })
     }
@@ -161,24 +132,5 @@ impl<'v> DevOutput<'v> {
     /// The dictionary of the sidecars.
     pub fn sidecars(&self) -> Value<'v> {
         self.sidecars.get()
-    }
-
-    /// The target patterns of `only`, if it was given.
-    pub fn only(&self) -> Option<Vec<String>> {
-        let only = self.only.get();
-        if only.is_none() {
-            return None;
-        }
-        Some(
-            ListRef::from_value(only)
-                .expect("validated at construction")
-                .iter()
-                .map(|v| {
-                    v.unpack_str()
-                        .expect("validated at construction")
-                        .to_owned()
-                })
-                .collect(),
-        )
     }
 }

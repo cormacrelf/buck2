@@ -158,7 +158,8 @@ pub enum DevAction {
     /// to the server and to each output. Finding what they may be built from, when the graph
     /// changed, may build what dynamic actions need to say what they do.
     Watch(DevWatchRequest),
-    /// Build the named `DevInfo.outputs`. The build stops if a file that it builds from changes.
+    /// Build the named `DevInfo.outputs`, which the server asked for. The build stops if a file
+    /// that it builds from changes.
     Build { outputs: Vec<String> },
     /// Release the local resources that the daemon holds for the session, and wait until they
     /// are gone. `buck2 dev` sends it after it has stopped the server.
@@ -196,6 +197,8 @@ pub struct DevServer {
     pub digest: String,
     /// The names of `DevInfo.outputs`.
     pub outputs: Vec<String>,
+    /// The names of `DevInfo.scopes`.
+    pub scopes: Vec<String>,
     /// `DevInfo.interactive`: the server gets the terminal.
     pub interactive: bool,
     /// The environment variables that the local resources give the server.
@@ -225,12 +228,23 @@ pub struct DevWatchRequest {
 /// files: the changed paths do.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevWatchState {
-    /// A digest of each group of the targets that the server and the outputs may be built from.
-    pub targets_digests: Vec<String>,
+    /// The targets that the server and the outputs may be built from, in groups. Sorted.
+    pub targets_digests: Vec<DevTargets>,
     /// The `.bzl` files that the graph loads, and their contents.
     pub bzl_digest: String,
     /// The build files of the graph and the `.bzl` files, and their contents.
     pub graph_digest: String,
+}
+
+/// The targets that the server or an output may be built from that are in the same scopes.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DevTargets {
+    /// 0 for the server, and `i + 1` for the `i`th output.
+    pub slot: usize,
+    /// The scopes that the targets are in, as bits by the order of `DevInfo.scopes`.
+    pub scopes: u64,
+    /// A digest of the targets.
+    pub digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -256,17 +270,23 @@ pub struct DevOutputChanges {
     /// The server's command may be built from a requested path, or its targets changed, so it
     /// may be new.
     pub server: bool,
-    /// The outputs to build again, each with the requested paths that call for it: paths that
-    /// the output may be built from, and, if its targets changed, the build files and `.bzl`
-    /// files.
-    pub build: BTreeMap<String, Vec<String>>,
-    /// The outputs with `only` to hold back, each with the requested paths that call for it:
-    /// the output may be built from them, and they are outside its `only`. With `missed` and
-    /// a `previous`, every output is in `build` or here, the ones here with the empty path,
-    /// which stands for the project.
-    pub hold: BTreeMap<String, Vec<String>>,
+    /// The outputs that the changes may affect, each with those changes: the requested paths
+    /// that the output may be built from, and, if its targets changed, a change for them. With
+    /// `missed` and a `previous`, every output has a change of the empty path, which stands for
+    /// the project.
+    pub outputs: BTreeMap<String, Vec<DevChange>>,
     /// How many targets the server and the outputs may be built from.
     pub targets: usize,
+}
+
+/// A change that an output may be built from.
+#[derive(Serialize, Deserialize)]
+pub struct DevChange {
+    /// The project-relative path that changed: a source file, a build file or a `.bzl` file.
+    /// `None` for a change to the targets that names no file, such as a `.buckconfig` change.
+    pub path: Option<String>,
+    /// The names of the scopes that the change is in.
+    pub scopes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]

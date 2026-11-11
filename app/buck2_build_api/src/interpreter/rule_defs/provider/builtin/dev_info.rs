@@ -40,6 +40,7 @@ use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::AllocList;
 use starlark::values::list::ListRef;
 use starlark::values::list::ListType;
+use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::none::NoneType;
 
 use crate as buck2_build_api;
@@ -52,6 +53,7 @@ use crate::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use crate::interpreter::rule_defs::provider::builtin::dev_output::DevOutput;
+use crate::interpreter::rule_defs::provider::builtin::dev_output::target_to_pattern;
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::check_all;
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::iter_local_resources;
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::unwrap_all;
@@ -165,8 +167,8 @@ pub struct DevInfo<'v> {
         'v,
         DictType<String, Either<ValueIsInputArtifactAnnotation, FrozenStarlarkCmdArgs<'static>>>,
     >,
-    /// For each output that was given as a `DevOutput` with `only`: the target patterns.
-    only: ValueOfUnchecked<'v, DictType<String, ListType<String>>>,
+    /// Named sets of targets, as target patterns. A change says which of them it is in.
+    scopes: ValueOfUnchecked<'v, DictType<String, ListType<String>>>,
     /// For each output that was given as a `DevOutput` with `sidecars`: those, by name.
     sidecars:
         ValueOfUnchecked<'v, DictType<String, DictType<String, ValueIsInputArtifactAnnotation>>>,
@@ -189,12 +191,17 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     ///   command again after each change, and starts the server again when the command line,
     ///   or the contents of an artifact that it names, changed. So keep what changes often
     ///   out of it: make that one of `outputs`, which the server asks for once it runs.
-    /// * `outputs`: artifacts that `buck2 dev` builds by name. It builds an output again after
-    ///   every change that the output may be built from. Give an output as
-    ///   `DevOutput(artifact, only = [...])` to hold it back after some of them. An artifact
-    ///   with associated artifacts is built with them, and they count as part of the output.
-    ///   An output may also be a `RunInfo` or another command line: `buck2 dev` builds what it
-    ///   names, hidden artifacts too, and gives the server its `argv`.
+    /// * `outputs`: artifacts that `buck2 dev` builds by name, when the server asks for them.
+    ///   After a change that an output that the server asked for may be built from,
+    ///   `buck2 dev` tells the server that it is stale. An artifact with associated artifacts
+    ///   is built with them, and they count as part of the output. An output may also be a
+    ///   `RunInfo` or another command line: `buck2 dev` builds what it names, hidden artifacts
+    ///   too, and gives the server its `argv`. Give an output as a `DevOutput` to build more
+    ///   artifacts with it.
+    /// * `scopes`: named sets of targets, each a list of target patterns (`"root//lib/..."`)
+    ///   or labels. A change is in a scope when it is to an own source file of one of its
+    ///   targets, or to one of its targets. For each stale output, `buck2 dev` tells the
+    ///   server the scopes that hold every change since the server last got it.
     /// * `interactive`: give the server the terminal, for a server that reads keys or lines
     ///   from it, such as a REPL. Otherwise its stdin is empty, and Ctrl-C reaches only
     ///   `buck2 dev`.
@@ -210,25 +217,23 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(require = named)] server: Value<'v>,
         #[starlark(require = named, default = UnpackDictEntries::default())]
         outputs: UnpackDictEntries<Value<'v>, Value<'v>>,
+        #[starlark(require = named, default = UnpackDictEntries::default())]
+        scopes: UnpackDictEntries<&'v str, UnpackListOrTuple<Value<'v>>>,
         #[starlark(require = named, default = false)] interactive: bool,
         #[starlark(require = named, default = NoneType)] local_resources: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<DevInfo<'v>> {
         let heap = eval.heap();
         let server = StarlarkCmdArgs::try_from_value(server)?;
-        // A `DevOutput` is taken apart here: its artifact goes to `outputs`, and its `only`
-        // to a dictionary of its own.
+        // A `DevOutput` is taken apart here: its artifact goes to `outputs`, and its sidecars
+        // to a dictionary of their own.
         let mut artifacts: Vec<(Value<'v>, Value<'v>)> = Vec::new();
-        let mut only: Vec<(Value<'v>, Value<'v>)> = Vec::new();
         let mut sidecars: Vec<(Value<'v>, Value<'v>)> = Vec::new();
         for (name, output) in outputs.entries {
             match ValueTyped::<DevOutput>::new(output) {
                 Some(output) => {
                     // `DevOutput` keeps it as `dev_output_value` does.
                     artifacts.push((name, output.as_ref().artifact()));
-                    if let Some(patterns) = output.as_ref().only() {
-                        only.push((name, heap.alloc(AllocList(patterns))));
-                    }
                     let with = output.as_ref().sidecars();
                     if DictRef::from_value(with).is_some_and(|with| !with.is_empty()) {
                         sidecars.push((name, with));
@@ -241,10 +246,23 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
                 )),
             }
         }
+        let scopes = scopes
+            .entries
+            .into_iter()
+            .map(|(name, targets)| {
+                let patterns = targets
+                    .items
+                    .into_iter()
+                    .map(target_to_pattern)
+                    .collect::<buck2_error::Result<Vec<_>>>()
+                    .with_buck_error_context(|| format!("For scope `{name}`"))?;
+                Ok((name, heap.alloc(AllocList(patterns))))
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
         let info = DevInfo {
             server: ValueOfUnchecked::new(heap.alloc(server)),
             outputs: ValueOfUnchecked::new(heap.alloc(AllocDict(artifacts))),
-            only: ValueOfUnchecked::new(heap.alloc(AllocDict(only))),
+            scopes: ValueOfUnchecked::new(heap.alloc(AllocDict(scopes))),
             sidecars: ValueOfUnchecked::new(heap.alloc(AllocDict(sidecars))),
             interactive: heap.alloc_typed_unchecked(interactive).cast(),
             local_resources: ValueOfUnchecked::new(local_resources),
@@ -377,9 +395,9 @@ impl<'v> DevInfo<'v> {
             .collect()
     }
 
-    /// The target patterns of `only`, for each output that has it.
-    pub fn only(&self) -> BuckMutInsertionMap<String, Vec<String>> {
-        DictRef::from_value(self.only.get())
+    /// The scopes, each with its target patterns, in the order that they were given.
+    pub fn scopes(&self) -> BuckMutInsertionMap<String, Vec<String>> {
+        DictRef::from_value(self.scopes.get())
             .expect("Value is a Dict")
             .iter()
             .map(|(name, patterns)| {

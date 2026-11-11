@@ -22,7 +22,8 @@
 //!
 //! The server and each output claim the files that they may be built from, and a file may
 //! belong to several of them. What claims files is a list of `Slot`s, and a set of slots is a
-//! bit mask.
+//! bit mask. Each change also says which of `DevInfo.scopes` it is in: those of the targets that
+//! it is to, or that have the changed file as an own source file.
 //!
 //! What the slots claim is a DICE key, `DevClaimsKey`. Finding it walks the targets of the
 //! graph, and the actions of the targets that own the artifacts of the slots, which builds what
@@ -71,11 +72,13 @@ use buck2_cli_proto::new_generic::DevAction;
 use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
 use buck2_cli_proto::new_generic::DevBuiltSidecar;
+use buck2_cli_proto::new_generic::DevChange;
 use buck2_cli_proto::new_generic::DevInterrupted;
 use buck2_cli_proto::new_generic::DevOutputChanges;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::DevServer;
+use buck2_cli_proto::new_generic::DevTargets;
 use buck2_cli_proto::new_generic::DevWatchRequest;
 use buck2_cli_proto::new_generic::DevWatchState;
 use buck2_cli_proto::new_generic::DevWatched;
@@ -193,13 +196,30 @@ struct Slot {
     /// Artifacts. The slot claims the targets that they are built from, with their source
     /// files.
     inputs: Vec<ArtifactGroup>,
-    /// For an output with `only`: the target patterns. A change to a file that the slot claims
-    /// holds the output back, unless it is an own source file of one of these targets.
-    only: Option<Vec<String>>,
 }
 
-/// The slot of the server.
-const SERVER_SLOT: u64 = 1;
+/// What `buck2 dev` needs of a `DevInfo` to say what a change is to it.
+struct Policy {
+    /// The names of the outputs. Slot 0 is the server, and slot `i + 1` is the output with the
+    /// `i`th of these names.
+    names: Vec<String>,
+    slots: Vec<Slot>,
+    /// `DevInfo.scopes`: each name with its target patterns. A set of scopes is the bits of a
+    /// `u64`, by this order.
+    scopes: Vec<(String, Vec<String>)>,
+}
+
+impl Policy {
+    /// The names of the scopes in `mask`.
+    fn scope_names(&self, mask: u64) -> Vec<String> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & slot_bit(*i) != 0)
+            .map(|(_, (name, _))| name.clone())
+            .collect()
+    }
+}
 
 fn slot_bit(slot: usize) -> u64 {
     1 << slot
@@ -273,9 +293,9 @@ impl<'a> DevView<'a> {
         }
     }
 
-    fn only(self) -> BuckMutInsertionMap<String, Vec<String>> {
+    fn scopes(self) -> BuckMutInsertionMap<String, Vec<String>> {
         match self {
-            DevView::Dev(info) => info.only(),
+            DevView::Dev(info) => info.scopes(),
             DevView::Run(_) => BuckMutInsertionMap::default(),
         }
     }
@@ -344,25 +364,26 @@ fn resource_inputs(resources: &[Resource]) -> buck2_error::Result<Vec<ArtifactGr
     Ok(visitor.inputs.into_iter().collect())
 }
 
-/// The names of the outputs of a `DevInfo`, and its slots: slot 0 is the server, and slot
-/// `i + 1` is the output with the `i`th of these names. `resource_inputs` are what the setup
-/// commands of the local resources name, which belong to the server's slot.
+/// The `Policy` of a `DevInfo`. `resource_inputs` are what the setup commands of the local
+/// resources name, which belong to the server's slot.
 fn dev_policy(
     info: DevView<'_>,
     resource_inputs: Vec<ArtifactGroup>,
-) -> buck2_error::Result<(Vec<String>, Vec<Slot>)> {
+) -> buck2_error::Result<Policy> {
     let outputs = info.outputs()?;
     if outputs.len() + 1 > MAX_SLOTS {
         return Err(DevError::TooManySlots("outputs and the server", outputs.len() + 1).into());
     }
-    let only = info.only();
+    let scopes: Vec<(String, Vec<String>)> = info.scopes().into_iter().collect();
+    if scopes.len() > MAX_SLOTS {
+        return Err(DevError::TooManySlots("scopes", scopes.len()).into());
+    }
     let sidecars = info.sidecars()?;
     let mut visitor = SimpleCommandLineArtifactVisitor::new();
     info.server_command_line().visit_artifacts(&mut visitor)?;
     let mut slots = vec![Slot {
         what: "`DevInfo.server`".to_owned(),
         inputs: visitor.inputs.into_iter().chain(resource_inputs).collect(),
-        only: None,
     }];
     let mut names = Vec::new();
     for (name, output) in outputs.iter() {
@@ -375,11 +396,14 @@ fn dev_policy(
         slots.push(Slot {
             what: format!("Output `{name}`"),
             inputs,
-            only: only.get(name).cloned(),
         });
         names.push(name.clone());
     }
-    Ok((names, slots))
+    Ok(Policy {
+        names,
+        slots,
+        scopes,
+    })
 }
 
 pub(crate) async fn dev_command(
@@ -513,6 +537,7 @@ async fn dev(
                 server,
                 digest,
                 outputs: outputs.keys().cloned().collect(),
+                scopes: info.view().scopes().into_keys().collect(),
                 interactive: info.view().interactive(),
                 env: resources.env,
                 resources: resources.running,
@@ -522,16 +547,9 @@ async fn dev(
         }
         DevAction::Watch(request) => {
             let resources = dev_resources(&mut ctx.ctx(), &info).await?;
-            let (names, slots) = dev_policy(info.view(), resource_inputs(&resources)?)?;
-            let mut watched = watch_files(
-                &mut ctx.ctx(),
-                &label,
-                &names,
-                &slots,
-                request,
-                &req.session,
-            )
-            .await?;
+            let policy = dev_policy(info.view(), resource_inputs(&resources)?)?;
+            let mut watched =
+                watch_files(&mut ctx.ctx(), &label, &policy, request, &req.session).await?;
             // A local resource that exited is set up again by the analysis that the client runs
             // when the server may be new.
             if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
@@ -573,7 +591,7 @@ async fn dev(
             // The slots that this build is built from. A change to a file of one of them stops
             // it.
             // Only the outputs' slots matter here.
-            let (all, _) = dev_policy(info.view(), Vec::new())?;
+            let all = dev_policy(info.view(), Vec::new())?.names;
             let builds = all
                 .iter()
                 .enumerate()
@@ -726,8 +744,6 @@ async fn builds_from_changed(
 ) -> buck2_error::Result<bool> {
     let cell_resolver = dice.get_cell_resolver().await?;
     let relevant = match claims.classify(dice, cell_resolver, path).await? {
-        // With `only`, a change that holds an output back stops a build of it too: the build
-        // would use the change.
         Claimed::Source { may, .. } => may & builds != 0,
         Claimed::BuildFile | Claimed::Bzl => true,
         Claimed::Nothing => false,
@@ -1022,12 +1038,11 @@ struct GraphClaims {
     files: BuckMutMap<ProjectRelativePathBuf, (u64, CellPath)>,
     /// The slots that claim the own source files of each target.
     with_own_files: BuckMutMap<ConfiguredTargetLabel, u64>,
-    /// The slots whose `only` names each target.
-    only: BuckMutMap<ConfiguredTargetLabel, u64>,
-    /// The targets whose digests say whether the targets of the slots changed, in groups.
-    /// Group `2 * i` has the targets of slot `i` that its `only` names, or all of them if it
-    /// has none, and group `2 * i + 1` has the others.
-    groups: Vec<Vec<ConfiguredTargetNode>>,
+    /// The scopes that each target is in. Targets in no scope are not here.
+    scopes: BuckMutMap<ConfiguredTargetLabel, u64>,
+    /// The targets whose digests say whether the targets of the slots changed, in groups: by
+    /// slot, and by the scopes that they are in.
+    groups: BTreeMap<(usize, u64), Vec<ConfiguredTargetNode>>,
     /// How many targets a slot has.
     claimed_targets: usize,
     /// The directory of each package of the graph.
@@ -1061,36 +1076,31 @@ impl GraphClaims {
 async fn graph_claims(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
-    slots: &[Slot],
+    policy: &Policy,
 ) -> buck2_error::Result<GraphClaims> {
+    let slots = &policy.slots;
     let mut timer = Timer::new();
     let cell_resolver = dice.get_cell_resolver().await?;
     let cell = label.target().pkg().cell_name();
     let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?;
 
-    let parse = |targets: &Option<Vec<String>>| {
-        targets
-            .as_ref()
-            .map(|targets| {
-                targets
-                    .iter()
-                    .map(|p| {
-                        ParsedPattern::<TargetPatternExtra>::parse_precise(
-                            p,
-                            cell,
-                            cell_resolver,
-                            &cell_alias_resolver,
-                        )
-                    })
-                    .collect::<buck2_error::Result<Vec<_>>>()
-            })
-            .transpose()
-    };
-    let mut only_patterns: Vec<Option<Vec<ParsedPattern<TargetPatternExtra>>>> =
-        Vec::with_capacity(slots.len());
-    for slot in slots {
-        only_patterns.push(parse(&slot.only)?);
-    }
+    let scope_patterns: Vec<Vec<ParsedPattern<TargetPatternExtra>>> = policy
+        .scopes
+        .iter()
+        .map(|(_, targets)| {
+            targets
+                .iter()
+                .map(|p| {
+                    ParsedPattern::<TargetPatternExtra>::parse_precise(
+                        p,
+                        cell,
+                        cell_resolver,
+                        &cell_alias_resolver,
+                    )
+                })
+                .collect::<buck2_error::Result<Vec<_>>>()
+        })
+        .collect::<buck2_error::Result<_>>()?;
 
     let root = dice
         .get_configured_target_node(label.target())
@@ -1111,18 +1121,19 @@ async fn graph_claims(
     let mut files: BuckMutMap<ProjectRelativePathBuf, (u64, CellPath)> = BuckMutMap::default();
     let mut targets: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
     let mut with_own_files: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
-    let mut only: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
-    let mut only_slots = 0;
-    let mut incomplete = Vec::new();
-    for (set, spec) in slots.iter().enumerate() {
-        if let Some(p) = &only_patterns[set] {
-            only_slots |= slot_bit(set);
-            for node in &nodes {
-                if p.iter().any(|p| p.matches(node.label().unconfigured())) {
-                    claim(&mut only, node.label().dupe(), set);
-                }
+    let mut scopes: BuckMutMap<ConfiguredTargetLabel, u64> = BuckMutMap::default();
+    for (scope, patterns) in scope_patterns.iter().enumerate() {
+        for node in &nodes {
+            if patterns
+                .iter()
+                .any(|p| p.matches(node.label().unconfigured()))
+            {
+                claim(&mut scopes, node.label().dupe(), scope);
             }
         }
+    }
+    let mut incomplete = Vec::new();
+    for (set, spec) in slots.iter().enumerate() {
         if spec.inputs.is_empty() {
             continue;
         }
@@ -1159,7 +1170,7 @@ async fn graph_claims(
     }
     timer.step("the targets of each slot");
 
-    let mut groups: Vec<Vec<ConfiguredTargetNode>> = vec![Vec::new(); 2 * slots.len()];
+    let mut groups: BTreeMap<(usize, u64), Vec<ConfiguredTargetNode>> = BTreeMap::new();
     let mut claimed_targets = 0;
     let mut build_files: BTreeMap<ProjectRelativePathBuf, CellPath> = BTreeMap::new();
     let mut packages = BTreeSet::new();
@@ -1169,13 +1180,15 @@ async fn graph_claims(
         if has != 0 {
             claimed_targets += 1;
         }
-        let named = only.get(node.label()).copied().unwrap_or(0);
+        let in_scopes = scopes.get(node.label()).copied().unwrap_or(0);
         for slot in 0..slots.len() {
             if has & slot_bit(slot) == 0 {
                 continue;
             }
-            let outside = only_slots & slot_bit(slot) != 0 && named & slot_bit(slot) == 0;
-            groups[2 * slot + outside as usize].push(node.dupe());
+            groups
+                .entry((slot, in_scopes))
+                .or_default()
+                .push(node.dupe());
         }
         if packages.insert(node.label().pkg()) {
             if let Some(dir) = project_path(cell_resolver, node.label().pkg().as_cell_path())? {
@@ -1193,7 +1206,7 @@ async fn graph_claims(
         nodes,
         files,
         with_own_files,
-        only,
+        scopes,
         groups,
         claimed_targets,
         package_dirs,
@@ -1519,8 +1532,9 @@ enum Claimed {
     Source {
         /// The slots that claim it, at least one.
         may: u64,
-        /// Of those, the ones whose `only` names a target that has the file as a source file.
-        only: u64,
+        /// The scopes that the change is in: those of the targets that have the file as an own
+        /// source file.
+        scopes: u64,
     },
     /// A build file of the graph.
     BuildFile,
@@ -1545,7 +1559,7 @@ enum Claimed {
 #[derive(Allocative, Debug, PartialEq, Eq)]
 struct DevClaims {
     /// For each target of the graph, by the hash of its unconfigured label: the slots that
-    /// claim its own source files, and the slots whose `only` names it. Sorted.
+    /// claim its own source files, and the scopes that it is in. Sorted.
     targets: Vec<(u64, u64, u64)>,
     /// The source files that slots claim by name, by the hash of their project-relative path,
     /// with the slots. Sorted.
@@ -1557,8 +1571,9 @@ struct DevClaims {
     build_files: Vec<u64>,
     /// The `.bzl` files that the graph loads. Sorted.
     bzl_files: Vec<u64>,
-    /// A digest of each group of targets; see `GraphClaims::groups`.
-    targets_digests: Vec<String>,
+    /// Each group of targets, by slot and scopes, with a digest of them; see
+    /// `GraphClaims::groups`. Sorted.
+    targets_digests: Vec<(usize, u64, String)>,
     /// How many targets a slot has.
     claimed_targets: usize,
     /// The `.bzl` files that the graph loads, and their contents.
@@ -1578,7 +1593,7 @@ impl DevClaims {
             nodes: _,
             files,
             with_own_files,
-            only,
+            scopes,
             groups,
             claimed_targets,
             package_dirs,
@@ -1594,11 +1609,11 @@ impl DevClaims {
                 .or_default()
                 .0 |= *slots;
         }
-        for (label, slots) in &only {
+        for (label, in_scopes) in &scopes {
             by_label
                 .entry(stable_hash(&label.unconfigured().to_string()))
                 .or_default()
-                .1 |= *slots;
+                .1 |= *in_scopes;
         }
 
         let mut by_path: BTreeMap<u64, u64> = BTreeMap::new();
@@ -1647,9 +1662,11 @@ impl DevClaims {
             .collect();
         bzl_hashes.sort_unstable();
 
-        let targets_digests: Vec<String> = groups
+        let targets_digests: Vec<(usize, u64, String)> = groups
             .iter()
-            .map(|nodes| targets_digest(nodes.iter().collect()))
+            .map(|((slot, in_scopes), nodes)| {
+                (*slot, *in_scopes, targets_digest(nodes.iter().collect()))
+            })
             .collect();
         timer.step("the digests of the targets of each slot");
         let interest = Arc::new(FileInterest::new(
@@ -1663,7 +1680,7 @@ impl DevClaims {
         Ok(DevClaims {
             targets: by_label
                 .into_iter()
-                .map(|(hash, (own, only))| (hash, own, only))
+                .map(|(hash, (own, in_scopes))| (hash, own, in_scopes))
                 .collect(),
             files: other_files,
             interest,
@@ -1679,7 +1696,15 @@ impl DevClaims {
 
     fn state(&self) -> DevWatchState {
         DevWatchState {
-            targets_digests: self.targets_digests.clone(),
+            targets_digests: self
+                .targets_digests
+                .iter()
+                .map(|(slot, scopes, digest)| DevTargets {
+                    slot: *slot,
+                    scopes: *scopes,
+                    digest: digest.clone(),
+                })
+                .collect(),
             bzl_digest: self.bzl_digest.clone(),
             graph_digest: self.graph_digest.clone(),
         }
@@ -1711,7 +1736,7 @@ impl DevClaims {
             Ok(i) => self.files[i].1,
             Err(_) => 0,
         };
-        let mut only = 0;
+        let mut scopes = 0;
         // The targets that have the file as a source file are in the packages that the file is
         // in. Only the packages of the graph are looked at, and those are loaded already.
         let cell_path = cell_resolver.get_cell_path(&path);
@@ -1730,22 +1755,19 @@ impl DevClaims {
                 else {
                     continue;
                 };
-                let (_, own, named) = self.targets[i];
+                let (_, own, in_scopes) = self.targets[i];
                 // Whether the target would add to the answer, if it has the file.
-                let adds = own & !may != 0 || named & !only != 0;
+                let adds = own & !may != 0 || in_scopes & !scopes != 0;
                 if adds && node.inputs().any(|input| input == cell_path) {
                     may |= own;
-                    only |= named;
+                    scopes |= in_scopes;
                 }
             }
         }
         Ok(if may == 0 {
             Claimed::Nothing
         } else {
-            Claimed::Source {
-                may,
-                only: only & may,
-            }
+            Claimed::Source { may, scopes }
         })
     }
 }
@@ -1770,8 +1792,8 @@ impl Key for DevClaimsKey {
         ctx: &mut DiceComputations,
         _cancellations: &CancellationContext,
     ) -> Self::Value {
-        let slots = dev_slots(ctx, &self.0).await?;
-        let claims = graph_claims(ctx, &self.0, &slots).await?;
+        let policy = dev_slots(ctx, &self.0).await?;
+        let claims = graph_claims(ctx, &self.0, &policy).await?;
         Ok(Arc::new(DevClaims::new(ctx, claims).await?))
     }
 
@@ -1798,15 +1820,15 @@ async fn dev_claims(
     dice.compute(&DevClaimsKey(label.dupe())).await?.dupe()
 }
 
-/// The slots of the `DevInfo` of a target.
+/// The `Policy` of the `DevInfo` of a target.
 async fn dev_slots(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
-) -> buck2_error::Result<Vec<Slot>> {
+) -> buck2_error::Result<Policy> {
     let providers = dice.get_providers(label).await?.require_compatible()?;
     let info = DevProvider::of(&providers, label)?;
     let resources = dev_resources(dice, &info).await?;
-    Ok(dev_policy(info.view(), resource_inputs(&resources)?)?.1)
+    dev_policy(info.view(), resource_inputs(&resources)?)
 }
 
 /// Say what the requested paths are to the server and to the outputs, and whose targets
@@ -1815,12 +1837,11 @@ async fn dev_slots(
 async fn watch_files(
     dice: &mut DiceComputations<'_>,
     label: &ConfiguredProvidersLabel,
-    names: &[String],
-    slots: &[Slot],
+    policy: &Policy,
     request: &DevWatchRequest,
     session: &str,
 ) -> buck2_error::Result<DevWatched> {
-    let mut outputs = OutputChanges::new(names, slots);
+    let mut outputs = OutputChanges::new(policy);
     let claims = dev_claims(dice, label).await?;
     // From here on the session's file change subscription drops the changes that cannot matter
     // to these claims. `buck2 dev` asks again after every change that is let through, and so
@@ -1839,26 +1860,35 @@ async fn watch_files(
     }
 
     let state = claims.state();
-    // Each of these is a group of targets; see `GraphClaims::groups`.
-    let (changed_groups, graph_changed) = match &request.previous {
-        None => (Vec::new(), false),
-        Some(previous) if previous.targets_digests.len() != state.targets_digests.len() => {
-            ((0..state.targets_digests.len()).collect(), true)
-        }
+    // The groups of targets that changed; see `GraphClaims::groups`.
+    let (changed_groups, every, graph_changed) = match &request.previous {
+        None => (Vec::new(), false, false),
         Some(previous) => {
             // A `.bzl` file may change what any rule does, so it changes every group.
             let every = previous.bzl_digest != state.bzl_digest;
-            let changed: Vec<usize> = previous
+            let old: BTreeMap<(usize, u64), &str> = previous
                 .targets_digests
                 .iter()
-                .zip(&state.targets_digests)
-                .enumerate()
-                .filter(|(_, (old, new))| every || old != new)
-                .map(|(group, _)| group)
+                .map(|group| ((group.slot, group.scopes), group.digest.as_str()))
+                .collect();
+            let new: BTreeMap<(usize, u64), &str> = state
+                .targets_digests
+                .iter()
+                .map(|group| ((group.slot, group.scopes), group.digest.as_str()))
+                .collect();
+            // A group that is new, or gone, changed too.
+            let changed: Vec<(usize, u64)> = old
+                .keys()
+                .chain(new.keys())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|key| every || old.get(key) != new.get(key))
                 .collect();
             let targets_changed = previous.targets_digests != state.targets_digests;
             (
                 changed,
+                every,
                 targets_changed || previous.graph_digest != state.graph_digest,
             )
         }
@@ -1871,119 +1901,91 @@ async fn watch_files(
         state,
         graph_changed,
         incomplete: claims.incomplete.clone(),
-        outputs: outputs.finish(&changed_groups, graph_changed, &claims),
+        outputs: outputs.finish(&changed_groups, every, graph_changed, &claims),
     })
 }
 
 /// Gathers what changes are to the server and to the outputs.
 struct OutputChanges<'a> {
-    names: &'a [String],
-    /// The slots that have `only`.
-    only_slots: u64,
+    policy: &'a Policy,
     changes: DevOutputChanges,
     /// The requested paths that are build files or `.bzl` files of the graph.
     graph_paths: Vec<String>,
 }
 
 impl<'a> OutputChanges<'a> {
-    fn new(names: &'a [String], slots: &[Slot]) -> Self {
-        let only_slots = slots
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.only.is_some())
-            .fold(0, |mask, (slot, _)| mask | slot_bit(slot));
+    fn new(policy: &'a Policy) -> Self {
         OutputChanges {
-            names,
-            only_slots,
+            policy,
             changes: DevOutputChanges::default(),
             graph_paths: Vec::new(),
         }
     }
 
-    /// Changes were missed, so anything may have changed: the server may be new, every output
-    /// without `only` is built again, and the others are held back.
+    fn add(&mut self, slot: usize, path: Option<String>, scopes: u64) {
+        if slot == 0 {
+            self.changes.server = true;
+            return;
+        }
+        let Some(name) = self.policy.names.get(slot - 1) else {
+            return;
+        };
+        self.changes
+            .outputs
+            .entry(name.clone())
+            .or_default()
+            .push(DevChange {
+                path,
+                scopes: self.policy.scope_names(scopes),
+            });
+    }
+
+    /// Changes were missed, so anything may have changed: the server may be new, and every
+    /// output may be built from what changed, in no scope.
     fn missed(&mut self) {
-        self.changes.server = true;
-        for (slot, name) in self.names.iter().enumerate().map(|(i, name)| (i + 1, name)) {
-            if self.only_slots & slot_bit(slot) != 0 {
-                self.changes
-                    .hold
-                    .entry(name.clone())
-                    .or_default()
-                    .push(String::new());
-            } else {
-                self.changes.build.entry(name.clone()).or_default();
-            }
+        for slot in 0..self.policy.slots.len() {
+            self.add(slot, Some(String::new()), 0);
         }
     }
 
     /// The requested path `path` changed.
     fn path(&mut self, path: &str, claimed: &Claimed) {
-        let (may, only) = match claimed {
-            Claimed::Source { may, only } => (*may, *only),
+        let (may, scopes) = match claimed {
+            Claimed::Source { may, scopes } => (*may, *scopes),
             Claimed::BuildFile | Claimed::Bzl => {
                 self.graph_paths.push(path.to_owned());
                 return;
             }
             Claimed::Nothing => return,
         };
-        self.changes.server |= may & SERVER_SLOT != 0;
-        for (slot, name) in self.names.iter().enumerate().map(|(i, name)| (i + 1, name)) {
-            let bit = slot_bit(slot);
-            if may & bit == 0 {
-                continue;
+        for slot in 0..self.policy.slots.len() {
+            if may & slot_bit(slot) != 0 {
+                self.add(slot, Some(path.to_owned()), scopes);
             }
-            // A file outside the `only` of an output holds it back.
-            let changes = if self.only_slots & bit != 0 && only & bit == 0 {
-                &mut self.changes.hold
-            } else {
-                &mut self.changes.build
-            };
-            changes
-                .entry(name.clone())
-                .or_default()
-                .push(path.to_owned());
         }
     }
 
-    /// The groups of targets `changed_groups` changed: group `2 * slot` has the targets of a
-    /// slot that its `only` names, or all of them if it has none, and group `2 * slot + 1` has
-    /// the others.
+    /// The groups of targets `changed_groups` changed, each a slot and the scopes of its
+    /// targets. With `every`, a `.bzl` file changed, which is in no scope.
     fn finish(
         mut self,
-        changed_groups: &[usize],
+        changed_groups: &[(usize, u64)],
+        every: bool,
         graph_changed: bool,
         claims: &DevClaims,
     ) -> DevOutputChanges {
         self.changes.server |= graph_changed;
-        for group in changed_groups {
-            let (slot, outside) = (group / 2, group % 2 == 1);
-            if slot == 0 {
-                self.changes.server = true;
-                continue;
+        let graph_paths = std::mem::take(&mut self.graph_paths);
+        for (slot, scopes) in changed_groups {
+            let scopes = if every { 0 } else { *scopes };
+            if graph_paths.is_empty() {
+                // The targets changed, but no requested path says why, as after a change to a
+                // `.buckconfig` file.
+                self.add(*slot, None, scopes);
             }
-            let Some(name) = self.names.get(slot - 1) else {
-                continue;
-            };
-            // Without `only`, an output has no targets outside it.
-            let changes = if outside && self.only_slots & slot_bit(slot) != 0 {
-                &mut self.changes.hold
-            } else {
-                &mut self.changes.build
-            };
-            changes
-                .entry(name.clone())
-                .or_default()
-                .extend(self.graph_paths.iter().cloned());
-        }
-        for paths in self
-            .changes
-            .build
-            .values_mut()
-            .chain(self.changes.hold.values_mut())
-        {
-            paths.sort();
-            paths.dedup();
+            for path in &graph_paths {
+                self.add(*slot, Some(path.clone()), scopes);
+            }
         }
         self.changes.targets = claims.claimed_targets;
         self.changes

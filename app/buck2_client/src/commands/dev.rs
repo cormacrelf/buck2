@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_cli_proto::new_generic::DevAction;
+use buck2_cli_proto::new_generic::DevChange;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::DevServer;
@@ -90,8 +91,9 @@ mod pty;
 ///
 /// The target must return a `DevInfo` provider, or a `RunInfo` provider, which is then the
 /// server. `buck2 dev` builds and starts its server, then watches the source files of the
-/// target's dependency graph. When a file changes, it builds the `DevInfo` outputs that may be
-/// built from it again and tells the server, and starts the server again if its command changed.
+/// target's dependency graph. It builds `DevInfo` outputs when the server asks for them. When a
+/// file changes, it tells the server which of the outputs that it asked for are stale, and
+/// starts the server again if its command changed.
 ///
 /// The server may connect to the socket named in the `BUCK2_DEV_SOCKET` environment variable, and
 /// exchange JSON lines with `buck2 dev` there: it gets messages such as `{"type": "built", ...}`,
@@ -478,23 +480,68 @@ enum Request {
     Restart,
 }
 
-/// What the server was last told is stale.
-#[derive(Default, PartialEq, Eq)]
-struct Stale {
-    /// Absolute paths of the changed files that hold an output back.
-    files: Vec<String>,
-    /// The names of the outputs that are held back.
-    outputs: Vec<String>,
+/// An output that the server asked for, with the changes since the server last got it.
+#[derive(Default)]
+struct Tracked {
+    /// The server got a build of the output.
+    received: bool,
+    /// Project-relative paths that changed since then. The empty path stands for the project:
+    /// changes were missed, so any file may have changed.
+    files: BTreeSet<String>,
+    /// The scopes that hold every change since then, or `None` if nothing changed.
+    within: Option<BTreeSet<String>>,
 }
 
-impl Stale {
-    fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.outputs.is_empty()
+impl Tracked {
+    fn add(&mut self, change: DevChange) {
+        if let Some(path) = change.path {
+            self.files.insert(path);
+        }
+        let scopes: BTreeSet<String> = change.scopes.into_iter().collect();
+        self.within = Some(match self.within.take() {
+            Some(within) => within.intersection(&scopes).cloned().collect(),
+            None => scopes,
+        });
     }
 
-    fn message(&self) -> serde_json::Value {
-        json!({"type": "stale", "files": self.files, "outputs": self.outputs})
+    /// The server got a build of the output.
+    fn built(&mut self) {
+        self.received = true;
+        self.files.clear();
+        self.within = None;
     }
+}
+
+/// The `stale` message for the outputs in `tracked` that changed, if any did. `root` is the
+/// project root, which paths are relative to.
+fn stale_message(tracked: &BTreeMap<String, Tracked>, root: &str) -> Option<serde_json::Value> {
+    let mut outputs = serde_json::Map::new();
+    for (name, tracked) in tracked {
+        let Some(within) = &tracked.within else {
+            continue;
+        };
+        // Within no scope is known for an output that the server does not have.
+        let within: Vec<&String> = if tracked.received {
+            within.iter().collect()
+        } else {
+            Vec::new()
+        };
+        let files: Vec<String> = tracked
+            .files
+            .iter()
+            .map(|path| absolute(root, path))
+            .collect();
+        outputs.insert(name.clone(), json!({"within": within, "files": files}));
+    }
+    (!outputs.is_empty()).then(|| json!({"type": "stale", "outputs": outputs}))
+}
+
+/// The absolute path of the project-relative `path`. The empty path is the project root.
+fn absolute(root: &str, path: &str) -> String {
+    if path.is_empty() {
+        return root.to_owned();
+    }
+    Path::new(root).join(path).to_string_lossy().into_owned()
 }
 
 /// The running server, and its connection to `buck2 dev`, if it made one.
@@ -599,14 +646,17 @@ impl ServerLink {
 
     /// Send the result of build `generation`: `built`, `failed` or `cancelled`. Only a
     /// connection that got the build's `building` gets it, so that a server that connected
-    /// during a build is not told about a build it did not hear start.
-    fn send_result(&mut self, generation: u64, message: serde_json::Value) {
+    /// during a build is not told about a build it did not hear start. Returns whether the
+    /// server got it.
+    fn send_result(&mut self, generation: u64, message: serde_json::Value) -> bool {
         if let Some(server) = &mut self.server {
             if server.announced == Some(generation) {
                 server.announced = None;
                 server.send(message);
+                return server.conn.is_some();
             }
         }
+        false
     }
 
     /// Handle what happened on the socket. `hello` is answered at once; requests wait in
@@ -614,8 +664,8 @@ impl ServerLink {
     fn on_event(
         &mut self,
         event: ServerEvent,
-        outputs: &[String],
-        stale: &Stale,
+        info: &DevServer,
+        stale: Option<serde_json::Value>,
     ) -> buck2_error::Result<()> {
         let Some(server) = &mut self.server else {
             return Ok(());
@@ -668,10 +718,11 @@ impl ServerLink {
                         server.send(json!({
                             "type": "ready",
                             "version": PROTOCOL_VERSION,
-                            "outputs": outputs,
+                            "outputs": info.outputs,
+                            "scopes": info.scopes,
                         }));
-                        if !stale.is_empty() {
-                            server.send(stale.message());
+                        if let Some(stale) = stale {
+                            server.send(stale);
                         }
                     }
                     Ok(_) if !introduced => {
@@ -858,17 +909,16 @@ struct Session<'a> {
     /// The digest of each sidecar, by the names of its output and its own, when it was last
     /// built.
     sidecar_digests: BuckMutMap<(String, String), Option<String>>,
-    /// The outputs with `only` that are held back, each with the project-relative paths that
-    /// changed outside its `only`: `buck2 dev` does not build it by itself until the server has
-    /// asked for it. The empty path stands for the project: changes were missed, so any file
-    /// may have changed.
-    held: BTreeMap<String, BTreeSet<String>>,
+    /// The outputs that the running server asked for, by name.
+    tracked: BTreeMap<String, Tracked>,
     /// For each output that was built since `buck2 dev` last asked the daemon about changes:
     /// the paths that had changed by then, and that it has not asked about yet. The build
-    /// used those changes, so they neither hold the output back nor build it again.
+    /// used those changes, so they do not make the output stale.
     fresh: BTreeMap<String, BTreeSet<String>>,
-    /// What the server was last told is stale: `held`.
-    stale: Stale,
+    /// The outputs of builds that the daemon stopped since `buck2 dev` last asked it about
+    /// changes, each with the paths that stopped them. The empty path stands for the project.
+    /// The next answer makes each of them stale, even if it says nothing of them.
+    stopped: BTreeMap<String, BTreeSet<String>>,
     /// Project-relative paths that changed since `buck2 dev` last acted on changes. Each `Watch`
     /// asks about all of them.
     unacted: BTreeSet<String>,
@@ -889,12 +939,6 @@ struct Session<'a> {
     resolve_failure: Option<Vec<String>>,
     /// Changed paths that `buck2 dev` read during a request. They are handled next.
     queued: BTreeSet<String>,
-    /// The outputs and files of a build that the daemon stopped because a file that it builds
-    /// from changed. The next build builds them too.
-    cancelled_outputs: BTreeSet<String>,
-    cancelled_files: BTreeSet<String>,
-    /// The outputs of `cancelled_outputs` that the server asked for.
-    cancelled_requested: BTreeSet<String>,
 }
 
 /// What became of analysing the target again.
@@ -972,9 +1016,9 @@ impl<'a> Session<'a> {
             generation: 0,
             digests: BuckMutMap::default(),
             sidecar_digests: BuckMutMap::default(),
-            held: BTreeMap::new(),
+            tracked: BTreeMap::new(),
             fresh: BTreeMap::new(),
-            stale: Stale::default(),
+            stopped: BTreeMap::new(),
             unacted: BTreeSet::new(),
             resolve_due: false,
             graph_dirty: false,
@@ -983,9 +1027,6 @@ impl<'a> Session<'a> {
             watch_failure: None,
             resolve_failure: None,
             queued: BTreeSet::new(),
-            cancelled_outputs: BTreeSet::new(),
-            cancelled_files: BTreeSet::new(),
-            cancelled_requested: BTreeSet::new(),
         };
         if session.resources_up()? {
             session.spawn().await?;
@@ -1037,7 +1078,8 @@ impl<'a> Session<'a> {
                     self.on_changes(paths).await?;
                 }
                 Some(event) = self.server_rx.recv() => {
-                    self.link.on_event(event, &self.server_info.outputs, &self.stale)?;
+                    let stale = stale_message(&self.tracked, &self.server_info.project_root);
+                    self.link.on_event(event, &self.server_info, stale)?;
                 }
                 status = server_exited(&mut self.link.server) => {
                     self.link.on_exit(status, &mut self.signals).await?;
@@ -1131,42 +1173,26 @@ impl<'a> Session<'a> {
     async fn on_request(&mut self, request: Request) -> buck2_error::Result<()> {
         match request {
             Request::Build { outputs } => {
-                // The graph changed, or the analysis failed, since the server was last built.
-                // This build uses the files as they are, so the server has to be as new as they
-                // are.
+                // From now on, the server hears when these are stale.
+                for name in &outputs {
+                    self.tracked.entry(name.clone()).or_default();
+                }
+                // The graph changed, or the analysis or the server's build failed, since the
+                // server was last built. This build uses the files as they are, so the server has
+                // to be as new as they are.
                 if self.resolve_due {
                     let resolved = self.reresolve(true).await?;
                     if let Some(messages) = resolved.failed {
-                        self.resolve_failure = Some(messages.clone());
-                        // The analysis that the build needs failed: that is how the build went.
-                        self.generation += 1;
-                        let generation = self.generation;
-                        self.link.send_building(
-                            generation,
-                            json!({
-                                "type": "building",
-                                "gen": generation,
-                                "outputs": outputs,
-                                "files": Vec::<String>::new(),
-                            }),
-                        );
-                        self.link.send_result(
-                            generation,
-                            json!({
-                                "type": "failed",
-                                "gen": generation,
-                                "error": messages.join("\n"),
-                            }),
-                        );
-                        self.last_build = Some(("failed", Duration::ZERO));
-                        return Ok(());
-                    }
-                    if resolved.respawned {
+                        // The build goes ahead: if the analysis failed, so does the build, with
+                        // the same errors. If only the server's build failed, the outputs may
+                        // still build.
+                        self.resolve_failure = Some(messages);
+                    } else if resolved.respawned {
                         // The server that asked is gone; the new one asks for what it needs.
                         return Ok(());
                     }
                 }
-                self.build(outputs, Vec::new(), true).await?;
+                self.build(outputs).await?;
             }
             Request::Restart => self.restart().await?,
             // Answered as soon as it arrives.
@@ -1176,13 +1202,12 @@ impl<'a> Session<'a> {
     }
 
     /// Ask the daemon what changed, and act on it. The server's command is built again if it may
-    /// be new, each output that a change calls for is built again, and each output that a
-    /// change holds back is left alone, with every later build of it, until the server asks for
-    /// it.
+    /// be new, and the server hears which of the outputs that it asked for are stale. No output
+    /// is built.
     async fn on_changes(&mut self, paths: BTreeSet<String>) -> buck2_error::Result<()> {
         self.unacted.extend(paths);
         let missed = self.missed;
-        if self.unacted.is_empty() && !missed && self.cancelled_outputs.is_empty() {
+        if self.unacted.is_empty() && !missed && self.stopped.is_empty() {
             return Ok(());
         }
         let request = DevWatchRequest {
@@ -1221,39 +1246,9 @@ impl<'a> Session<'a> {
         // Without a state there is nothing to compare with: the session started without an
         // answer.
         let graph_changed = self.watched.state.is_none() || graph_changed;
-        let relevant = recovered
-            || graph_changed
-            || changes.server
-            || !changes.build.is_empty()
-            || !changes.hold.is_empty();
-
-        // A build since the changes were read has used them already. Not a change to the graph,
-        // though: a new file that a target takes in does not stop a build that is running.
+        let relevant = recovered || graph_changed || changes.server || !changes.outputs.is_empty();
         let fresh = std::mem::take(&mut self.fresh);
-        let is_news = |name: &String, paths: &mut Vec<String>| {
-            let Some(fresh) = fresh.get(name).filter(|_| !graph_changed) else {
-                return true;
-            };
-            let asked = paths.len();
-            paths.retain(|path| !fresh.contains(path));
-            // Without paths, the targets of the output changed.
-            asked == 0 || !paths.is_empty()
-        };
-        let mut hold = changes.hold;
-        hold.retain(is_news);
-        let mut build = changes.build;
-        build.retain(is_news);
-        for (name, paths) in hold {
-            self.held.entry(name).or_default().extend(paths);
-        }
-        self.send_stale();
-        build.retain(|name, _| !self.held.contains_key(name));
-        let files: BTreeSet<String> = build
-            .values()
-            .flatten()
-            .map(|path| self.absolute(path))
-            .collect();
-        let outputs: Vec<String> = build.into_keys().collect();
+        let stopped = std::mem::take(&mut self.stopped);
 
         self.missed = false;
         self.unacted.clear();
@@ -1263,14 +1258,12 @@ impl<'a> Session<'a> {
 
         // The server's command is built again only if it may be new, and a server that exited
         // starts again after a change that is something to it or to an output.
-        let cancelled = !self.cancelled_outputs.is_empty();
-        let start_exited = relevant || cancelled;
         if changes.server
             || recovered
             || self.resolve_due
-            || (self.link.server.is_none() && start_exited)
+            || (self.link.server.is_none() && relevant)
         {
-            let resolved = self.reresolve(start_exited).await?;
+            let resolved = self.reresolve(relevant).await?;
             if let Some(messages) = &resolved.failed {
                 if relevant || self.resolve_failure.as_ref() != Some(messages) {
                     self.send_failed(messages.clone());
@@ -1283,29 +1276,52 @@ impl<'a> Session<'a> {
                 }
             }
             if resolved.respawned {
-                // The new server asks for the outputs it needs.
+                // The new server has asked for nothing, so nothing is stale for it.
                 return Ok(());
             }
         }
-        if !outputs.is_empty() || cancelled {
-            self.build(outputs, files.into_iter().collect(), false)
-                .await?;
+
+        // What the changes are to the outputs that the server asked for.
+        let mut affected = BTreeSet::new();
+        for (name, list) in changes.outputs {
+            let Some(tracked) = self.tracked.get_mut(&name) else {
+                continue;
+            };
+            // A build since the changes were read has used them already. Not a change to the
+            // graph, though: a new file that a target takes in does not stop a build that is
+            // running.
+            let fresh = fresh.get(&name).filter(|_| !graph_changed);
+            for change in list {
+                let used = match (fresh, &change.path) {
+                    (Some(fresh), Some(path)) => fresh.contains(path),
+                    _ => false,
+                };
+                if !used {
+                    tracked.add(change);
+                    affected.insert(name.clone());
+                }
+            }
+        }
+        // A build that the daemon stopped is stale, whatever the answer says of its outputs.
+        for (name, paths) in stopped {
+            let Some(tracked) = self.tracked.get_mut(&name) else {
+                continue;
+            };
+            if affected.insert(name) {
+                for path in paths {
+                    tracked.add(DevChange {
+                        path: Some(path),
+                        scopes: Vec::new(),
+                    });
+                }
+            }
+        }
+        if !affected.is_empty() {
+            if let Some(stale) = stale_message(&self.tracked, &self.server_info.project_root) {
+                self.link.send(stale);
+            }
         }
         Ok(())
-    }
-
-    /// Tell the server about the outputs that are held back, and the files that hold them back,
-    /// if they are not what it was last told.
-    fn send_stale(&mut self) {
-        let held: BTreeSet<&String> = self.held.values().flatten().collect();
-        let stale = Stale {
-            files: held.into_iter().map(|path| self.absolute(path)).collect(),
-            outputs: self.held.keys().cloned().collect(),
-        };
-        if stale != self.stale && !(stale.is_empty() && self.stale.is_empty()) {
-            self.link.send(stale.message());
-        }
-        self.stale = stale;
     }
 
     /// Keep what the daemon said about the targets of the server and the outputs.
@@ -1329,16 +1345,6 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    fn absolute(&self, path: &str) -> String {
-        if path.is_empty() {
-            return self.server_info.project_root.clone();
-        }
-        Path::new(&self.server_info.project_root)
-            .join(path)
-            .to_string_lossy()
-            .into_owned()
-    }
-
     /// Send a request to the daemon, and handle the server while it runs. File changes during
     /// the request do not stop it: `buck2 dev` reads them, and handles them once it is done. Only
     /// the end of the session drops the request, which cancels it in the daemon.
@@ -1355,7 +1361,7 @@ impl<'a> Session<'a> {
             server_info,
             server_rx,
             link,
-            stale,
+            tracked,
             signals,
             ..
         } = &mut *self;
@@ -1372,7 +1378,8 @@ impl<'a> Session<'a> {
                 // The server is not kept waiting while the daemon works. Its requests are handled
                 // after this one.
                 Some(event) = server_rx.recv() => {
-                    link.on_event(event, &server_info.outputs, stale)?;
+                    let stale = stale_message(tracked, &server_info.project_root);
+                    link.on_event(event, server_info, stale)?;
                 }
                 status = server_exited(&mut link.server) => {
                     link.on_exit(status, signals).await?;
@@ -1400,36 +1407,22 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Build `outputs`, and the outputs of a build that the daemon stopped, and tell the server.
-    /// `requested` says that the server asked for `outputs`. An output that is held back is
-    /// built only if the server asked for it, and a build of it lets it go.
-    /// The daemon stops the build if a file that it builds from changes; other changes during
-    /// the build are handled after it.
-    async fn build(
-        &mut self,
-        outputs: Vec<String>,
-        files: Vec<String>,
-        requested: bool,
-    ) -> buck2_error::Result<()> {
-        let mut outputs: BTreeSet<String> = outputs.into_iter().collect();
-        let mut requested = if requested {
-            outputs.clone()
-        } else {
-            BTreeSet::new()
-        };
-        requested.append(&mut self.cancelled_requested);
-        outputs.append(&mut self.cancelled_outputs);
-        // An output that was held back after the build of it that the daemon stopped began.
-        let wanted = outputs.len();
-        outputs.retain(|name| requested.contains(name) || !self.held.contains_key(name));
-        if outputs.is_empty() && wanted != 0 {
-            self.cancelled_files.clear();
-            return Ok(());
-        }
-        let outputs: Vec<String> = outputs.into_iter().collect();
-        let mut files: BTreeSet<String> = files.into_iter().collect();
-        files.append(&mut self.cancelled_files);
-        let files: Vec<String> = files.into_iter().collect();
+    /// Build `outputs`, which the server asked for, and tell the server. An output that it
+    /// gets is no longer stale. The daemon stops the build if a file that it builds from
+    /// changes; other changes during the build are handled after it.
+    async fn build(&mut self, outputs: Vec<String>) -> buck2_error::Result<()> {
+        let outputs: Vec<String> = outputs
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // The changes since the server last got each output.
+        let root = &self.server_info.project_root;
+        let files: BTreeSet<String> = outputs
+            .iter()
+            .filter_map(|name| self.tracked.get(name))
+            .flat_map(|tracked| tracked.files.iter().map(|path| absolute(root, path)))
+            .collect();
         self.generation += 1;
         let generation = self.generation;
         self.link.send_building(
@@ -1463,16 +1456,14 @@ impl<'a> Session<'a> {
                     }),
                 );
                 self.last_build = Some(("failed", started.elapsed()));
-                return Ok(());
             }
             Outcome::Done(DevResponse::Build(built)) => {
                 let mut message = serde_json::Map::new();
                 // The changes that `buck2 dev` has read: the daemon stops a build when a file
                 // that it builds from changes, so this build used them.
                 let known: BTreeSet<String> = self.queued.union(&self.unacted).cloned().collect();
+                let names: Vec<String> = built.outputs.keys().cloned().collect();
                 for (name, output) in built.outputs {
-                    // The server has the output as the files are now.
-                    self.held.remove(&name);
                     self.fresh.insert(name.clone(), known.clone());
                     let key = (output.digest.clone(), output.argv.clone());
                     let changed = self.digests.get(&name) != Some(&key) || output.digest.is_none();
@@ -1509,15 +1500,17 @@ impl<'a> Session<'a> {
                     }
                     message.insert(name, built);
                 }
-                if built.failed.is_empty() {
+                let delivered = if built.failed.is_empty() {
+                    self.last_build = Some(("succeeded", started.elapsed()));
                     self.link.send_result(
                         generation,
                         json!({"type": "built", "gen": generation, "outputs": message}),
-                    );
-                    self.last_build = Some(("succeeded", started.elapsed()));
+                    )
                 } else {
                     // Some outputs built: the server gets them, and the errors of the others,
-                    // whose digests stay those of the last time they built.
+                    // whose digests stay those of the last time they built, and which stay
+                    // stale.
+                    self.last_build = Some(("partly failed", started.elapsed()));
                     self.link.send_result(
                         generation,
                         json!({
@@ -1526,21 +1519,33 @@ impl<'a> Session<'a> {
                             "outputs": message,
                             "failed": built.failed,
                         }),
-                    );
-                    self.last_build = Some(("partly failed", started.elapsed()));
-                    self.send_stale();
-                    return Ok(());
+                    )
+                };
+                if delivered {
+                    // The server has these outputs as the files are now.
+                    for name in names {
+                        if let Some(tracked) = self.tracked.get_mut(&name) {
+                            tracked.built();
+                        }
+                    }
                 }
-                self.send_stale();
             }
             Outcome::Done(DevResponse::Interrupted(interrupted)) => {
-                self.cancelled_outputs.extend(outputs);
-                self.cancelled_files.extend(files);
-                self.cancelled_requested.extend(requested);
                 self.link
                     .send_result(generation, json!({"type": "cancelled", "gen": generation}));
-                // `buck2 dev` has these changes from the file watcher too, but asks about them in
-                // any case.
+                // The outputs are stale once `buck2 dev` has asked about the changes. It has them
+                // from the file watcher too, but asks about them in any case.
+                let paths: Vec<String> = if interrupted.missed {
+                    vec![String::new()]
+                } else {
+                    interrupted.paths.clone()
+                };
+                for name in &outputs {
+                    self.stopped
+                        .entry(name.clone())
+                        .or_default()
+                        .extend(paths.iter().cloned());
+                }
                 self.queued.extend(interrupted.paths);
                 self.missed |= interrupted.missed;
                 self.missed_queued |= interrupted.missed;
@@ -1556,7 +1561,6 @@ impl<'a> Session<'a> {
                     }),
                 );
                 self.last_build = Some(("failed", started.elapsed()));
-                return Ok(());
             }
             // The session is ending: the server is stopping too.
             Outcome::Interrupted => {}
@@ -1715,13 +1719,10 @@ impl<'a> Session<'a> {
         self.link.requests.clear();
         self.digests.clear();
         self.sidecar_digests.clear();
-        self.cancelled_outputs.clear();
-        self.cancelled_files.clear();
-        self.cancelled_requested.clear();
-        // Nothing that the new server has is stale: it has nothing yet.
-        self.held.clear();
+        // The new server has asked for nothing yet.
+        self.tracked.clear();
         self.fresh.clear();
-        self.send_stale();
+        self.stopped.clear();
         if let Err(e) = self.spawn().await {
             self.link.console.message(format!(
                 "{:#}\n`buck2 dev` starts the server again after the next change.",
