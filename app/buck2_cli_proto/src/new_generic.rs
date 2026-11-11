@@ -154,12 +154,11 @@ pub struct DevRequest {
 pub enum DevAction {
     /// Analyse the target and build the server.
     Server,
-    /// Say what each changed path is to the watch sets, and whether the targets of the sets
-    /// changed since an earlier answer. Finding what the sets claim, when the graph changed, may
-    /// build what dynamic actions need to expand `DevWatch.inputs`.
+    /// Say what the changed paths, and the changes to the targets since an earlier answer, are
+    /// to the server and to each output. Finding what they may be built from, when the graph
+    /// changed, may build what dynamic actions need to say what they do.
     Watch(DevWatchRequest),
-    /// Build the named `DevInfo.outputs`. The build stops if a file that it builds from changes,
-    /// whose change does not wait.
+    /// Build the named `DevInfo.outputs`. The build stops if a file that it builds from changes.
     Build { outputs: Vec<String> },
 }
 
@@ -203,58 +202,42 @@ pub struct DevWatchRequest {
     pub paths: Vec<String>,
     /// The `state` of an earlier answer, to say what changed since. `None` at the start.
     pub previous: Option<DevWatchState>,
-    /// Also answer `waiting`: at the start, and when changes were missed.
-    pub all_waiting: bool,
+    /// The file watcher missed changes since `previous`, so anything may have changed.
+    pub missed: bool,
 }
 
-/// Digests that say whether the targets of the watch sets, or the graph, changed. `buck2 dev`
-/// keeps them only to send them back. They say nothing of the contents of source files: the
-/// changed paths do.
+/// Digests that say whether the targets of the server and the outputs, or the graph, changed.
+/// `buck2 dev` keeps them only to send them back. They say nothing of the contents of source
+/// files: the changed paths do.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevWatchState {
-    pub sets: Vec<DevSetState>,
+    /// A digest of each group of the targets that the server and the outputs may be built from.
+    pub targets_digests: Vec<String>,
     /// The `.bzl` files that the graph loads, and their contents.
     pub bzl_digest: String,
     /// The build files of the graph and the `.bzl` files, and their contents.
     pub graph_digest: String,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DevSetState {
-    /// The targets that belong to the set.
-    pub targets_digest: String,
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct DevWatched {
-    /// The `DevInfo.watch` sets, in order.
-    pub watch: Vec<DevWatchSet>,
     pub state: DevWatchState,
-    /// What each of the requested paths is.
-    pub paths: Vec<DevPath>,
-    /// With `all_waiting`: the project-relative paths of the build files and `.bzl` files whose
-    /// change waits. `buck2 dev` keeps them for when the analysis fails, and so cannot say that
-    /// the change to one of them waits.
-    pub waiting: Vec<String>,
-    /// The sets whose targets changed since `previous`, and every set if a `.bzl` file changed.
-    /// Empty without `previous`. A set whose file changed is not here: `paths` says that.
-    pub changed_sets: Vec<usize>,
     /// A build file or a `.bzl` file of the graph, or a target, changed since `previous`, so the
     /// server may build differently.
     pub graph_changed: bool,
-    /// Why some `inputs` could not be expanded, for example because building what a dynamic
-    /// action needs failed. Their sets have the source files of the targets that own those
-    /// inputs and of their dependencies instead. Empty when every input was expanded.
+    /// Why `buck2 dev` could not find everything that the server or some outputs are built
+    /// from, for example because building what a dynamic action needs failed. They have the
+    /// source files of the targets that own their artifacts and of their dependencies instead.
+    /// Empty when everything was found.
     pub incomplete: Vec<String>,
-    /// For a `DevInfo` without `watch`, whose outputs carry the policy: what the requested
-    /// paths, and the changes since `previous`, are to the server and to each output. `watch`,
-    /// `waiting` and `changed_sets` are then empty, and no path has a set or waits.
-    pub outputs: Option<DevOutputChanges>,
+    /// What the requested paths, and the changes since `previous`, are to the server and to
+    /// each output.
+    pub outputs: DevOutputChanges,
 }
 
-/// What changes are to the server and to the outputs of a `DevInfo` without `watch`. Nothing
-/// here is exclusive: one path may be here for the server and for several outputs.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// What changes are to the server and to the outputs. Nothing here is exclusive: one path may be
+/// here for the server and for several outputs.
+#[derive(Default, Serialize, Deserialize)]
 pub struct DevOutputChanges {
     /// The server's command may be built from a requested path, or its targets changed, so it
     /// may be new.
@@ -264,32 +247,12 @@ pub struct DevOutputChanges {
     /// files.
     pub build: BTreeMap<String, Vec<String>>,
     /// The outputs with `only` to hold back, each with the requested paths that call for it:
-    /// the output may be built from them, and they are outside its `only`. With `all_waiting`
-    /// and a `previous`, changes were missed: every output is in `build` or here, the ones
-    /// here with the empty path, which stands for the project.
+    /// the output may be built from them, and they are outside its `only`. With `missed` and
+    /// a `previous`, every output is in `build` or here, the ones here with the empty path,
+    /// which stands for the project.
     pub hold: BTreeMap<String, Vec<String>>,
     /// How many targets the server and the outputs may be built from.
     pub targets: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct DevWatchSet {
-    pub build: Vec<String>,
-    pub restart: bool,
-    pub notify: bool,
-    /// How many targets the set has.
-    pub targets: usize,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct DevPath {
-    /// Project-relative.
-    pub path: String,
-    /// The watch set that claims the file, if one does.
-    pub set: Option<usize>,
-    /// A change to it waits (see the `buck2 dev` docs): it is a file of a `notify` set, a build
-    /// file of a package with a target in one, or a `.bzl` file when there is a `notify` set.
-    pub waits: bool,
 }
 
 #[derive(Serialize, Deserialize)]

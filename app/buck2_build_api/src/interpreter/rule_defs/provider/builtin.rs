@@ -13,7 +13,6 @@
 pub mod default_info;
 pub mod dev_info;
 pub mod dev_output;
-pub mod dev_watch;
 pub mod external_runner_test_info;
 pub mod install_info;
 pub mod internal_runner_test_info;

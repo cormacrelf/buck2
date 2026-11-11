@@ -10,11 +10,13 @@
 
 //! `DevOutput`: one of `DevInfo.outputs`, with the changes after which `buck2 dev` builds it
 //! again by itself, and the other artifacts that are built with it.
-//!
-//! A prototype of the `only` proposal in `dev_review.md`.
 
 use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
+use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
+use buck2_interpreter::types::configured_providers_label::StarlarkProvidersLabel;
+use buck2_interpreter::types::target_label::StarlarkConfiguredTargetLabel;
+use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
@@ -37,13 +39,33 @@ use starlark::values::none::NoneOr;
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueIsInputArtifactAnnotation;
-use crate::interpreter::rule_defs::provider::builtin::dev_watch::target_to_pattern;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
 enum DevOutputError {
     #[error("Sidecar `{name}` of a `DevOutput` must be an artifact, but got `{got}`")]
     ExpectedArtifact { name: String, got: String },
+    #[error("Expected target patterns (strings) or target labels, but got `{0}`")]
+    BadTarget(String),
+}
+
+fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
+    if let Some(s) = value.unpack_str() {
+        return Ok(s.to_owned());
+    }
+    if let Some(label) = value.downcast_ref::<StarlarkTargetLabel>() {
+        return Ok(label.label().to_string());
+    }
+    if let Some(label) = value.downcast_ref::<StarlarkConfiguredTargetLabel>() {
+        return Ok(label.label().unconfigured().to_string());
+    }
+    if let Some(label) = value.downcast_ref::<StarlarkConfiguredProvidersLabel>() {
+        return Ok(label.label().target().unconfigured().to_string());
+    }
+    if let Some(label) = value.downcast_ref::<StarlarkProvidersLabel>() {
+        return Ok(label.label().target().to_string());
+    }
+    Err(DevOutputError::BadTarget(value.to_repr()).into())
 }
 
 /// One of `DevInfo.outputs`, with the changes after which `buck2 dev` builds it again by itself.

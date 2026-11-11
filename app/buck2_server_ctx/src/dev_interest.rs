@@ -12,10 +12,10 @@
 //!
 //! A session subscribes to the file changes that the daemon's file watcher sees. That
 //! subscription takes no lock on the daemon's state, so it cannot ask what a path is to the
-//! session's target. Instead, each `buck2 dev` request that finds what the watch sets claim
-//! leaves a `FileInterest` here, under the name of the session, and the subscription drops the
-//! changes that the interest says cannot matter. The session then asks the daemon only about
-//! the rest.
+//! session's target. Instead, each `buck2 dev` request that finds what the server and the
+//! outputs claim leaves a `FileInterest` here, under the name of the session, and the
+//! subscription drops the changes that the interest says cannot matter. The session then asks
+//! the daemon only about the rest.
 //!
 //! An interest is a summary, and may be out of date: it lets through more than matters, and what
 //! it holds back cannot change what the target is built from without another change that it
@@ -46,8 +46,8 @@ pub struct FileInterest {
     /// The directories above them. Sorted.
     above: Vec<u64>,
     /// Files that matter wherever they are: the build files and `.bzl` files of the graph, and
-    /// the source files that a watch set claims other than as a source file of one of its
-    /// targets. Sorted.
+    /// the source files that the server or an output claims other than as a source file of one
+    /// of its targets. Sorted.
     files: Vec<u64>,
 }
 
@@ -86,8 +86,8 @@ impl FileInterest {
     }
 
     /// Whether `path` is in a package of the graph, or is one of the other files that matter.
-    /// `false` means that no watch set claims it, and that it is no build file or `.bzl` file of
-    /// the graph.
+    /// `false` means that neither the server nor an output claims it, and that it is no build
+    /// file or `.bzl` file of the graph.
     pub fn may_claim(&self, path: &ProjectRelativePath) -> bool {
         if self
             .files
@@ -230,7 +230,7 @@ mod tests {
         assert!(interest.may_claim(path("app/pages/a.txt")));
         // One of the files that matter wherever they are.
         assert!(interest.may_claim(path("defs.bzl")));
-        // Outside the packages: no set claims it, and it cannot change the graph.
+        // Outside the packages: nothing claims it, and it cannot change the graph.
         assert!(!interest.may_matter(path("other/main.txt")));
         assert!(!interest.may_matter(path("libs/b/lib.txt")));
         assert!(!interest.may_matter(path("other.bzl")));
