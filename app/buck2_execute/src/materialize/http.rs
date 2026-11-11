@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allocative::Allocative;
+use base64::Engine;
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::DigestAlgorithmFamily;
 use buck2_common::cas_digest::SHA1_SIZE;
@@ -40,21 +41,91 @@ use pagable::Pagable;
 use sha1::Digest;
 use sha1::Sha1;
 use sha2::Sha256;
+use sha2::Sha384;
+use sha2::Sha512;
 use smallvec::SmallVec;
 
 use crate::digest_config::DigestConfig;
 
+/// What a download must match. `sha1` and `sha256` are lowercase hex and must each match;
+/// `sri` passes if any of its digests matches.
 #[derive(Debug, Clone, Dupe, Allocative, Pagable)]
-pub enum Checksum {
-    Sha1(Arc<str>),
-    Sha256(Arc<str>),
-    Both { sha1: Arc<str>, sha256: Arc<str> },
+pub struct Checksum {
+    sha1: Option<Arc<str>>,
+    sha256: Option<Arc<str>>,
+    sri: Option<Arc<SriChecksum>>,
+}
+
+/// The digests of a Subresource Integrity string that apply: those of its strongest algorithm,
+/// as lowercase hex.
+#[derive(Debug, Allocative, Pagable)]
+struct SriChecksum {
+    algorithm: SriAlgorithm,
+    digests: Vec<Arc<str>>,
+}
+
+/// In order of strength. SHA-1 is not an SRI algorithm, but npm lockfiles still carry it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Allocative, Pagable
+)]
+enum SriAlgorithm {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl SriAlgorithm {
+    fn parse(algorithm: &str) -> Option<Self> {
+        match algorithm.to_ascii_lowercase().as_str() {
+            "sha1" => Some(Self::Sha1),
+            "sha256" => Some(Self::Sha256),
+            "sha384" => Some(Self::Sha384),
+            "sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    fn digest_len(self) -> usize {
+        match self {
+            Self::Sha1 => SHA1_SIZE,
+            Self::Sha256 => SHA256_SIZE,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+
+    fn hasher(self) -> Box<dyn DynDigest + Send> {
+        match self {
+            Self::Sha1 => Box::new(Sha1::new()),
+            Self::Sha256 => Box::new(Sha256::new()),
+            Self::Sha384 => Box::new(Sha384::new()),
+            Self::Sha512 => Box::new(Sha512::new()),
+        }
+    }
+
+    fn digest_family(self) -> Option<DigestAlgorithmFamily> {
+        match self {
+            Self::Sha1 => Some(DigestAlgorithmFamily::Sha1),
+            Self::Sha256 => Some(DigestAlgorithmFamily::Sha256),
+            Self::Sha384 | Self::Sha512 => None,
+        }
+    }
 }
 
 #[derive(buck2_error::Error, Debug)]
 #[buck2(tag = Input)]
 enum DownloadFileError {
-    #[error("Must pass in at least one checksum (e.g. `sha1 = ...`)")]
+    #[error("Must pass in at least one checksum (e.g. `sha1 = ...` or `sri = ...`)")]
     MissingChecksum,
     #[error("Invalid digest for `{digest_type}` argument, expected length of {expected_len} but got {}, digest `{digest}`", digest.len())]
     InvalidDigestLength {
@@ -70,10 +141,72 @@ enum DownloadFileError {
         bad_char: char,
         digest_type: &'static str,
     },
+    #[error(
+        "No usable hash in `sri` `{0}`: expected `<algorithm>-<base64 digest>` with algorithm sha512, sha384, sha256 or sha1"
+    )]
+    SriNothingUsable(String),
+    #[error(
+        "Invalid `sri` hash `{hash}`: a {algorithm} digest is {expected_len} bytes of base64, which this is not"
+    )]
+    SriInvalidDigest {
+        hash: String,
+        algorithm: &'static str,
+        expected_len: usize,
+    },
+}
+
+/// Parse a Subresource Integrity string as the W3C spec does
+/// (<https://www.w3.org/TR/SRI/#parse-metadata>), then keep the hashes of its strongest
+/// algorithm (<https://www.w3.org/TR/SRI/#get-the-strongest-metadata>).
+///
+/// The string is a whitespace-separated list of `<algorithm>-<base64 digest>[?<options>]`.
+/// Options are ignored, as are hashes whose algorithm is unknown or that have no `-`. A hash of
+/// a known algorithm whose digest is not base64 of the right length can never match, so it is
+/// an error here rather than a failed download later.
+fn parse_sri(sri: &str) -> buck2_error::Result<SriChecksum> {
+    let mut strongest: Option<SriChecksum> = None;
+    for hash in sri.split_ascii_whitespace() {
+        let hash_without_options = hash.split_once('?').map_or(hash, |(h, _)| h);
+        let Some((algorithm, digest)) = hash_without_options.split_once('-') else {
+            continue;
+        };
+        let Some(algorithm) = SriAlgorithm::parse(algorithm) else {
+            continue;
+        };
+        let invalid = || DownloadFileError::SriInvalidDigest {
+            hash: hash.to_owned(),
+            algorithm: algorithm.name(),
+            expected_len: algorithm.digest_len(),
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(digest)
+            .map_err(|_| invalid())?;
+        if bytes.len() != algorithm.digest_len() {
+            return Err(invalid().into());
+        }
+        let digest = Arc::from(hex::encode(bytes));
+        match &mut strongest {
+            Some(s) if s.algorithm == algorithm => s.digests.push(digest),
+            Some(s) if s.algorithm > algorithm => {}
+            _ => {
+                strongest = Some(SriChecksum {
+                    algorithm,
+                    digests: vec![digest],
+                })
+            }
+        }
+    }
+    strongest.ok_or_else(|| DownloadFileError::SriNothingUsable(sri.to_owned()).into())
 }
 
 impl Checksum {
-    pub fn new(sha1: Option<&str>, sha256: Option<&str>) -> buck2_error::Result<Self> {
+    /// `sha1` and `sha256` are hex. `sri` is a Subresource Integrity string, as npm lockfiles
+    /// carry in `integrity`; see [`parse_sri`].
+    pub fn new(
+        sha1: Option<&str>,
+        sha256: Option<&str>,
+        sri: Option<&str>,
+    ) -> buck2_error::Result<Self> {
         fn is_hex_digit(x: char) -> bool {
             let x = x.to_ascii_lowercase();
             x.is_ascii_digit() || ('a'..='f').contains(&x)
@@ -109,30 +242,42 @@ impl Checksum {
             }
         }
 
-        match (
-            validate_digest(sha1, SHA1_SIZE, "sha1")?,
-            validate_digest(sha256, SHA256_SIZE, "sha256")?,
-        ) {
-            (Some(sha1), None) => Ok(Checksum::Sha1(sha1)),
-            (None, Some(sha256)) => Ok(Checksum::Sha256(sha256)),
-            (Some(sha1), Some(sha256)) => Ok(Checksum::Both { sha1, sha256 }),
-            (None, None) => Err(DownloadFileError::MissingChecksum.into()),
+        let checksum = Checksum {
+            sha1: validate_digest(sha1, SHA1_SIZE, "sha1")?,
+            sha256: validate_digest(sha256, SHA256_SIZE, "sha256")?,
+            sri: sri.map(parse_sri).transpose()?.map(Arc::new),
+        };
+        if checksum.sha1.is_none() && checksum.sha256.is_none() && checksum.sri.is_none() {
+            return Err(DownloadFileError::MissingChecksum.into());
         }
+        Ok(checksum)
     }
 
+    /// The one SHA-1 the content must have, if there is one: the `sha1` argument, or else an
+    /// `sri` whose strongest hashes are a single SHA-1.
     pub fn sha1(&self) -> Option<&str> {
-        match self {
-            Self::Sha1(sha1) => Some(sha1),
-            Self::Sha256(..) => None,
-            Self::Both { sha1, .. } => Some(sha1),
-        }
+        self.sha1
+            .as_deref()
+            .or_else(|| self.sri_single(SriAlgorithm::Sha1))
     }
 
+    /// As [`Self::sha1`], for SHA-256.
     pub fn sha256(&self) -> Option<&str> {
-        match self {
-            Self::Sha1(..) => None,
-            Self::Sha256(sha256) => Some(sha256),
-            Self::Both { sha256, .. } => Some(sha256),
+        self.sha256
+            .as_deref()
+            .or_else(|| self.sri_single(SriAlgorithm::Sha256))
+    }
+
+    fn sri_single(&self, algorithm: SriAlgorithm) -> Option<&str> {
+        match self.sri.as_deref() {
+            Some(SriChecksum {
+                algorithm: a,
+                digests,
+            }) if *a == algorithm => match &**digests {
+                [digest] => Some(digest),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -327,26 +472,38 @@ async fn copy_and_hash(
         ExtraDigest(Box<dyn DynDigest + Send>),
     }
 
-    let mut validators = SmallVec::<[_; 2]>::new();
+    // Reuse the `FileDigest::digester` when it computes the same hash.
+    let validator = |algorithm: SriAlgorithm| match algorithm.digest_family() {
+        Some(family) if family == digester.algorithm() => Validator::PrimaryDigest,
+        _ => Validator::ExtraDigest(algorithm.hasher()),
+    };
 
-    if let Some(sha1) = checksum.sha1() {
-        let validator = if digester.algorithm() == DigestAlgorithmFamily::Sha1 {
-            Validator::PrimaryDigest
-        } else {
-            Validator::ExtraDigest(Box::new(Sha1::new()) as _)
-        };
-
-        validators.push((validator, sha1, "sha1"));
+    // Each entry passes if the content's digest is any of `expected`. Only an `sri` gives more
+    // than one; its digests are shown in SRI form, the form they were given in.
+    let mut validators = SmallVec::<[(Validator, &[Arc<str>], &'static str, bool); 3]>::new();
+    if let Some(sha1) = &checksum.sha1 {
+        validators.push((
+            validator(SriAlgorithm::Sha1),
+            std::slice::from_ref(sha1),
+            "sha1",
+            false,
+        ));
     }
-
-    if let Some(sha256) = checksum.sha256() {
-        let validator = if digester.algorithm() == DigestAlgorithmFamily::Sha256 {
-            Validator::PrimaryDigest
-        } else {
-            Validator::ExtraDigest(Box::new(Sha256::new()) as _)
-        };
-
-        validators.push((validator, sha256, "sha256"));
+    if let Some(sha256) = &checksum.sha256 {
+        validators.push((
+            validator(SriAlgorithm::Sha256),
+            std::slice::from_ref(sha256),
+            "sha256",
+            false,
+        ));
+    }
+    if let Some(sri) = checksum.sri.as_deref() {
+        validators.push((
+            validator(sri.algorithm),
+            &sri.digests,
+            sri.algorithm.name(),
+            true,
+        ));
     }
 
     let mut buff = DebugBuffer::new(512);
@@ -366,7 +523,7 @@ async fn copy_and_hash(
             .map_err(HttpDownloadError::IoError)?;
 
         digester.update(&chunk);
-        for (validator, _expected, _kind) in validators.iter_mut() {
+        for (validator, ..) in validators.iter_mut() {
             if let Validator::ExtraDigest(hasher) = validator {
                 hasher.update(&chunk);
             }
@@ -380,13 +537,30 @@ async fn copy_and_hash(
     let digest = digester.finalize();
 
     // Validate
-    for (validator, expected, kind) in validators {
+    for (validator, expected, kind, sri) in validators {
         let obtained = match validator {
             Validator::PrimaryDigest => digest.raw_digest().to_string(),
             Validator::ExtraDigest(hasher) => hex::encode(hasher.finalize()),
         };
 
-        if expected != obtained {
+        if !expected.iter().any(|e| **e == *obtained) {
+            let show = |hex_digest: &str| {
+                if sri {
+                    let bytes = hex::decode(hex_digest).unwrap_or_default();
+                    format!(
+                        "{kind}-{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    )
+                } else {
+                    hex_digest.to_owned()
+                }
+            };
+            let expected = expected
+                .iter()
+                .map(|e| show(e))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            let obtained = show(&obtained);
             let debug = Box::new(MaybeResponseDebugInfo {
                 bytes_seen: buff.bytes_seen,
                 buff: buff.to_utf8().map(ToOwned::to_owned),
@@ -397,7 +571,7 @@ async fn copy_and_hash(
             if is_vpnless {
                 return Err(HttpDownloadError::MaybeNotAllowedOnVpnless {
                     kind,
-                    want: expected.to_owned(),
+                    want: expected,
                     got: obtained,
                     url: url.to_owned(),
                     debug,
@@ -405,7 +579,7 @@ async fn copy_and_hash(
             }
             return Err(HttpDownloadError::InvalidChecksum {
                 digest_kind: kind,
-                expected: expected.to_owned(),
+                expected,
                 obtained,
                 url: url.to_owned(),
                 debug,
@@ -518,6 +692,32 @@ mod tests {
 
     use super::*;
 
+    // SRI hashes of `foobar`, the content `do_test` streams, and of the empty string.
+    const FOOBAR_SHA1: &str = "sha1-iEPX+SQWIR3p67lj/0zigSWTKHg=";
+    const FOOBAR_SHA256: &str = "sha256-w6uP8Tcg6K2QR905Rms8iXTlksL6OD1KOWBxTK7wxPI=";
+    const FOOBAR_SHA384: &str =
+        "sha384-PJww2fZl501RXIQpYNSkUcg6ASX9Pec5LXs3IxrxDHLqWK7fzfiaV2W/kCr5Ps8G";
+    const FOOBAR_SHA512: &str = "sha512-ClAmHr0aOQ/tK/Mm8mc8FFWCpjQtUjIElz0CGTN/gWFqgGmwElh89WNfaSXxtWw2AjDBmyc1AO4BPgMGAb8kJQ==";
+    const EMPTY_SHA256: &str = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+    const EMPTY_SHA512: &str = "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==";
+
+    // Unvalidated, so a test can expect a digest that is not even hex.
+    fn checksum_sha1(sha1: &str) -> Checksum {
+        Checksum {
+            sha1: Some(Arc::from(sha1)),
+            sha256: None,
+            sri: None,
+        }
+    }
+
+    fn checksum_sha256(sha256: &str) -> Checksum {
+        Checksum {
+            sha1: None,
+            sha256: Some(Arc::from(sha256)),
+            sri: None,
+        }
+    }
+
     async fn do_test(
         digest_config: CasDigestConfig,
         checksum: &Checksum,
@@ -543,12 +743,11 @@ mod tests {
     async fn test_copy_and_hash_ok() -> buck2_error::Result<()> {
         let (digest, bytes) = do_test(
             testing::blake3(),
-            &Checksum::Both {
-                sha1: Arc::from("8843d7f92416211de9ebb963ff4ce28125932878"),
-                sha256: Arc::from(
-                    "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2",
-                ),
-            },
+            &Checksum::new(
+                Some("8843d7f92416211de9ebb963ff4ce28125932878"),
+                Some("c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"),
+                Some(FOOBAR_SHA512),
+            )?,
         )
         .await?;
 
@@ -585,7 +784,7 @@ mod tests {
             stream::iter(vec![Ok(Bytes::from("foo")), Ok(Bytes::from("bar"))]),
             ShortWriter(&mut out),
             testing::sha1(),
-            &Checksum::Sha1(Arc::from("8843d7f92416211de9ebb963ff4ce28125932878")),
+            &checksum_sha1("8843d7f92416211de9ebb963ff4ce28125932878"),
             false,
         )
         .await?;
@@ -598,12 +797,12 @@ mod tests {
     #[tokio::test]
     async fn test_copy_and_hash_invalid_primary_hash() -> buck2_error::Result<()> {
         assert_matches!(
-            do_test(testing::sha1(), &Checksum::Sha1(Arc::from("oops"))).await,
+            do_test(testing::sha1(), &checksum_sha1("oops")).await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
         assert_matches!(
-            do_test(testing::sha256(), &Checksum::Sha256(Arc::from("oops"))).await,
+            do_test(testing::sha256(), &checksum_sha256("oops")).await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
@@ -613,16 +812,112 @@ mod tests {
     #[tokio::test]
     async fn test_copy_and_hash_invalid_secondary_hash() -> buck2_error::Result<()> {
         assert_matches!(
-            do_test(testing::blake3(), &Checksum::Sha1(Arc::from("oops"))).await,
+            do_test(testing::blake3(), &checksum_sha1("oops")).await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
         assert_matches!(
-            do_test(testing::blake3(), &Checksum::Sha256(Arc::from("oops"))).await,
+            do_test(testing::blake3(), &checksum_sha256("oops")).await,
             Err(HttpDownloadError::InvalidChecksum { .. })
         );
 
         Ok(())
+    }
+
+    fn sri(sri: &str) -> Checksum {
+        Checksum::new(None, None, Some(sri)).unwrap()
+    }
+
+    async fn sri_passes(sri_str: &str) -> bool {
+        match do_test(testing::sha1(), &sri(sri_str)).await {
+            Ok(_) => true,
+            Err(HttpDownloadError::InvalidChecksum { .. }) => false,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_sri() {
+        // Each algorithm on its own.
+        assert!(sri_passes(FOOBAR_SHA512).await);
+        assert!(sri_passes(FOOBAR_SHA384).await);
+        assert!(sri_passes(FOOBAR_SHA256).await);
+        assert!(sri_passes(FOOBAR_SHA1).await);
+        assert!(!sri_passes(EMPTY_SHA512).await);
+
+        // Only the strongest algorithm counts: a wrong sha256 beside a right sha512 is not
+        // checked, and a right sha256 beside a wrong sha512 does not help.
+        assert!(sri_passes(&format!("{EMPTY_SHA256} {FOOBAR_SHA512}")).await);
+        assert!(!sri_passes(&format!("{FOOBAR_SHA256} {EMPTY_SHA512}")).await);
+        assert!(sri_passes(&format!("{EMPTY_SHA256}\t{FOOBAR_SHA384}")).await);
+        assert!(!sri_passes(&format!("{FOOBAR_SHA384}\n{EMPTY_SHA512}")).await);
+
+        // Any digest of the strongest algorithm may match.
+        assert!(sri_passes(&format!("{EMPTY_SHA512} {FOOBAR_SHA512}")).await);
+        assert!(sri_passes(&format!("{FOOBAR_SHA512} {EMPTY_SHA512}")).await);
+
+        // Options are ignored, and so are tokens of unknown algorithms or no algorithm at all.
+        assert!(sri_passes(&format!("{FOOBAR_SHA512}?foo=bar")).await);
+        assert!(sri_passes(&format!("md5-AAAA {FOOBAR_SHA256} junk")).await);
+        assert!(!sri_passes(&format!("{EMPTY_SHA256} sha1024-AAAA")).await);
+        // Algorithm names are not case-sensitive.
+        assert!(sri_passes(&FOOBAR_SHA512.replacen("sha512", "SHA512", 1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_copy_and_hash_sri_mismatch_is_reported_in_sri_form() {
+        let e = do_test(
+            testing::sha1(),
+            &sri(&format!("{EMPTY_SHA512} {EMPTY_SHA512}")),
+        )
+        .await
+        .unwrap_err();
+        assert_matches!(
+            &e,
+            HttpDownloadError::InvalidChecksum { digest_kind: "sha512", expected, obtained, .. }
+                if *expected == format!("{EMPTY_SHA512} or {EMPTY_SHA512}") && obtained == FOOBAR_SHA512
+        );
+    }
+
+    #[test]
+    fn test_sri_single_digest_names_the_content() -> buck2_error::Result<()> {
+        // A single sha1 or sha256 is as good as the hex argument for naming the content.
+        assert_eq!(
+            sri(FOOBAR_SHA1).sha1(),
+            Some("8843d7f92416211de9ebb963ff4ce28125932878")
+        );
+        assert_eq!(
+            sri(FOOBAR_SHA256).sha256(),
+            Some("c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2")
+        );
+        // Not when it is outranked, or when it is one of several.
+        assert_eq!(sri(&format!("{FOOBAR_SHA1} {FOOBAR_SHA512}")).sha1(), None);
+        assert_eq!(
+            sri(&format!("{FOOBAR_SHA256} {EMPTY_SHA256}")).sha256(),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sri_rejects() {
+        for (sri, wanted) in [
+            ("", "No usable hash"),
+            ("   ", "No usable hash"),
+            ("sha512", "No usable hash"),
+            ("md5-rL0Y20zC+Fzt72VPzMSk2A==", "No usable hash"),
+            ("sha512-not*base64", "a sha512 digest is 64 bytes of base64"),
+            (
+                FOOBAR_SHA1.replacen("sha1", "sha512", 1).leak(),
+                "a sha512 digest is 64 bytes of base64",
+            ),
+        ] {
+            let e = Checksum::new(None, None, Some(sri)).expect_err(sri);
+            let e = format!("{e:#}");
+            assert!(e.contains(wanted), "`{sri}` gave `{e}`, wanted `{wanted}`");
+        }
+        let e = Checksum::new(None, None, None).unwrap_err();
+        assert!(format!("{e:#}").contains("at least one checksum"), "{e:#}");
     }
 
     #[test]

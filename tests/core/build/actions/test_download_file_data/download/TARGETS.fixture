@@ -7,6 +7,7 @@ download(
     url = read_config("test", "url"),
     sha1 = read_config("test", "sha1"),
     sha256 = read_config("test", "sha256"),
+    sri = read_config("test", "sri"),
     size_bytes = declared_size(),
 )
 
@@ -16,6 +17,7 @@ download(
     url = read_config("test", "url"),
     sha1 = read_config("test", "sha1"),
     sha256 = read_config("test", "sha256"),
+    sri = read_config("test", "sri"),
     size_bytes = declared_size(),
 )
 
@@ -25,6 +27,7 @@ download(
     url = read_config("test", "url"),
     sha1 = read_config("test", "sha1"),
     sha256 = read_config("test", "sha256"),
+    sri = read_config("test", "sri"),
     size_bytes = declared_size(),
 )
 

@@ -17,6 +17,7 @@ def _download_impl(ctx: AnalysisContext):
         ctx.attrs.url,
         sha1 = ctx.attrs.sha1,
         sha256 = ctx.attrs.sha256,
+        sri = ctx.attrs.sri,
         size_bytes = ctx.attrs.size_bytes,
         has_content_based_path = ctx.attrs.has_content_based_path,
     )
@@ -29,6 +30,7 @@ download = rule(
         "sha1": attrs.option(attrs.string(), default = None),
         "sha256": attrs.option(attrs.string(), default = None),
         "size_bytes": attrs.option(attrs.int(), default = None),
+        "sri": attrs.option(attrs.string(), default = None),
         "url": attrs.string(),
     },
 )

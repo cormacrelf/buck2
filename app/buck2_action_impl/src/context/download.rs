@@ -44,10 +44,20 @@ enum CasArtifactError {
 #[starlark_module]
 pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
     /// Downloads a URL to an output (filename as string or output artifact). The file at the URL
-    /// must have the given sha1 or the command will fail. The optional parameter is_executable
-    /// indicates whether the resulting file should be marked with executable permissions.
-    /// (Meta-internal) The optional parameter vpnless_url indicates a url from which this resource
-    /// can be downloaded off VPN; this has the same restrictions as `url` above.
+    /// must match every checksum given or the command will fail; at least one is required.
+    ///
+    /// * `sha1`, `sha256`: hex digests.
+    /// * `sri`: a [Subresource Integrity](https://www.w3.org/TR/SRI/) string, such as the
+    ///   `integrity` of an npm, pnpm or yarn lockfile entry: `sha512-<base64 digest>`. As the
+    ///   spec says, it may list several whitespace-separated hashes; only those of the strongest
+    ///   algorithm present (sha512, then sha384, sha256, and sha1, which npm still uses) are
+    ///   checked, and the file passes if it matches any of them. `?options` are ignored, as are
+    ///   hashes of unknown algorithms, but at least one usable hash must be left. A hash of a
+    ///   known algorithm whose digest is not base64 of the right length is an error.
+    /// * `is_executable`: whether the resulting file should be marked with executable
+    ///   permissions.
+    /// * `vpnless_url` (Meta-internal): a url from which this resource can be downloaded off
+    ///   VPN; this has the same restrictions as `url` above.
     fn download_file<'v>(
         this: &AnalysisActions<'v>,
         #[starlark(require = pos)] output: OutputArtifactArg<'v>,
@@ -55,6 +65,7 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] vpnless_url: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] sha1: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] sha256: NoneOr<&str>,
+        #[starlark(require = named, default = NoneOr::None)] sri: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] size_bytes: NoneOr<u64>,
         #[starlark(require = named, default = false)] is_executable: bool,
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
@@ -68,7 +79,7 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
             has_content_based_path.into_option(),
         )?;
 
-        let checksum = Checksum::new(sha1.into_option(), sha256.into_option())?;
+        let checksum = Checksum::new(sha1.into_option(), sha256.into_option(), sri.into_option())?;
 
         this.register_action(
             buck_mut_insertion_set![output_artifact],

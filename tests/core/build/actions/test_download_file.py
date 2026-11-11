@@ -10,6 +10,7 @@
 
 
 import asyncio
+import base64
 import hashlib
 import socket
 from typing import List, Optional
@@ -27,6 +28,7 @@ def configs(
     *,
     sha1: Optional[str] = None,
     sha256: Optional[str] = None,
+    sri: Optional[str] = None,
     size: Optional[int] = None,
 ) -> List[str]:
     """`-c` arguments declaring the download the fixture's targets read from the config."""
@@ -35,6 +37,8 @@ def configs(
         args += ["-c", f"test.sha1={sha1}"]
     if sha256 is not None:
         args += ["-c", f"test.sha256={sha256}"]
+    if sri is not None:
+        args += ["-c", f"test.sri={sri}"]
     if size is not None:
         args += ["-c", f"test.size_bytes={size}"]
     return args
@@ -42,6 +46,12 @@ def configs(
 
 def sha256_hex(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def sri(algorithm: str, content: bytes) -> str:
+    """A Subresource Integrity hash, as npm lockfiles carry in `integrity`."""
+    digest = hashlib.new(algorithm, content).digest()
+    return f"{algorithm}-{base64.b64encode(digest).decode()}"
 
 
 def use_fbsource_digests(buck: Buck) -> None:
@@ -59,7 +69,19 @@ async def build_and_read(buck: Buck, target: str, *args: str) -> bytes:
 class DownloadFileTest(BuckTestCase):
     @buck_test(data_dir="download", skip_for_os=["windows"])
     @parametrize(
-        "shape", ["sha1", "sha256", "both", "both_with_size", "sha1_uppercase"]
+        "shape",
+        [
+            "sha1",
+            "sha256",
+            "both",
+            "both_with_size",
+            "sha1_uppercase",
+            "sri_sha512",
+            "sri_sha256",
+            "sri_sha1",
+            "sri_sha512_with_sha1",
+            "sri_strongest_of_several",
+        ],
     )
     async def test_downloads_declared_each_way(self, buck: Buck, shape: str) -> None:
         content = random_string().encode()
@@ -71,6 +93,17 @@ class DownloadFileTest(BuckTestCase):
             "both": configs("", sha1=sha1, sha256=sha256),
             "both_with_size": configs("", sha1=sha1, sha256=sha256, size=len(content)),
             "sha1_uppercase": configs("", sha1=sha1.upper()),
+            "sri_sha512": configs("", sri=sri("sha512", content)),
+            "sri_sha256": configs("", sri=sri("sha256", content)),
+            "sri_sha1": configs("", sri=sri("sha1", content)),
+            "sri_sha512_with_sha1": configs(
+                "", sha1=sha1, sri=sri("sha512", content)
+            ),
+            # Only the strongest algorithm is checked, so the wrong sha256 is not.
+            "sri_strongest_of_several": configs(
+                "",
+                sri=f"{sri('sha256', b'')} {sri('sha384', content)}?opt md5-AAAA",
+            ),
         }[shape][2:]
         async with StaticHttpServer({"/file": content}) as server:
             assert (
@@ -226,6 +259,10 @@ class DownloadFileTest(BuckTestCase):
                 buck.build("//:download", *configs(url, sha1="xxxxxx")),
                 stderr_regex="Invalid digest for `sha1` argument",
             )
+            await expect_failure(
+                buck.build("//:download", *configs(url, sri="md5-AAAA")),
+                stderr_regex="No usable hash in `sri`",
+            )
             # Nothing was fetched for those.
             assert server.count("GET", "/file") == 0
 
@@ -257,6 +294,20 @@ class DownloadFileTest(BuckTestCase):
                     "//:download", *configs(url, sha1=sha1_hex(content), sha256=zeros64)
                 ),
                 stderr_regex="Invalid sha256 digest",
+            )
+            await expect_failure(
+                buck.build("//:download", *configs(url, sri=sri("sha512", b""))),
+                stderr_regex="Invalid sha512 digest",
+            )
+            # A right sha256 does not make up for a wrong sha512.
+            await expect_failure(
+                buck.build(
+                    "//:download",
+                    *configs(
+                        url, sri=f"{sri('sha256', content)} {sri('sha512', b'')}"
+                    ),
+                ),
+                stderr_regex="Invalid sha512 digest",
             )
 
     @buck_test(data_dir="download")
