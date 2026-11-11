@@ -21,7 +21,8 @@ of `app`, and `built` says where each one is and whether it changed: the server 
 changed ones, and reads and compares nothing. Vite sees those writes and updates the
 browser with hot module replacement. When `packages` changes, the server starts Vite again.
 
-Vite runs in this server's process group, so `buck2 dev` stops it with the server.
+Vite runs in this server's process group, so `buck2 dev` stops it with the server. The
+arguments after `--` go to Vite: `buck2 dev //app:app -- --host` passes `--host`.
 """
 
 import argparse
@@ -79,8 +80,10 @@ def sync(files, dst):
 
 
 class Vite:
-    def __init__(self, port):
+    def __init__(self, port, args):
         self.port = port
+        # Arguments for Vite, from the command line.
+        self.args = args
         self.process = None
 
     def start(self, packages):
@@ -90,13 +93,17 @@ class Vite:
             os.remove(link)
         os.symlink(os.path.join(packages, "node_modules"), link)
         vite = os.path.join(packages, "node_modules", "vite", "bin", "vite.js")
-        log("starting Vite on http://localhost:%d/" % self.port)
+        argv = ["node", vite]
+        # Vite takes an option given twice as a list, so a `--port` of the user's replaces this
+        # server's.
+        if any(arg == "--port" or arg.startswith("--port=") for arg in self.args):
+            log("starting Vite")
+        else:
+            log("starting Vite on http://localhost:%d/" % self.port)
+            argv += ["--port", str(self.port), "--strictPort"]
         # Vite inherits the terminal, which `DevInfo(interactive = True)` gives this server, so
         # its keyboard shortcuts work.
-        self.process = subprocess.Popen(
-            ["node", vite, "--port", str(self.port), "--strictPort"],
-            cwd=STAGE,
-        )
+        self.process = subprocess.Popen(argv + self.args, cwd=STAGE)
 
     def stop(self):
         if self.process is not None and self.process.poll() is None:
@@ -108,12 +115,13 @@ class Vite:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5173)
+    parser.add_argument("vite_args", nargs="*", help="arguments for Vite, after `--`")
     args = parser.parse_args()
 
     # `buck2 dev` may stop this server with SIGTERM. Exit through the `finally` below, which
     # stops Vite.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    vite = Vite(int(os.environ.get("PORT", args.port)))
+    vite = Vite(int(os.environ.get("PORT", args.port)), args.vite_args)
     packages = None
     have_app = False
     conn = connect_to_buck2_dev()

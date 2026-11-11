@@ -10,7 +10,9 @@ the new module, and the page keeps its state (the click count).
 buck2 dev //app:app
 ```
 
-Open <http://localhost:5173/>. To use another port, set `PORT`.
+Open <http://localhost:5173/>. To use another port, set `PORT`. Arguments after
+`--` go to Vite, so `buck2 dev //app:app -- --host --open` serves on the network
+and opens a browser, and `-- --port 3000` serves on port 3000.
 
 You need `pnpm` and `node` on your `PATH`, and network access: the
 `//node:packages` target runs `pnpm install` in a local build action. That is a

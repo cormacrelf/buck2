@@ -75,11 +75,14 @@ def _vite_app_impl(ctx):
     app = ctx.actions.symlinked_dir("app", files)
     packages = ctx.attrs.packages[DefaultInfo].default_outputs[0]
 
+    # `buck2 dev //app:app -- ARGS` appends ARGS after the `--`, and the server passes them
+    # to Vite.
     server = cmd_args(
         "python3",
         ctx.attrs.server[DefaultInfo].default_outputs[0],
         "--port",
         str(ctx.attrs.port),
+        "--",
     )
     return [
         DefaultInfo(default_output = app),
