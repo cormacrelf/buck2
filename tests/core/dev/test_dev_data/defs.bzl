@@ -13,12 +13,12 @@ ConcatOuts = transitive_set(args_projections = {"out": lambda out: out})
 
 def _concat_output(ctx, name, inputs = None):
     """Concatenate the outputs of `deps` and then `srcs`, or `inputs` if given, after sleeping
-    for the number of seconds in `delay` if it is set. The action fails if a line of the result
-    starts with `FAIL`."""
+    for the number of seconds in `delay` if it is set and `inputs` is not. The action fails if a
+    line of the result starts with `FAIL`."""
     out = ctx.actions.declare_output(name, has_content_based_path = False)
+    delay = ctx.attrs.delay if ctx.attrs.delay and inputs == None else "/dev/null"
     if inputs == None:
         inputs = [d[ConcatInfo].out for d in ctx.attrs.deps] + ctx.attrs.srcs
-    delay = ctx.attrs.delay if ctx.attrs.delay else "/dev/null"
     ctx.actions.run(
         cmd_args(
             "sh",

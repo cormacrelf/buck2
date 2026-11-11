@@ -235,8 +235,9 @@ decides what to do, usually to ask for some of the outputs with `build`.
 
 - `stale` comes after every change that may affect a tracked output, also when
   it says what the last one said, such as after a file was saved twice.
-- `built` for an output clears its changes. An output that is in `built.failed`,
-  or whose build was `failed` or `cancelled`, keeps them.
+- `built` for an output clears its changes, unless the server asked for it with
+  `stale_until_ack` (see below). An output that is in `built.failed`, or whose build was
+  `failed` or `cancelled` before the server got it, keeps them.
 - A build does not send `stale`: the server got `built`, and knows.
 - An output that the server never asked for is never in `stale`, and never
   built.
@@ -253,6 +254,26 @@ A build that the daemon stops, because a file that it uses changed, ends in
 `cancelled`. The change makes its outputs stale, so `stale` follows once
 `buck2 dev` has looked at the change. A server needs one rule: on `stale`,
 decide, and send `build`.
+
+### Saying when the server has an output
+
+Getting an output is not always having it: a patch can fail to load, and an app
+can take a while to start. A server that wants its outputs to stay stale until
+it has them sends `build` with `"stale_until_ack": true`. Their changes then
+stay, after `built` too, until the server sends `ack`:
+
+```json
+{"type": "ack", "gen": 7, "outputs": ["exe", "patch"]}
+```
+
+`ack` says that the server is up to date with these outputs as build `gen` left
+them: the changes that `buck2 dev` had heard of when that build started no longer
+make them stale, and those since still do. The outputs need not be ones that
+the build built. A server that loads patches into a program asks for `exe`, and
+once the new program runs, it has every change that `patch` had too, so it sends
+`ack` for both. `ack` works whether or not the build asked for
+`stale_until_ack`, and has no answer. `buck2 dev` reports an `ack` for a build that has not started, or for a
+name that is not an output, and ignores it.
 
 ## Scopes
 
@@ -578,17 +599,26 @@ console, and prints only errors and that the server exited or restarts.
 | `ready`         | `version`: as in `hello`, `outputs`: the names in `DevInfo.outputs`, `scopes`: the names in `DevInfo.scopes` | The server sent `hello` with a version that `buck2 dev` speaks.          |
 | `unsupported`   | `versions`: the versions that `buck2 dev` speaks          | The server sent `hello` with another version.                                                                |
 | `building`      | `gen`, `outputs`: names, `files`: the changes of these outputs since the server got them | The server asked for a build, and it starts.                                     |
-| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
-| `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
-| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. Its outputs are in the next `stale`.             |
+| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), `failed`: name to error if some outputs failed, and `last_of_generation` | A build of at least one output succeeded, or, for a streaming build, an output finished. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. `last_of_generation` is true on the last `built` of the build. |
+| `failed`        | `gen`, `error`                                            | A build of every output, unless it streams, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
+| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. Its outputs that the server did not get are in the next `stale`. |
 | `stale`         | `outputs`: name to `{within, files}`, for each output that the server asked for and that changes since it got it may affect. `within`: the scopes that hold all of those changes. `files`: the changed files, absolute | Files changed that may affect an output that the server asked for. After missed changes the project root is in `files`. See [Stale outputs](#stale-outputs) and [Scopes](#scopes). |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
 
 `gen` is a number that increases with each build. `building` and `built` for
-the same build have the same `gen`. A
-`building` is followed by one of `built`, `failed` and `cancelled`, unless
-`buck2 dev` exits first. A server gets `built`, `failed` or `cancelled` for a
+the same build have the same `gen`. A `building` is followed by a `built` whose
+`last_of_generation` is true, or by `failed` or `cancelled`, unless `buck2 dev`
+exits first.
+
+By default a build sends one `built`, once every output is done. A server that
+sends `build` with `"streaming": true` gets a `built` for each output as soon
+as it is done, with `last_of_generation` false on all but the last, so that a
+fast output does not wait for a slow one. An output that fails comes in a
+`built` of its own, in `failed`, and the build never ends in `failed` for it.
+If the build is `cancelled`, the server keeps the outputs that it got, and only
+the others are stale. Once an output is done, a change to a file that only it is
+built from no longer stops the build. A server gets `built`, `failed` or `cancelled` for a
 build only if it got that build's `building`: a server that connects while a
 build runs hears nothing of that build, and asks for what it needs after
 `ready`. A `failed` without a `building` is about the analysis of the target,
@@ -617,7 +647,8 @@ are not sent again. Once the analysis works again, the server gets
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`, or `unsupported`. Send it before anything else. |
-| `build`   | `outputs`: a list of names | Build these outputs now, with all changes, and track them from now on. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. |
+| `build`   | `outputs`: a list of names, and optionally `streaming` and `stale_until_ack`, both false by default | Build these outputs now, with all changes, and track them from now on. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. With `streaming`, each output comes in its own `built` as soon as it is done. With `stale_until_ack`, the outputs stay stale until the server sends `ack`. |
+| `ack`     | `gen`, `outputs`: a list of names | The server is up to date with these outputs as build `gen` left them. See [Saying when the server has an output](#saying-when-the-server-has-an-output). |
 | `restart` |                           | Build the server again and restart it. The new server has asked for nothing. If the build fails, the old server keeps running until the next analysis restarts it. |
 
 `buck2 dev` reads the connection all the time, also while it builds, so a

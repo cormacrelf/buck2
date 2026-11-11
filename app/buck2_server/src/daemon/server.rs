@@ -1883,9 +1883,9 @@ impl DaemonApi for BuckdServer {
         self.run_streaming(
             req,
             DefaultCommandOptions,
-            |context, partial: PartialResultDispatcher<NoPartialResult>, req| {
-                new_generic_command(context, req, partial).boxed()
-            },
+            |context,
+             partial: PartialResultDispatcher<buck2_cli_proto::NewGenericPartialResultMessage>,
+             req| { new_generic_command(context, req, partial).boxed() },
         )
         .await
     }

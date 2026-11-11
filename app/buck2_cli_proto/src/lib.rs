@@ -286,6 +286,7 @@ partial_result_convert!(StdoutBytes);
 partial_result_convert!(LspMessage);
 partial_result_convert!(SubscriptionResponseWrapper);
 partial_result_convert!(DapMessage);
+partial_result_convert!(NewGenericPartialResultMessage);
 
 define_request!(KillRequest);
 define_request!(StatusRequest);

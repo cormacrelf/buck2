@@ -102,7 +102,9 @@ impl OtherServerCommands for OtherServerCommandsInstance {
     async fn dev(
         &self,
         ctx: &dyn ServerCommandContextTrait,
-        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        partial_result_dispatcher: PartialResultDispatcher<
+            buck2_cli_proto::NewGenericPartialResultMessage,
+        >,
         req: DevRequest,
     ) -> buck2_error::Result<DevResponse> {
         dev_command(ctx, partial_result_dispatcher, req).await

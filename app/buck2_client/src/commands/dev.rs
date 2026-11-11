@@ -33,6 +33,8 @@ use async_trait::async_trait;
 use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_cli_proto::new_generic::DevAction;
+use buck2_cli_proto::new_generic::DevBuilt;
+use buck2_cli_proto::new_generic::DevBuiltOutput;
 use buck2_cli_proto::new_generic::DevChange;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
@@ -40,6 +42,7 @@ use buck2_cli_proto::new_generic::DevServer;
 use buck2_cli_proto::new_generic::DevWatchRequest;
 use buck2_cli_proto::new_generic::DevWatchState;
 use buck2_cli_proto::new_generic::DevWatched;
+use buck2_cli_proto::new_generic::NewGenericPartialResult;
 use buck2_cli_proto::new_generic::NewGenericRequest;
 use buck2_cli_proto::new_generic::NewGenericResponse;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
@@ -60,6 +63,7 @@ use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::subscriber::SessionUpdate;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
+use buck2_error::internal_error;
 use buck2_hash::BuckMutMap;
 use buck2_wrapper_common::invocation_id::TraceId;
 use serde_json::json;
@@ -216,6 +220,7 @@ impl DevCommand {
         // anything else, so that `buck2 dev` stops at once if it cannot.
         let session = TraceId::new().to_string();
         let changes = FileChanges::subscribe(connection.clone(), &context, session.clone()).await?;
+        let (partials_tx, partials) = mpsc::unbounded_channel();
         let daemon = Daemon {
             connection,
             events_ctx,
@@ -224,9 +229,11 @@ impl DevCommand {
             session,
             target: self.target.clone(),
             target_cfg: self.target_cfg.target_cfg(),
+            partials: partials_tx,
         };
         let mut session = match Session::start(
             daemon,
+            partials,
             self.server_args.clone(),
             Duration::from_millis(self.debounce_ms),
             listener,
@@ -261,6 +268,8 @@ struct Daemon<'a> {
     session: String,
     target: String,
     target_cfg: buck2_cli_proto::TargetCfg,
+    /// Where the results of a streaming build go before its response.
+    partials: mpsc::UnboundedSender<DevBuilt>,
 }
 
 /// A request the daemon ran but that failed. The console has already shown the errors.
@@ -271,6 +280,7 @@ impl Daemon<'_> {
         &mut self,
         action: impl Fn() -> DevAction,
     ) -> buck2_error::Result<Result<DevResponse, Failed>> {
+        let partials = self.partials.clone();
         let outcome = self
             .connection
             .new_generic(
@@ -284,6 +294,15 @@ impl Daemon<'_> {
                     })
                 },
                 self.events_ctx,
+                &mut |partial| {
+                    match partial {
+                        // `buck2 dev` is exiting if this fails.
+                        NewGenericPartialResult::Dev(built) => {
+                            let _ignored = partials.send(built);
+                        }
+                    }
+                    Ok(())
+                },
             )
             .await
             .map_err(|e| if lost_daemon(&e) { daemon_gone(e) } else { e })?;
@@ -477,40 +496,73 @@ const PROTOCOL_VERSIONS: &[u64] = &[1];
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
-    Hello { version: u64 },
-    Build { outputs: Vec<String> },
+    Hello {
+        version: u64,
+    },
+    Build {
+        outputs: Vec<String>,
+        /// Send the result of each output as soon as it is known, rather than all of them at
+        /// the end.
+        #[serde(default)]
+        streaming: bool,
+        /// The outputs stay stale until the server says with `ack` that it has them.
+        #[serde(default)]
+        stale_until_ack: bool,
+    },
+    /// The server is up to date with `outputs` as build `gen` left them.
+    Ack {
+        r#gen: u64,
+        outputs: Vec<String>,
+    },
     Restart,
 }
 
 /// An output that the server asked for, with the changes since the server last got it.
 #[derive(Default)]
 struct Tracked {
-    /// The server got a build of the output.
+    /// The server has a build of the output.
     received: bool,
-    /// Project-relative paths that changed since then. The empty path stands for the project:
-    /// changes were missed, so any file may have changed.
-    files: BTreeSet<String>,
-    /// The scopes that hold every change since then, or `None` if nothing changed.
-    within: Option<BTreeSet<String>>,
+    /// The changes since then, by project-relative path, each with the scopes that hold it and
+    /// the number of the last build that had started when `buck2 dev` heard of it. The empty
+    /// path stands for the project: changes were missed, so any file may have changed. `None`
+    /// is a change to the targets that names no file.
+    changes: BTreeMap<Option<String>, (u64, BTreeSet<String>)>,
 }
 
 impl Tracked {
-    fn add(&mut self, change: DevChange) {
-        if let Some(path) = change.path {
-            self.files.insert(path);
-        }
+    /// Add `change`, heard of after build `generation` started.
+    fn add(&mut self, change: DevChange, generation: u64) {
         let scopes: BTreeSet<String> = change.scopes.into_iter().collect();
-        self.within = Some(match self.within.take() {
-            Some(within) => within.intersection(&scopes).cloned().collect(),
-            None => scopes,
-        });
+        match self.changes.get_mut(&change.path) {
+            Some((heard, within)) => {
+                *heard = generation.max(*heard);
+                *within = within.intersection(&scopes).cloned().collect();
+            }
+            None => {
+                self.changes.insert(change.path, (generation, scopes));
+            }
+        }
     }
 
-    /// The server got a build of the output.
-    fn built(&mut self) {
+    /// The project-relative paths that changed.
+    fn files(&self) -> impl Iterator<Item = &String> {
+        self.changes.keys().flatten()
+    }
+
+    /// The scopes that hold every change, or `None` if nothing changed.
+    fn within(&self) -> Option<BTreeSet<String>> {
+        let mut scopes = self.changes.values().map(|(_, scopes)| scopes);
+        let first = scopes.next()?.clone();
+        Some(scopes.fold(first, |within, scopes| {
+            within.intersection(scopes).cloned().collect()
+        }))
+    }
+
+    /// The server has the output as build `generation` left it: with every change heard of
+    /// before that build started.
+    fn received(&mut self, generation: u64) {
         self.received = true;
-        self.files.clear();
-        self.within = None;
+        self.changes.retain(|_, (heard, _)| *heard >= generation);
     }
 }
 
@@ -519,20 +571,16 @@ impl Tracked {
 fn stale_message(tracked: &BTreeMap<String, Tracked>, root: &str) -> Option<serde_json::Value> {
     let mut outputs = serde_json::Map::new();
     for (name, tracked) in tracked {
-        let Some(within) = &tracked.within else {
+        let Some(within) = tracked.within() else {
             continue;
         };
         // Within no scope is known for an output that the server does not have.
-        let within: Vec<&String> = if tracked.received {
-            within.iter().collect()
+        let within: Vec<String> = if tracked.received {
+            within.into_iter().collect()
         } else {
             Vec::new()
         };
-        let files: Vec<String> = tracked
-            .files
-            .iter()
-            .map(|path| absolute(root, path))
-            .collect();
+        let files: Vec<String> = tracked.files().map(|path| absolute(root, path)).collect();
         outputs.insert(name.clone(), json!({"within": within, "files": files}));
     }
     (!outputs.is_empty()).then(|| json!({"type": "stale", "outputs": outputs}))
@@ -646,14 +694,16 @@ impl ServerLink {
         }
     }
 
-    /// Send the result of build `generation`: `built`, `failed` or `cancelled`. Only a
+    /// Send a result of build `generation`: `built`, `failed` or `cancelled`. Only a
     /// connection that got the build's `building` gets it, so that a server that connected
-    /// during a build is not told about a build it did not hear start. Returns whether the
-    /// server got it.
-    fn send_result(&mut self, generation: u64, message: serde_json::Value) -> bool {
+    /// during a build is not told about a build it did not hear start. `last` is false for a
+    /// `built` that more results of the build follow. Returns whether the server got it.
+    fn send_result(&mut self, generation: u64, message: serde_json::Value, last: bool) -> bool {
         if let Some(server) = &mut self.server {
             if server.announced == Some(generation) {
-                server.announced = None;
+                if last {
+                    server.announced = None;
+                }
                 server.send(message);
                 return server.conn.is_some();
             }
@@ -923,18 +973,13 @@ struct Session<'a> {
     /// How the last build went, and how long it took.
     last_build: Option<(&'static str, Duration)>,
     generation: u64,
-    /// The digest of each output when it was last built, with its `argv` if it is a command
-    /// line.
-    digests: BuckMutMap<String, (Option<String>, Option<Vec<String>>)>,
-    /// The digest of each sidecar, by the names of its output and its own, when it was last
-    /// built.
-    sidecar_digests: BuckMutMap<(String, String), Option<String>>,
+    /// The results of a streaming build, which arrive before its response.
+    partials: mpsc::UnboundedReceiver<DevBuilt>,
+    /// The build that runs, if one does.
+    building: Option<Building>,
+    delivered: Delivered,
     /// The outputs that the running server asked for, by name.
     tracked: BTreeMap<String, Tracked>,
-    /// For each output that was built since `buck2 dev` last asked the daemon about changes:
-    /// the paths that had changed by then, and that it has not asked about yet. The build
-    /// used those changes, so they do not make the output stale.
-    fresh: BTreeMap<String, BTreeSet<String>>,
     /// The outputs of builds that the daemon stopped since `buck2 dev` last asked it about
     /// changes, each with the paths that stopped them. The empty path stands for the project.
     /// The next answer makes each of them stale, even if it says nothing of them.
@@ -961,6 +1006,133 @@ struct Session<'a> {
     queued: BTreeSet<String>,
 }
 
+/// A build that runs.
+struct Building {
+    generation: u64,
+    /// The outputs stay stale until the server says with `ack` that it has them.
+    stale_until_ack: bool,
+    /// The outputs whose results the server was sent. If another command preempted the build,
+    /// the daemon builds them again, but the server gets each once.
+    sent: BTreeSet<String>,
+    /// How many outputs the server got, and how many failed.
+    built: usize,
+    failed: usize,
+}
+
+/// What `buck2 dev` keeps of the outputs that it built, to say what changed.
+#[derive(Default)]
+struct Delivered {
+    /// The digest of each output when it was last built, with its `argv` if it is a command
+    /// line.
+    digests: BuckMutMap<String, (Option<String>, Option<Vec<String>>)>,
+    /// The digest of each sidecar, by the names of its output and its own, when it was last
+    /// built.
+    sidecar_digests: BuckMutMap<(String, String), Option<String>>,
+    /// For each output that was built since `buck2 dev` last asked the daemon about changes:
+    /// the paths that had changed by then, and that it has not asked about yet. The build
+    /// used those changes, so they do not make the output stale.
+    fresh: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Delivered {
+    /// What the server gets of each of `outputs`, which were built after the changes in
+    /// `known`.
+    fn entries(
+        &mut self,
+        outputs: BTreeMap<String, DevBuiltOutput>,
+        known: &BTreeSet<String>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut entries = serde_json::Map::new();
+        for (name, output) in outputs {
+            self.fresh.insert(name.clone(), known.clone());
+            let key = (output.digest.clone(), output.argv.clone());
+            let changed = self.digests.get(&name) != Some(&key) || output.digest.is_none();
+            self.digests.insert(name.clone(), key);
+            let mut built = json!({
+                "digest": output.digest,
+                "changed": changed,
+            });
+            // An artifact has a `path`, and a command line has an `argv`.
+            if let Some(path) = output.path {
+                built["path"] = json!(path);
+            }
+            if let Some(argv) = output.argv {
+                built["argv"] = json!(argv);
+            }
+            if !output.sidecars.is_empty() {
+                // Each sidecar says by itself whether it changed.
+                let mut sidecars = serde_json::Map::new();
+                for (sidecar, artifact) in output.sidecars {
+                    let key = (name.clone(), sidecar.clone());
+                    let changed = self.sidecar_digests.get(&key) != Some(&artifact.digest)
+                        || artifact.digest.is_none();
+                    self.sidecar_digests.insert(key, artifact.digest.clone());
+                    sidecars.insert(
+                        sidecar,
+                        json!({
+                            "path": artifact.path,
+                            "digest": artifact.digest,
+                            "changed": changed,
+                        }),
+                    );
+                }
+                built["sidecars"] = serde_json::Value::Object(sidecars);
+            }
+            entries.insert(name, built);
+        }
+        entries
+    }
+}
+
+/// Send the server a `built` with results of the build that runs. `known` has the changes that
+/// `buck2 dev` has heard of: the daemon stops a build when a file that it builds from changes,
+/// so the build used them. `last` says that no more results of the build follow. Returns
+/// whether the server got it.
+fn send_built(
+    link: &mut ServerLink,
+    tracked: &mut BTreeMap<String, Tracked>,
+    delivered: &mut Delivered,
+    building: &mut Building,
+    built: DevBuilt,
+    known: &BTreeSet<String>,
+    last: bool,
+) -> bool {
+    let DevBuilt {
+        mut outputs,
+        mut failed,
+    } = built;
+    outputs.retain(|name, _| !building.sent.contains(name));
+    failed.retain(|name, _| !building.sent.contains(name));
+    if outputs.is_empty() && failed.is_empty() && !last {
+        return false;
+    }
+    building.sent.extend(outputs.keys().cloned());
+    building.sent.extend(failed.keys().cloned());
+    building.built += outputs.len();
+    building.failed += failed.len();
+    let names: Vec<String> = outputs.keys().cloned().collect();
+    let mut message = json!({
+        "type": "built",
+        "gen": building.generation,
+        "outputs": delivered.entries(outputs, known),
+        "last_of_generation": last,
+    });
+    // The outputs that failed keep the digests of the last time they built, and stay stale.
+    if !failed.is_empty() {
+        message["failed"] = json!(failed);
+    }
+    let got = link.send_result(building.generation, message, last);
+    if got && !building.stale_until_ack {
+        // The server has these outputs as the files are now.
+        for name in names {
+            if let Some(tracked) = tracked.get_mut(&name) {
+                tracked.received(building.generation);
+            }
+        }
+    }
+    got
+}
+
 /// What became of analysing the target again.
 #[derive(Default)]
 struct Resolved {
@@ -985,6 +1157,7 @@ impl<'a> Session<'a> {
     /// started.
     async fn start(
         mut daemon: Daemon<'a>,
+        partials: mpsc::UnboundedReceiver<DevBuilt>,
         server_args: Vec<String>,
         debounce: Duration,
         listener: Listener,
@@ -1034,10 +1207,10 @@ impl<'a> Session<'a> {
             status: String::new(),
             last_build: None,
             generation: 0,
-            digests: BuckMutMap::default(),
-            sidecar_digests: BuckMutMap::default(),
+            partials,
+            building: None,
+            delivered: Delivered::default(),
             tracked: BTreeMap::new(),
-            fresh: BTreeMap::new(),
             stopped: BTreeMap::new(),
             unacted: BTreeSet::new(),
             resolve_due: false,
@@ -1192,7 +1365,11 @@ impl<'a> Session<'a> {
 
     async fn on_request(&mut self, request: Request) -> buck2_error::Result<()> {
         match request {
-            Request::Build { outputs } => {
+            Request::Build {
+                outputs,
+                streaming,
+                stale_until_ack,
+            } => {
                 // From now on, the server hears when these are stale.
                 for name in &outputs {
                     self.tracked.entry(name.clone()).or_default();
@@ -1212,8 +1389,12 @@ impl<'a> Session<'a> {
                         return Ok(());
                     }
                 }
-                self.build(outputs).await?;
+                self.build(outputs, streaming, stale_until_ack).await?;
             }
+            Request::Ack {
+                r#gen: generation,
+                outputs,
+            } => self.ack(generation, outputs)?,
             Request::Restart => self.restart().await?,
             // Answered as soon as it arrives.
             Request::Hello { .. } => {}
@@ -1267,7 +1448,7 @@ impl<'a> Session<'a> {
         // answer.
         let graph_changed = self.watched.state.is_none() || graph_changed;
         let relevant = recovered || graph_changed || changes.server || !changes.outputs.is_empty();
-        let fresh = std::mem::take(&mut self.fresh);
+        let fresh = std::mem::take(&mut self.delivered.fresh);
         let stopped = std::mem::take(&mut self.stopped);
 
         self.missed = false;
@@ -1317,7 +1498,7 @@ impl<'a> Session<'a> {
                     _ => false,
                 };
                 if !used {
-                    tracked.add(change);
+                    tracked.add(change, self.generation);
                     affected.insert(name.clone());
                 }
             }
@@ -1329,10 +1510,13 @@ impl<'a> Session<'a> {
             };
             if affected.insert(name) {
                 for path in paths {
-                    tracked.add(DevChange {
-                        path: Some(path),
-                        scopes: Vec::new(),
-                    });
+                    tracked.add(
+                        DevChange {
+                            path: Some(path),
+                            scopes: Vec::new(),
+                        },
+                        self.generation,
+                    );
                 }
             }
         }
@@ -1378,23 +1562,43 @@ impl<'a> Session<'a> {
             missed,
             missed_queued,
             queued,
+            unacted,
             server_info,
             server_rx,
             link,
             tracked,
             signals,
+            partials,
+            building,
+            delivered,
             ..
         } = &mut *self;
+        // Results of a streaming build go to the server as they arrive.
+        let mut deliver = |built: DevBuilt,
+                           queued: &BTreeSet<String>,
+                           link: &mut ServerLink,
+                           tracked: &mut BTreeMap<String, Tracked>| {
+            if let Some(building) = building.as_mut() {
+                let known: BTreeSet<String> = queued.union(unacted).cloned().collect();
+                send_built(link, tracked, delivered, building, built, &known, false);
+            }
+        };
         let request = daemon.request(action);
         tokio::pin!(request);
         loop {
             tokio::select! {
                 result = &mut request => {
-                    return Ok(match result? {
+                    let result = result?;
+                    // The results that the build sent before its response.
+                    while let Ok(built) = partials.try_recv() {
+                        deliver(built, queued, link, tracked);
+                    }
+                    return Ok(match result {
                         Ok(response) => Outcome::Done(response),
                         Err(Failed(messages)) => Outcome::Failed(messages),
                     });
                 }
+                Some(built) = partials.recv() => deliver(built, queued, link, tracked),
                 // The server is not kept waiting while the daemon works. Its requests are handled
                 // after this one.
                 Some(event) = server_rx.recv() => {
@@ -1428,9 +1632,16 @@ impl<'a> Session<'a> {
     }
 
     /// Build `outputs`, which the server asked for, and tell the server. An output that it
-    /// gets is no longer stale. The daemon stops the build if a file that it builds from
-    /// changes; other changes during the build are handled after it.
-    async fn build(&mut self, outputs: Vec<String>) -> buck2_error::Result<()> {
+    /// gets is no longer stale, or, with `stale_until_ack`, once the server says that it has
+    /// it. With `streaming`, the server gets each output as soon as it is built. The daemon
+    /// stops the build if a file that an output that is not built yet builds from changes;
+    /// other changes during the build are handled after it.
+    async fn build(
+        &mut self,
+        outputs: Vec<String>,
+        streaming: bool,
+        stale_until_ack: bool,
+    ) -> buck2_error::Result<()> {
         let outputs: Vec<String> = outputs
             .into_iter()
             .collect::<BTreeSet<_>>()
@@ -1441,7 +1652,7 @@ impl<'a> Session<'a> {
         let files: BTreeSet<String> = outputs
             .iter()
             .filter_map(|name| self.tracked.get(name))
-            .flat_map(|tracked| tracked.files.iter().map(|path| absolute(root, path)))
+            .flat_map(|tracked| tracked.files().map(|path| absolute(root, path)))
             .collect();
         self.generation += 1;
         let generation = self.generation;
@@ -1456,14 +1667,26 @@ impl<'a> Session<'a> {
         );
 
         let started = Instant::now();
+        self.building = Some(Building {
+            generation,
+            stale_until_ack,
+            sent: BTreeSet::new(),
+            built: 0,
+            failed: 0,
+        });
         let outcome = self
             .request(|| DevAction::Build {
                 outputs: outputs.clone(),
+                streaming,
             })
-            .await?;
-        match outcome {
+            .await;
+        let mut building = self
+            .building
+            .take()
+            .ok_or_else(|| internal_error!("The build that ran is gone"))?;
+        match outcome? {
             Outcome::Done(DevResponse::Build(built))
-                if built.outputs.is_empty() && !built.failed.is_empty() =>
+                if !streaming && built.outputs.is_empty() && !built.failed.is_empty() =>
             {
                 // Nothing built.
                 let error: Vec<String> = built.failed.into_values().collect();
@@ -1474,93 +1697,43 @@ impl<'a> Session<'a> {
                         "gen": generation,
                         "error": error.join("\n"),
                     }),
+                    true,
                 );
                 self.last_build = Some(("failed", started.elapsed()));
             }
             Outcome::Done(DevResponse::Build(built)) => {
-                let mut message = serde_json::Map::new();
-                // The changes that `buck2 dev` has read: the daemon stops a build when a file
-                // that it builds from changes, so this build used them.
                 let known: BTreeSet<String> = self.queued.union(&self.unacted).cloned().collect();
-                let names: Vec<String> = built.outputs.keys().cloned().collect();
-                for (name, output) in built.outputs {
-                    self.fresh.insert(name.clone(), known.clone());
-                    let key = (output.digest.clone(), output.argv.clone());
-                    let changed = self.digests.get(&name) != Some(&key) || output.digest.is_none();
-                    self.digests.insert(name.clone(), key);
-                    let mut built = json!({
-                        "digest": output.digest,
-                        "changed": changed,
-                    });
-                    // An artifact has a `path`, and a command line has an `argv`.
-                    if let Some(path) = output.path {
-                        built["path"] = json!(path);
-                    }
-                    if let Some(argv) = output.argv {
-                        built["argv"] = json!(argv);
-                    }
-                    if !output.sidecars.is_empty() {
-                        // Each sidecar says by itself whether it changed.
-                        let mut sidecars = serde_json::Map::new();
-                        for (sidecar, artifact) in output.sidecars {
-                            let key = (name.clone(), sidecar.clone());
-                            let changed = self.sidecar_digests.get(&key) != Some(&artifact.digest)
-                                || artifact.digest.is_none();
-                            self.sidecar_digests.insert(key, artifact.digest.clone());
-                            sidecars.insert(
-                                sidecar,
-                                json!({
-                                    "path": artifact.path,
-                                    "digest": artifact.digest,
-                                    "changed": changed,
-                                }),
-                            );
-                        }
-                        built["sidecars"] = serde_json::Value::Object(sidecars);
-                    }
-                    message.insert(name, built);
-                }
-                let delivered = if built.failed.is_empty() {
-                    self.last_build = Some(("succeeded", started.elapsed()));
-                    self.link.send_result(
-                        generation,
-                        json!({"type": "built", "gen": generation, "outputs": message}),
-                    )
-                } else {
-                    // Some outputs built: the server gets them, and the errors of the others,
-                    // whose digests stay those of the last time they built, and which stay
-                    // stale.
-                    self.last_build = Some(("partly failed", started.elapsed()));
-                    self.link.send_result(
-                        generation,
-                        json!({
-                            "type": "built",
-                            "gen": generation,
-                            "outputs": message,
-                            "failed": built.failed,
-                        }),
-                    )
+                send_built(
+                    &mut self.link,
+                    &mut self.tracked,
+                    &mut self.delivered,
+                    &mut building,
+                    built,
+                    &known,
+                    true,
+                );
+                let result = match (building.built, building.failed) {
+                    (_, 0) => "succeeded",
+                    (0, _) => "failed",
+                    _ => "partly failed",
                 };
-                if delivered {
-                    // The server has these outputs as the files are now.
-                    for name in names {
-                        if let Some(tracked) = self.tracked.get_mut(&name) {
-                            tracked.built();
-                        }
-                    }
-                }
+                self.last_build = Some((result, started.elapsed()));
             }
             Outcome::Done(DevResponse::Interrupted(interrupted)) => {
-                self.link
-                    .send_result(generation, json!({"type": "cancelled", "gen": generation}));
-                // The outputs are stale once `buck2 dev` has asked about the changes. It has them
-                // from the file watcher too, but asks about them in any case.
+                self.link.send_result(
+                    generation,
+                    json!({"type": "cancelled", "gen": generation}),
+                    true,
+                );
+                // The outputs that the server did not get are stale once `buck2 dev` has asked
+                // about the changes. It has them from the file watcher too, but asks about them
+                // in any case.
                 let paths: Vec<String> = if interrupted.missed {
                     vec![String::new()]
                 } else {
                     interrupted.paths.clone()
                 };
-                for name in &outputs {
+                for name in outputs.iter().filter(|name| !building.sent.contains(*name)) {
                     self.stopped
                         .entry(name.clone())
                         .or_default()
@@ -1579,11 +1752,32 @@ impl<'a> Session<'a> {
                         "gen": generation,
                         "error": messages.join("\n"),
                     }),
+                    true,
                 );
                 self.last_build = Some(("failed", started.elapsed()));
             }
             // The session is ending: the server is stopping too.
             Outcome::Interrupted => {}
+        }
+        Ok(())
+    }
+
+    /// The server is up to date with `outputs` as build `generation` left them, built by it or
+    /// not: changes heard of before that build started no longer make them stale.
+    fn ack(&mut self, generation: u64, outputs: Vec<String>) -> buck2_error::Result<()> {
+        if generation > self.generation {
+            return self.link.console.message(format!(
+                "`buck2 dev` ignored an `ack` from the server for build {generation}, which has not started"
+            ));
+        }
+        for name in outputs {
+            if !self.server_info.outputs.contains(&name) {
+                self.link.console.message(format!(
+                    "`buck2 dev` ignored an `ack` from the server for `{name}`, which is not an output"
+                ))?;
+                continue;
+            }
+            self.tracked.entry(name).or_default().received(generation);
         }
         Ok(())
     }
@@ -1737,11 +1931,9 @@ impl<'a> Session<'a> {
         }
         // The new server asks for what it needs.
         self.link.requests.clear();
-        self.digests.clear();
-        self.sidecar_digests.clear();
+        self.delivered = Delivered::default();
         // The new server has asked for nothing yet.
         self.tracked.clear();
-        self.fresh.clear();
         self.stopped.clear();
         if let Err(e) = self.spawn().await {
             self.link.console.message(format!(

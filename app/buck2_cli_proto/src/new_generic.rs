@@ -39,6 +39,13 @@ pub enum NewGenericResponse {
     Dev(DevResponse),
 }
 
+/// What a `NewGenericRequest` sends before its response.
+#[derive(Serialize, Deserialize)]
+pub enum NewGenericPartialResult {
+    /// The result of one output of a streaming `DevAction::Build`.
+    Dev(DevBuilt),
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct DebugEvalRequest {
     pub paths: Vec<String>,
@@ -159,8 +166,14 @@ pub enum DevAction {
     /// changed, may build what dynamic actions need to say what they do.
     Watch(DevWatchRequest),
     /// Build the named `DevInfo.outputs`, which the server asked for. The build stops if a file
-    /// that it builds from changes.
-    Build { outputs: Vec<String> },
+    /// that it builds from changes. With `streaming`, the result of each output but the last to
+    /// finish is a `NewGenericPartialResult::Dev` as soon as it is known, and the response has
+    /// the last; a change to a file of an output that is done no longer stops the build.
+    Build {
+        outputs: Vec<String>,
+        #[serde(default)]
+        streaming: bool,
+    },
     /// Release the local resources that the daemon holds for the session, and wait until they
     /// are gone. `buck2 dev` sends it after it has stopped the server.
     Release,

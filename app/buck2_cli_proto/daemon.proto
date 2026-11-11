@@ -737,6 +737,11 @@ message NewGenericResponseMessage {
   string new_generic_response = 1;
 }
 
+message NewGenericPartialResultMessage {
+  // `NewGenericPartialResult` serialized to JSON.
+  string new_generic_partial_result = 1;
+}
+
 message UnstableCrashRequest {
   enum CrashType {
     PANIC = 0;
@@ -801,6 +806,7 @@ message PartialResult {
     LspMessage lsp_message = 2;
     SubscriptionResponseWrapper subscription_response_wrapper = 3;
     DapMessage dap_message = 4;
+    NewGenericPartialResultMessage new_generic_partial_result_message = 5;
   }
 }
 

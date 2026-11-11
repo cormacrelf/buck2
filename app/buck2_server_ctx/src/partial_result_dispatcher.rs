@@ -44,6 +44,15 @@ where
             partial_result: Some(res.into()),
         });
     }
+
+    /// The same dispatcher, for a part of the command that sends no partial results.
+    pub fn without_partial_results(self) -> PartialResultDispatcher<NoPartialResult> {
+        PartialResultDispatcher {
+            dispatcher: self.dispatcher,
+            cancellation: self.cancellation,
+            result_type: PhantomData,
+        }
+    }
 }
 
 impl PartialResultDispatcher<buck2_cli_proto::StdoutBytes> {

@@ -13,7 +13,6 @@ use buck2_cli_proto::new_generic::NewGenericResponse;
 use buck2_error::BuckErrorContext;
 use buck2_server_ctx::late_bindings::DOCS_SERVER_COMMAND;
 use buck2_server_ctx::late_bindings::OTHER_SERVER_COMMANDS;
-use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 
 use crate::ctx::ServerCommandContext;
@@ -21,7 +20,9 @@ use crate::ctx::ServerCommandContext;
 pub(crate) async fn new_generic_command(
     context: &ServerCommandContext<'_>,
     req: buck2_cli_proto::NewGenericRequestMessage,
-    partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+    partial_result_dispatcher: PartialResultDispatcher<
+        buck2_cli_proto::NewGenericPartialResultMessage,
+    >,
 ) -> buck2_error::Result<buck2_cli_proto::NewGenericResponseMessage> {
     let req = req.new_generic_request;
     let req: NewGenericRequest = serde_json::from_str(&req)
@@ -30,7 +31,11 @@ pub(crate) async fn new_generic_command(
         NewGenericRequest::Complete(e) => NewGenericResponse::Complete(
             OTHER_SERVER_COMMANDS
                 .get()?
-                .complete(context, partial_result_dispatcher, e)
+                .complete(
+                    context,
+                    partial_result_dispatcher.without_partial_results(),
+                    e,
+                )
                 .await?,
         ),
         NewGenericRequest::DebugEval(e) => NewGenericResponse::DebugEval(
@@ -45,13 +50,21 @@ pub(crate) async fn new_generic_command(
         NewGenericRequest::Explain(m) => NewGenericResponse::Explain(
             OTHER_SERVER_COMMANDS
                 .get()?
-                .explain(context, partial_result_dispatcher, m)
+                .explain(
+                    context,
+                    partial_result_dispatcher.without_partial_results(),
+                    m,
+                )
                 .await?,
         ),
         NewGenericRequest::ExpandExternalCells(e) => NewGenericResponse::ExpandExternalCells(
             OTHER_SERVER_COMMANDS
                 .get()?
-                .expand_external_cells(context, partial_result_dispatcher, e)
+                .expand_external_cells(
+                    context,
+                    partial_result_dispatcher.without_partial_results(),
+                    e,
+                )
                 .await?,
         ),
         NewGenericRequest::Dev(d) => NewGenericResponse::Dev(
@@ -63,7 +76,11 @@ pub(crate) async fn new_generic_command(
         NewGenericRequest::Docs(d) => NewGenericResponse::Docs(
             DOCS_SERVER_COMMAND
                 .get()?
-                .docs(context, partial_result_dispatcher, d)
+                .docs(
+                    context,
+                    partial_result_dispatcher.without_partial_results(),
+                    d,
+                )
                 .await?,
         ),
     };

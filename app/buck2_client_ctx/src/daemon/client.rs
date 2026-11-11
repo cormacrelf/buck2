@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use buck2_cli_proto::daemon_api_client::*;
+use buck2_cli_proto::new_generic::NewGenericPartialResult;
 use buck2_cli_proto::new_generic::NewGenericRequest;
 use buck2_cli_proto::new_generic::NewGenericResponse;
 use buck2_cli_proto::*;
@@ -372,6 +373,26 @@ impl PartialResultHandler for NoPartialResultHandler {
     }
 }
 
+/// Decodes the partial results of a new generic command, and hands them on.
+struct NewGenericPartialResultHandler<'a>(
+    &'a mut (dyn FnMut(NewGenericPartialResult) -> buck2_error::Result<()> + Send),
+);
+
+#[async_trait]
+impl PartialResultHandler for NewGenericPartialResultHandler<'_> {
+    type PartialResult = buck2_cli_proto::NewGenericPartialResultMessage;
+
+    async fn handle_partial_result(
+        &mut self,
+        _ctx: PartialResultCtx<'_>,
+        partial_res: Self::PartialResult,
+    ) -> buck2_error::Result<()> {
+        let partial_res = serde_json::from_str(&partial_res.new_generic_partial_result)
+            .buck_error_context("Could not deserialize `NewGenericPartialResult`")?;
+        (self.0)(partial_res)
+    }
+}
+
 /// Receives StdoutBytes, writes them to stdout.
 pub struct StdoutPartialResultHandler;
 
@@ -606,7 +627,7 @@ impl FlushingBuckdClient<'_> {
         new_generic_impl,
         NewGenericRequestMessage,
         NewGenericResponseMessage,
-        NoPartialResult
+        buck2_cli_proto::NewGenericPartialResultMessage
     );
     stream_method!(
         clean_stale,
@@ -708,6 +729,27 @@ impl FlushingBuckdClient<'_> {
         events_ctx: &mut EventsCtx,
         stdin: Option<ConsoleInteractionStream<'_>>,
     ) -> buck2_error::Result<CommandOutcome<NewGenericResponse>> {
+        self.new_generic_with_partial_results(context, req, events_ctx, stdin, &mut |_| {
+            Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::InvalidEvent,
+                "Unexpected partial result from a new generic command"
+            ))
+        })
+        .await
+    }
+
+    /// `new_generic`, for a command that sends partial results before its response. Each goes
+    /// to `on_partial_result` as it arrives.
+    pub async fn new_generic_with_partial_results(
+        &mut self,
+        context: buck2_cli_proto::ClientContext,
+        req: NewGenericRequest,
+        events_ctx: &mut EventsCtx,
+        stdin: Option<ConsoleInteractionStream<'_>>,
+        on_partial_result: &mut (
+                 dyn FnMut(NewGenericPartialResult) -> buck2_error::Result<()> + Send
+             ),
+    ) -> buck2_error::Result<CommandOutcome<NewGenericResponse>> {
         let req = serde_json::to_string(&req)
             .buck_error_context("Could not serialize `NewGenericRequest`")?;
         let req = buck2_cli_proto::NewGenericRequestMessage {
@@ -715,7 +757,12 @@ impl FlushingBuckdClient<'_> {
             new_generic_request: req,
         };
         let command_outcome: CommandOutcome<buck2_cli_proto::NewGenericResponseMessage> = self
-            .new_generic_impl(req, events_ctx, stdin, &mut NoPartialResultHandler)
+            .new_generic_impl(
+                req,
+                events_ctx,
+                stdin,
+                &mut NewGenericPartialResultHandler(on_partial_result),
+            )
             .await?;
         match command_outcome {
             CommandOutcome::Success(resp) => {

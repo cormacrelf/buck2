@@ -73,7 +73,9 @@ pub trait OtherServerCommands: Send + Sync + 'static {
     async fn dev(
         &self,
         ctx: &dyn ServerCommandContextTrait,
-        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        partial_result_dispatcher: PartialResultDispatcher<
+            buck2_cli_proto::NewGenericPartialResultMessage,
+        >,
         req: DevRequest,
     ) -> buck2_error::Result<DevResponse>;
 }

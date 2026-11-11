@@ -20,6 +20,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use buck2_cli_proto::ClientContext;
+use buck2_cli_proto::new_generic::NewGenericPartialResult;
 use buck2_cli_proto::new_generic::NewGenericRequest;
 use buck2_cli_proto::new_generic::NewGenericResponse;
 use buck2_data::error::ErrorTag;
@@ -59,19 +60,29 @@ impl DaemonConnection {
 
     /// Run a `NewGenericRequest` as a daemon command, and return its outcome. If the daemon
     /// preempted the command for another one, ask again once that one is done. `request` makes
-    /// the request for each attempt. Fails with an error that `lost_daemon` recognises if the
+    /// the request for each attempt. Partial results go to `on_partial_result`, those of an
+    /// attempt that was preempted too. Fails with an error that `lost_daemon` recognises if the
     /// daemon goes away.
     pub async fn new_generic(
         &self,
         context: &ClientContext,
         request: impl Fn() -> NewGenericRequest,
         events_ctx: &mut EventsCtx,
+        on_partial_result: &mut (
+                 dyn FnMut(NewGenericPartialResult) -> buck2_error::Result<()> + Send
+             ),
     ) -> buck2_error::Result<CommandOutcome<NewGenericResponse>> {
         let mut buckd = self.connector();
         loop {
             match buckd
                 .with_flushing()
-                .new_generic(context.clone(), request(), events_ctx, None)
+                .new_generic_with_partial_results(
+                    context.clone(),
+                    request(),
+                    events_ctx,
+                    None,
+                    on_partial_result,
+                )
                 .await?
             {
                 CommandOutcome::Failure(result)

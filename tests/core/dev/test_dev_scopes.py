@@ -15,7 +15,7 @@
 # `test_dev`:
 #
 # - `//app:outputs` has `site`, built from `app/main.txt` and `//lib:lib`, and `extra`, built
-#   from `app/extra.txt`.
+#   from `app/extra.txt`. `//app:outputs_slow` is the same, with a delay for `site` only.
 # - `//app:scopes` has `site`, `exe` and `patch`, each built from `app/main.txt` and `//lib:lib`,
 #   and the scopes `app` (the target itself), `lib` (`//lib:lib`) and `both` (the two). Its
 #   server asks for every output when it starts. `//app:scopes_pages` is the same with
@@ -350,6 +350,71 @@ class DevScopesTest(BuckTestCase):
                 ["app/main.txt", "lib/lib.txt"],
             )
             assert stale(buck, message)["patch"] == (["both", "lib"], ["lib/lib.txt"])
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_ack_sets_when_the_server_got_an_output(self, buck: Buck) -> None:
+        dev, built = await start_manual(buck, "//app:scopes")
+        try:
+            assert built["last_of_generation"]
+            write(buck, "app/main.txt", "app v2\n")
+            await dev.expect("stale")
+
+            # The server gets `exe`, but has not said that it has it, so it is still stale.
+            dev.request({"type": "build", "outputs": ["exe"], "stale_until_ack": True})
+            _, built = await dev.expect("building", "built")
+            write(buck, "lib/lib.txt", "lib v2\n")
+            (message,) = await dev.expect("stale")
+            assert stale(buck, message)["exe"] == (
+                ["both"],
+                ["app/main.txt", "lib/lib.txt"],
+            )
+
+            # With the `exe` of that build, the server is up to date with `patch` too, which
+            # that build did not build. What changed before the build no longer makes them
+            # stale; what changed after it still does.
+            dev.request({"type": "ack", "gen": built["gen"], "outputs": ["exe", "patch"]})
+            dev.request({"type": "ack", "gen": built["gen"] + 100, "outputs": ["site"]})
+            dev.request({"type": "ack", "gen": built["gen"], "outputs": ["nothing"]})
+            # `ack` has no answer. Give the server time to send them.
+            await dev.quiet(1)
+            write(buck, "lib/lib.txt", "lib v3\n")
+            (message,) = await dev.expect("stale")
+            assert stale(buck, message) == {
+                "exe": (["both", "lib"], ["lib/lib.txt"]),
+                "patch": (["both", "lib"], ["lib/lib.txt"]),
+                "site": (["both"], ["app/main.txt", "lib/lib.txt"]),
+            }
+        finally:
+            output = await dev.stop()
+        assert "which has not started" in output, output
+        assert "`nothing`, which is not an output" in output, output
+
+    @dev_test()
+    async def test_streaming_sends_each_output_when_it_is_built(
+        self, buck: Buck
+    ) -> None:
+        dev, _ = await start_manual(buck, "//app:outputs_slow")
+        try:
+            write(buck, "app/delay.txt", "8\n")
+            await dev.expect("stale")
+            dev.request(
+                {"type": "build", "outputs": ["extra", "site"], "streaming": True}
+            )
+            building, first = await dev.expect("building", "built")
+            assert first["gen"] == building["gen"]
+            assert list(first["outputs"]) == ["extra"]
+            assert not first["last_of_generation"]
+
+            # `extra` is done, so a change to its file does not stop the build of `site`.
+            write(buck, "app/extra.txt", "extra v2\n")
+            (last,) = await dev.expect("built")
+            assert last["gen"] == building["gen"]
+            assert contents(last) == {"site": "lib v1\napp v1\n"}
+            assert last["last_of_generation"]
+            (message,) = await dev.expect("stale")
+            assert stale(buck, message) == {"extra": ([], ["app/extra.txt"])}
         finally:
             await dev.stop()
 

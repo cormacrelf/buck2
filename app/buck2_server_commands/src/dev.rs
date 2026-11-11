@@ -40,6 +40,9 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -82,6 +85,7 @@ use buck2_cli_proto::new_generic::DevTargets;
 use buck2_cli_proto::new_generic::DevWatchRequest;
 use buck2_cli_proto::new_generic::DevWatchState;
 use buck2_cli_proto::new_generic::DevWatched;
+use buck2_cli_proto::new_generic::NewGenericPartialResult;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::metadata::FileType;
@@ -132,7 +136,6 @@ use buck2_server_ctx::dev_interest::session_held_if_any;
 use buck2_server_ctx::dev_interest::set_interest;
 use buck2_server_ctx::dev_interest::stable_hash;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
-use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use buck2_server_ctx::template::ServerCommandTemplate;
 use buck2_server_ctx::template::run_server_command;
@@ -408,7 +411,9 @@ fn dev_policy(
 
 pub(crate) async fn dev_command(
     ctx: &dyn ServerCommandContextTrait,
-    partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+    partial_result_dispatcher: PartialResultDispatcher<
+        buck2_cli_proto::NewGenericPartialResultMessage,
+    >,
     req: DevRequest,
 ) -> buck2_error::Result<DevResponse> {
     // A build stops when a file that it builds from changes. Subscribe before the command syncs
@@ -439,12 +444,12 @@ impl ServerCommandTemplate for DevServerCommand {
     type StartEvent = buck2_data::DevCommandStart;
     type EndEvent = buck2_data::DevCommandEnd;
     type Response = DevResponse;
-    type PartialResult = NoPartialResult;
+    type PartialResult = buck2_cli_proto::NewGenericPartialResultMessage;
 
     async fn command(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
-        _partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
+        partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
         mut ctx: DiceTransaction,
     ) -> buck2_error::Result<Self::Response> {
         let changes = self
@@ -452,7 +457,8 @@ impl ServerCommandTemplate for DevServerCommand {
             .lock()
             .ok()
             .and_then(|mut changes| changes.take());
-        let response = dev(server_ctx, &mut ctx, &self.req, changes).await;
+        let partial_results = Mutex::new(partial_result_dispatcher);
+        let response = dev(server_ctx, &mut ctx, &self.req, changes, &partial_results).await;
         if response.is_err() && matches!(self.req.action, DevAction::Watch(_)) {
             // What fixes the target may be outside what it was built from.
             clear_interest(&self.req.session);
@@ -472,6 +478,9 @@ async fn dev(
     ctx: &mut DiceTransaction,
     req: &DevRequest,
     changes: Option<BoxStream<'static, FileChangeBatch>>,
+    partial_results: &Mutex<
+        PartialResultDispatcher<buck2_cli_proto::NewGenericPartialResultMessage>,
+    >,
 ) -> buck2_error::Result<DevResponse> {
     if let DevAction::Release = &req.action {
         // Needs no analysis: the target may not build any more.
@@ -560,7 +569,10 @@ async fn dev(
             Ok(DevResponse::Watch(watched))
         }
         DevAction::Release => Err(internal_error!("`Release` is handled above")),
-        DevAction::Build { outputs: names } => {
+        DevAction::Build {
+            outputs: names,
+            streaming,
+        } => {
             let sidecars = info.view().sidecars()?;
             let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
             for name in names {
@@ -583,20 +595,45 @@ async fn dev(
                 command_argv(artifact_fs, command, ensured)
             };
             let argv: Argv = &argv;
+            // The slots of the outputs that the build has yet to finish. A change to a file of
+            // one of them stops it. Only the outputs' slots matter here.
+            let all = dev_policy(info.view(), Vec::new())?.names;
+            let builds = AtomicU64::new(
+                all.iter()
+                    .enumerate()
+                    .filter(|(_, name)| names.contains(name))
+                    .fold(0, |mask, (output, _)| mask | slot_bit(output + 1)),
+            );
+            let builds = &builds;
+            let all = &all;
+            let emit = move |built: DevBuilt| -> buck2_error::Result<()> {
+                for name in built.outputs.keys().chain(built.failed.keys()) {
+                    if let Some(output) = all.iter().position(|n| n == name) {
+                        builds.fetch_and(!slot_bit(output + 1), Ordering::SeqCst);
+                    }
+                }
+                let json = serde_json::to_string(&NewGenericPartialResult::Dev(built))
+                    .buck_error_context("Could not serialize `NewGenericPartialResult`")?;
+                if let Ok(mut partial_results) = partial_results.lock() {
+                    partial_results.emit(buck2_cli_proto::NewGenericPartialResultMessage {
+                        new_generic_partial_result: json,
+                    });
+                }
+                Ok(())
+            };
+            let stream: Option<Stream> = streaming.then_some(&emit);
             let Some(changes) = changes else {
                 return Ok(DevResponse::Build(
-                    build(server_ctx.project_root(), &mut ctx.ctx(), wanted, argv).await?,
+                    build(
+                        server_ctx.project_root(),
+                        &mut ctx.ctx(),
+                        wanted,
+                        argv,
+                        stream,
+                    )
+                    .await?,
                 ));
             };
-            // The slots that this build is built from. A change to a file of one of them stops
-            // it.
-            // Only the outputs' slots matter here.
-            let all = dev_policy(info.view(), Vec::new())?.names;
-            let builds = all
-                .iter()
-                .enumerate()
-                .filter(|(_, name)| names.contains(name))
-                .fold(0, |mask, (output, _)| mask | slot_bit(output + 1));
             let claims = dev_claims(&mut ctx.ctx(), &label).await?;
             let io = ctx
                 .ctx()
@@ -615,7 +652,7 @@ async fn dev(
                 .compute2(
                     async move |dice| {
                         tokio::select! {
-                            built = build(project_root, dice, wanted, argv) => {
+                            built = build(project_root, dice, wanted, argv, stream) => {
                                 let _ignored = built_tx.send(());
                                 Some(built)
                             }
@@ -695,11 +732,12 @@ impl FileShape {
 
 /// Wait for a file that the build is built from to change from what this command saw, and say
 /// which did. A file saved without a change, and one that nothing builds from, are no change.
+/// `builds` has the slots of the outputs that the build has yet to finish.
 async fn changed_files(
     dice: &mut DiceComputations<'_>,
     mut changes: BoxStream<'static, FileChangeBatch>,
     claims: &DevClaims,
-    builds: u64,
+    builds: &AtomicU64,
     io: Arc<dyn IoProvider>,
 ) -> DevInterrupted {
     while let Some(batch) = changes.next().await {
@@ -715,7 +753,7 @@ async fn changed_files(
                 continue;
             }
             // A path that cannot be looked at counts as changed.
-            if builds_from_changed(dice, claims, builds, &io, &path)
+            if builds_from_changed(dice, claims, builds.load(Ordering::SeqCst), &io, &path)
                 .await
                 .unwrap_or(true)
             {
@@ -859,17 +897,26 @@ fn contents(
     Ok(contents)
 }
 
+/// Hands on the result of one output of a streaming build.
+type Stream<'a> = &'a (dyn Fn(DevBuilt) -> buck2_error::Result<()> + Sync);
+
 /// Build each output on its own: one that fails does not keep the others from the server. An
 /// output fails if one of its sidecars, or an artifact associated with it or with a sidecar,
-/// does.
+/// does. With `stream`, the result of each output but the last to finish goes to `stream` as
+/// soon as it is known, and the result has only the last.
 async fn build(
     project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
     wanted: Vec<Wanted>,
     argv: Argv<'_>,
+    stream: Option<Stream<'_>>,
 ) -> buck2_error::Result<DevBuilt> {
     let artifact_fs = dice.get_artifact_fs().await?;
-    let built = dice
+    let artifact_fs = &artifact_fs;
+    // The outputs that have yet to finish.
+    let remaining = AtomicUsize::new(wanted.len());
+    let remaining = &remaining;
+    let results = dice
         .compute_join(wanted, async |dice, wanted| {
             let Wanted {
                 name,
@@ -890,69 +937,100 @@ async fn build(
                     buck2_error::Ok((sidecar, groups))
                 })
                 .await;
-            (name, command, values)
+            let result = match values {
+                Ok(values) => {
+                    output_result(project_root, artifact_fs, argv, &name, command, values)?
+                }
+                Err(e) => Err(output_error(&e)),
+            };
+            if let Some(stream) = stream {
+                if remaining.fetch_sub(1, Ordering::SeqCst) > 1 {
+                    let mut built = DevBuilt {
+                        outputs: BTreeMap::new(),
+                        failed: BTreeMap::new(),
+                    };
+                    match result {
+                        Ok(output) => {
+                            built.outputs.insert(name, output);
+                        }
+                        Err(error) => {
+                            built.failed.insert(name, error);
+                        }
+                    }
+                    stream(built)?;
+                    return buck2_error::Ok(None);
+                }
+            }
+            buck2_error::Ok(Some((name, result)))
         })
         .await;
     let mut outputs = BTreeMap::new();
     let mut failed = BTreeMap::new();
-    for (name, command, values) in built {
-        let mut values = match values {
-            Ok(values) => values,
-            Err(e) => {
-                failed.insert(name, output_error(&e));
-                continue;
+    for result in results {
+        match result? {
+            Some((name, Ok(output))) => {
+                outputs.insert(name, output);
             }
-        };
-        let mut output = None;
-        if command {
-            // The output comes first. What its command line names is all that it is.
-            let (_, groups) = values.remove(0);
-            match argv(&name, &artifact_fs, &groups) {
-                Ok(argv) => {
-                    let digest = contents_digest(contents(&artifact_fs, &groups)?);
-                    output = Some((None, Some(argv), Some(digest)));
-                }
-                Err(e) => {
-                    failed.insert(name, output_error(&e));
-                    continue;
-                }
+            Some((name, Err(error))) => {
+                failed.insert(name, error);
             }
+            None => {}
         }
-        let mut sidecars = BTreeMap::new();
-        for (sidecar, groups) in values {
-            // The artifact comes first, and then those associated with it.
-            let (artifact, value) = groups
-                .first()
-                .and_then(|(_, values)| values.iter().next())
-                .ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
-            let path =
-                artifact.resolve_path(&artifact_fs, Some(&value.content_based_path_hash()))?;
-            let path = project_root.resolve(&path).to_string();
-            let digest = if groups.len() > 1 {
-                // A new associated artifact is a new output, also with the same artifact.
-                Some(contents_digest(contents(&artifact_fs, &groups)?))
-            } else {
-                value.digest().map(|d| d.to_string())
-            };
-            match sidecar {
-                Some(sidecar) => {
-                    sidecars.insert(sidecar, DevBuiltSidecar { path, digest });
-                }
-                None => output = Some((Some(path), None, digest)),
-            }
-        }
-        let (path, argv, digest) = output.ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
-        outputs.insert(
-            name,
-            DevBuiltOutput {
-                path,
-                argv,
-                digest,
-                sidecars,
-            },
-        );
     }
     Ok(DevBuilt { outputs, failed })
+}
+
+/// What the server gets of an output that built, from its artifacts and those of its sidecars,
+/// the output's first. `Err` says why it cannot have it.
+fn output_result(
+    project_root: &ProjectRoot,
+    artifact_fs: &ArtifactFs,
+    argv: Argv<'_>,
+    name: &str,
+    command: bool,
+    mut values: Vec<(Option<String>, Ensured)>,
+) -> buck2_error::Result<Result<DevBuiltOutput, String>> {
+    let mut output = None;
+    if command {
+        // The output comes first. What its command line names is all that it is.
+        let (_, groups) = values.remove(0);
+        match argv(name, artifact_fs, &groups) {
+            Ok(argv) => {
+                let digest = contents_digest(contents(artifact_fs, &groups)?);
+                output = Some((None, Some(argv), Some(digest)));
+            }
+            Err(e) => return Ok(Err(output_error(&e))),
+        }
+    }
+    let mut sidecars = BTreeMap::new();
+    for (sidecar, groups) in values {
+        // The artifact comes first, and then those associated with it.
+        let (artifact, value) = groups
+            .first()
+            .and_then(|(_, values)| values.iter().next())
+            .ok_or_else(|| DevError::EmptyOutput(name.to_owned()))?;
+        let path = artifact.resolve_path(artifact_fs, Some(&value.content_based_path_hash()))?;
+        let path = project_root.resolve(&path).to_string();
+        let digest = if groups.len() > 1 {
+            // A new associated artifact is a new output, also with the same artifact.
+            Some(contents_digest(contents(artifact_fs, &groups)?))
+        } else {
+            value.digest().map(|d| d.to_string())
+        };
+        match sidecar {
+            Some(sidecar) => {
+                sidecars.insert(sidecar, DevBuiltSidecar { path, digest });
+            }
+            None => output = Some((Some(path), None, digest)),
+        }
+    }
+    let (path, argv, digest) = output.ok_or_else(|| DevError::EmptyOutput(name.to_owned()))?;
+    Ok(Ok(DevBuiltOutput {
+        path,
+        argv,
+        digest,
+        sidecars,
+    }))
 }
 
 /// The most of an action's stdout or stderr that `output_error` keeps: the end, where the

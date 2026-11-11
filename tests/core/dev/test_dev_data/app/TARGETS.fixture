@@ -206,6 +206,17 @@ dev_app(
     server_args = ["--all-outputs"],
 )
 
+# `outputs` with a delay for `site`, and none for `extra`.
+dev_app(
+    name = "outputs_slow",
+    mode = "outputs",
+    srcs = ["main.txt"],
+    deps = ["//lib:lib"],
+    delay = "delay.txt",
+    extra_outputs = {"extra": ["extra.txt"]},
+    server = "server.py",
+)
+
 dev_app(
     name = "scopes",
     mode = "patch",
