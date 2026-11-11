@@ -3424,6 +3424,7 @@ dependencies = [
  "dupe",
  "futures 0.3.34",
  "pin-project",
+ "tokio",
  "tonic",
  "tracing",
 ]

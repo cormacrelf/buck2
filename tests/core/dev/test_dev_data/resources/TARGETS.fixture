@@ -1,0 +1,67 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//:resource_defs.bzl", "dev_with_resources", "local_resource")
+
+# Gives the server the process ID of its holder, which a new setup changes.
+local_resource(
+    name = "db",
+    env = {
+        "DEV_DB_PID": "pid",
+        "DEV_DB_VERSION": "version",
+    },
+    setup = "setup.py",
+    version = "db_version.txt",
+)
+
+# Gives the server the same port after every setup.
+local_resource(
+    name = "cache",
+    env = {"DEV_CACHE_PORT": "port"},
+    setup = "setup.py",
+    version = "cache_version.txt",
+)
+
+local_resource(
+    name = "broken",
+    env = {"DEV_BROKEN_PORT": "port"},
+    setup = "setup.py",
+    version = "broken_version.txt",
+)
+
+local_resource(
+    name = "slow",
+    env = {"DEV_SLOW_PORT": "port"},
+    setup = "setup.py",
+    timeout = 2,
+    version = "slow_version.txt",
+)
+
+dev_with_resources(
+    name = "app",
+    resources = {
+        "cache": ":cache",
+        "db": ":db",
+    },
+    page = "page.txt",
+    server = "server.py",
+)
+
+dev_with_resources(
+    name = "app_broken",
+    resources = {"broken": ":broken"},
+    page = "page.txt",
+    server = "server.py",
+)
+
+dev_with_resources(
+    name = "app_slow",
+    resources = {"slow": ":slow"},
+    page = "page.txt",
+    server = "server.py",
+)

@@ -2167,6 +2167,10 @@ fn server_shutdown_signal(
         // The clock starts at the decision to shut down, not once the drain returns, so that the
         // deadline bounds the drain as well as the teardown that follows it.
         spawn_shutdown_watchdog(in_process, shutdown_deadline);
+        // Release the local resources of `buck2 dev` sessions now, without waiting for their
+        // subscriptions to end: the drain may not get that far before the deadline. The release
+        // sends `SIGTERM` at once, and waits for the processes while the daemon drains.
+        tokio::spawn(buck2_server_ctx::dev_interest::release_all_sessions());
 
         let _ = shutdown_deadline_sender.send(shutdown_deadline);
     };

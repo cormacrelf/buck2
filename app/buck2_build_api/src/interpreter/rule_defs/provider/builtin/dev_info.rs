@@ -13,8 +13,10 @@
 use allocative::Allocative;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api_derive::internal_provider;
+use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_error::BuckErrorContext;
 use buck2_hash::BuckMutInsertionMap;
+use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use either::Either;
@@ -38,6 +40,7 @@ use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::AllocList;
 use starlark::values::list::ListRef;
 use starlark::values::list::ListType;
+use starlark::values::none::NoneType;
 
 use crate as buck2_build_api;
 use crate::artifact_groups::ArtifactGroup;
@@ -49,6 +52,9 @@ use crate::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use crate::interpreter::rule_defs::provider::builtin::dev_output::DevOutput;
+use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::check_all;
+use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::iter_local_resources;
+use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::unwrap_all;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
@@ -166,6 +172,11 @@ pub struct DevInfo<'v> {
         ValueOfUnchecked<'v, DictType<String, DictType<String, ValueIsInputArtifactAnnotation>>>,
     /// Whether the server gets the terminal: its stdin, and the keys typed into it.
     interactive: ValueOfUnchecked<'v, bool>,
+    /// The local resources that `buck2 dev` sets up before it starts the server: a name for each,
+    /// with the label of a target that has a `LocalResourceInfo`, as in
+    /// `ExternalRunnerTestInfo.local_resources`. A name without a label is ignored.
+    local_resources:
+        ValueOfUnchecked<'v, DictType<String, Option<StarlarkConfiguredProvidersLabel>>>,
 }
 
 #[starlark_module]
@@ -187,12 +198,20 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     /// * `interactive`: give the server the terminal, for a server that reads keys or lines
     ///   from it, such as a REPL. Otherwise its stdin is empty, and Ctrl-C reaches only
     ///   `buck2 dev`.
+    /// * `local_resources`: processes that the server needs, such as a database, by name: a
+    ///   dictionary from a name to the label of a target with a `LocalResourceInfo`, as in
+    ///   `ExternalRunnerTestInfo`. The daemon runs the setup command of each before
+    ///   `buck2 dev` starts the server, which gets the environment variables that the
+    ///   `LocalResourceInfo` maps. A resource keeps running while the server restarts, and is
+    ///   set up again when its setup command is new or it exited. The daemon releases them when
+    ///   `buck2 dev` exits.
     #[starlark(as_type = DevInfo<'static>)]
     fn DevInfo<'v>(
         #[starlark(require = named)] server: Value<'v>,
         #[starlark(require = named, default = UnpackDictEntries::default())]
         outputs: UnpackDictEntries<Value<'v>, Value<'v>>,
         #[starlark(require = named, default = false)] interactive: bool,
+        #[starlark(require = named, default = NoneType)] local_resources: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<DevInfo<'v>> {
         let heap = eval.heap();
@@ -228,6 +247,7 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
             only: ValueOfUnchecked::new(heap.alloc(AllocDict(only))),
             sidecars: ValueOfUnchecked::new(heap.alloc(AllocDict(sidecars))),
             interactive: heap.alloc_typed_unchecked(interactive).cast(),
+            local_resources: ValueOfUnchecked::new(local_resources),
         };
         validate_dev_info(&info)?;
         Ok(info)
@@ -349,6 +369,14 @@ impl<'v> DevInfo<'v> {
             .collect()
     }
 
+    /// `local_resources`: each name, with the label of the target that has its
+    /// `LocalResourceInfo`. Names without a label are left out.
+    pub fn local_resources(&self) -> Vec<(&'v str, &'v ConfiguredProvidersLabel)> {
+        unwrap_all(iter_local_resources(self.local_resources.get()))
+            .filter_map(|(name, label)| Some((name, label?)))
+            .collect()
+    }
+
     /// The target patterns of `only`, for each output that has it.
     pub fn only(&self) -> BuckMutInsertionMap<String, Vec<String>> {
         DictRef::from_value(self.only.get())
@@ -391,5 +419,6 @@ fn validate_dev_info<'v>(info: &DevInfo<'v>) -> buck2_error::Result<()> {
             .into());
         }
     }
+    check_all(iter_local_resources(info.local_resources.get()))?;
     Ok(())
 }

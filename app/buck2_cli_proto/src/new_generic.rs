@@ -160,6 +160,9 @@ pub enum DevAction {
     Watch(DevWatchRequest),
     /// Build the named `DevInfo.outputs`. The build stops if a file that it builds from changes.
     Build { outputs: Vec<String> },
+    /// Release the local resources that the daemon holds for the session, and wait until they
+    /// are gone. `buck2 dev` sends it after it has stopped the server.
+    Release,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -169,6 +172,7 @@ pub enum DevResponse {
     Build(DevBuilt),
     /// The build stopped.
     Interrupted(DevInterrupted),
+    Released,
 }
 
 /// Why a `Build` stopped.
@@ -194,6 +198,16 @@ pub struct DevServer {
     pub outputs: Vec<String>,
     /// `DevInfo.interactive`: the server gets the terminal.
     pub interactive: bool,
+    /// The environment variables that the local resources give the server.
+    pub env: Vec<(String, String)>,
+    /// One name for each local resource as it runs now. A resource that was set up anew has a
+    /// new name, so a server that was started before it is out of date.
+    pub resources: Vec<String>,
+    /// The local resources that had exited by themselves, and that the daemon set up again.
+    pub resources_exited: Vec<String>,
+    /// Why local resources could not be set up, one message for each. The server must not run
+    /// without them.
+    pub resource_errors: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

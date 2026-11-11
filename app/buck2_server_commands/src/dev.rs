@@ -59,6 +59,8 @@ use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevArt
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevOutputSpec;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::OwnedDevInfo;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::local_resource_info::LocalResourceInfo;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::local_resource_info::OwnedLocalResourceInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::OwnedRunInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
@@ -122,6 +124,8 @@ use buck2_server_ctx::ctx::FileChangeBatch;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::dev_interest::FileInterest;
 use buck2_server_ctx::dev_interest::clear_interest;
+use buck2_server_ctx::dev_interest::session_held;
+use buck2_server_ctx::dev_interest::session_held_if_any;
 use buck2_server_ctx::dev_interest::set_interest;
 use buck2_server_ctx::dev_interest::stable_hash;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
@@ -143,6 +147,11 @@ use futures::stream::BoxStream;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 
+use crate::dev_resources::ResourcesUpdate;
+use crate::dev_resources::SessionResources;
+use crate::dev_resources::SetupKey;
+use crate::dev_resources::WantedResource;
+
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
 enum DevError {
@@ -159,6 +168,17 @@ enum DevError {
     },
     #[error("Output `{0}` of the `DevInfo` produced no artifact")]
     EmptyOutput(String),
+    #[error(
+        "`DevInfo.local_resources` names `{target}` for `{name}`, which has no `LocalResourceInfo` provider"
+    )]
+    NoLocalResourceInfo {
+        name: String,
+        target: ConfiguredProvidersLabel,
+    },
+    #[error(
+        "The `buck2 dev` session `{0}` has no file change subscription, so the daemon cannot hold its local resources"
+    )]
+    NoSession(String),
     #[error("`buck2 dev` takes at most {MAX_SLOTS} {0}, but the `DevInfo` has {1}")]
     TooManySlots(&'static str, usize),
 }
@@ -266,11 +286,71 @@ impl<'a> DevView<'a> {
             DevView::Run(_) => false,
         }
     }
+
+    fn local_resources(self) -> Vec<(String, ConfiguredProvidersLabel)> {
+        match self {
+            DevView::Dev(info) => info
+                .local_resources()
+                .into_iter()
+                .map(|(name, label)| (name.to_owned(), label.dupe()))
+                .collect(),
+            DevView::Run(_) => Vec::new(),
+        }
+    }
+}
+
+/// A local resource of the server: a name in `DevInfo.local_resources`, and the target that
+/// has its `LocalResourceInfo`.
+struct Resource {
+    name: String,
+    target: ConfiguredProvidersLabel,
+    info: OwnedLocalResourceInfo,
+}
+
+impl Resource {
+    fn setup_command_line(&self) -> &dyn CommandLineArgLike<'_> {
+        self.info.as_ref().value().as_ref().setup_command_line()
+    }
+}
+
+/// The `LocalResourceInfo` of each of `DevInfo.local_resources`.
+async fn dev_resources(
+    dice: &mut DiceComputations<'_>,
+    info: &DevProvider,
+) -> buck2_error::Result<Vec<Resource>> {
+    let mut resources = Vec::new();
+    for (name, target) in info.view().local_resources() {
+        let providers = dice.get_providers(&target).await?.require_compatible()?;
+        let info = providers
+            .builtin_provider_value::<LocalResourceInfo>()?
+            .ok_or_else(|| DevError::NoLocalResourceInfo {
+                name: name.clone(),
+                target: target.dupe(),
+            })?;
+        resources.push(Resource { name, target, info });
+    }
+    Ok(resources)
+}
+
+/// The artifacts that the setup commands of `resources` name. They count as the server's: a
+/// change to them may make a setup command new.
+fn resource_inputs(resources: &[Resource]) -> buck2_error::Result<Vec<ArtifactGroup>> {
+    let mut visitor = SimpleCommandLineArtifactVisitor::new();
+    for resource in resources {
+        resource
+            .setup_command_line()
+            .visit_artifacts(&mut visitor)?;
+    }
+    Ok(visitor.inputs.into_iter().collect())
 }
 
 /// The names of the outputs of a `DevInfo`, and its slots: slot 0 is the server, and slot
-/// `i + 1` is the output with the `i`th of these names.
-fn dev_policy(info: DevView<'_>) -> buck2_error::Result<(Vec<String>, Vec<Slot>)> {
+/// `i + 1` is the output with the `i`th of these names. `resource_inputs` are what the setup
+/// commands of the local resources name, which belong to the server's slot.
+fn dev_policy(
+    info: DevView<'_>,
+    resource_inputs: Vec<ArtifactGroup>,
+) -> buck2_error::Result<(Vec<String>, Vec<Slot>)> {
     let outputs = info.outputs()?;
     if outputs.len() + 1 > MAX_SLOTS {
         return Err(DevError::TooManySlots("outputs and the server", outputs.len() + 1).into());
@@ -281,7 +361,7 @@ fn dev_policy(info: DevView<'_>) -> buck2_error::Result<(Vec<String>, Vec<Slot>)
     info.server_command_line().visit_artifacts(&mut visitor)?;
     let mut slots = vec![Slot {
         what: "`DevInfo.server`".to_owned(),
-        inputs: visitor.inputs.into_iter().collect(),
+        inputs: visitor.inputs.into_iter().chain(resource_inputs).collect(),
         only: None,
     }];
     let mut names = Vec::new();
@@ -312,7 +392,7 @@ pub(crate) async fn dev_command(
     // subscription reports. A change in between is reported but is no change to the build.
     let changes = match &req.action {
         DevAction::Build { .. } => ctx.subscribe_to_file_changes().await.ok(),
-        DevAction::Server | DevAction::Watch(_) => None,
+        DevAction::Server | DevAction::Watch(_) | DevAction::Release => None,
     };
     run_server_command(
         DevServerCommand {
@@ -369,6 +449,13 @@ async fn dev(
     req: &DevRequest,
     changes: Option<BoxStream<'static, FileChangeBatch>>,
 ) -> buck2_error::Result<DevResponse> {
+    if let DevAction::Release = &req.action {
+        // Needs no analysis: the target may not build any more.
+        if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
+            resources.release_all().await?;
+        }
+        return Ok(DevResponse::Released);
+    }
     let label = configured_label(server_ctx, &mut ctx.ctx(), req).await?;
     let providers = ctx
         .ctx()
@@ -386,28 +473,75 @@ async fn dev(
                 "Failed to build the `buck2 dev` server",
             )
             .await?;
+            let resources = dev_resources(&mut ctx.ctx(), &info).await?;
+            let resources = if resources.is_empty()
+                && session_held_if_any::<SessionResources>(&req.session).is_none()
+            {
+                ResourcesUpdate::default()
+            } else {
+                let mut wanted = Vec::with_capacity(resources.len());
+                for resource in resources {
+                    let what = format!(
+                        "Failed to build the setup command of local resource `{}` (`{}`)",
+                        resource.name, resource.target
+                    );
+                    let (argv, digest) =
+                        build_command(&mut ctx.ctx(), || resource.setup_command_line(), &what)
+                            .await?;
+                    let env = resource
+                        .info
+                        .as_ref()
+                        .value()
+                        .as_ref()
+                        .env_var_mapping()
+                        .into_iter()
+                        .collect();
+                    wanted.push(WantedResource {
+                        name: resource.name,
+                        target: resource.target,
+                        info: resource.info,
+                        key: SetupKey { argv, digest, env },
+                    });
+                }
+                let held = session_held(&req.session, SessionResources::default)
+                    .ok_or_else(|| DevError::NoSession(req.session.clone()))?;
+                held.update(&mut ctx.ctx(), server_ctx.cancellation_context(), wanted)
+                    .await?
+            };
             Ok(DevResponse::Server(DevServer {
                 project_root: server_ctx.project_root().root().to_string(),
                 server,
                 digest,
                 outputs: outputs.keys().cloned().collect(),
                 interactive: info.view().interactive(),
+                env: resources.env,
+                resources: resources.running,
+                resources_exited: resources.exited,
+                resource_errors: resources.errors,
             }))
         }
         DevAction::Watch(request) => {
-            let (names, slots) = dev_policy(info.view())?;
-            Ok(DevResponse::Watch(
-                watch_files(
-                    &mut ctx.ctx(),
-                    &label,
-                    &names,
-                    &slots,
-                    request,
-                    &req.session,
-                )
-                .await?,
-            ))
+            let resources = dev_resources(&mut ctx.ctx(), &info).await?;
+            let (names, slots) = dev_policy(info.view(), resource_inputs(&resources)?)?;
+            let mut watched = watch_files(
+                &mut ctx.ctx(),
+                &label,
+                &names,
+                &slots,
+                request,
+                &req.session,
+            )
+            .await?;
+            // A local resource that exited is set up again by the analysis that the client runs
+            // when the server may be new.
+            if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
+                if resources.any_exited().await {
+                    watched.outputs.server = true;
+                }
+            }
+            Ok(DevResponse::Watch(watched))
         }
+        DevAction::Release => Err(internal_error!("`Release` is handled above")),
         DevAction::Build { outputs: names } => {
             let sidecars = info.view().sidecars()?;
             let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
@@ -438,7 +572,8 @@ async fn dev(
             };
             // The slots that this build is built from. A change to a file of one of them stops
             // it.
-            let (all, _) = dev_policy(info.view())?;
+            // Only the outputs' slots matter here.
+            let (all, _) = dev_policy(info.view(), Vec::new())?;
             let builds = all
                 .iter()
                 .enumerate()
@@ -1670,7 +1805,8 @@ async fn dev_slots(
 ) -> buck2_error::Result<Vec<Slot>> {
     let providers = dice.get_providers(label).await?.require_compatible()?;
     let info = DevProvider::of(&providers, label)?;
-    Ok(dev_policy(info.view())?.1)
+    let resources = dev_resources(dice, &info).await?;
+    Ok(dev_policy(info.view(), resource_inputs(&resources)?)?.1)
 }
 
 /// Say what the requested paths are to the server and to the outputs, and whose targets

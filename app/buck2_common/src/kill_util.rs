@@ -29,6 +29,21 @@ pub async fn try_terminate_process_gracefully(
     }
 }
 
+/// Whether the process `pid` still runs: it exists, and has not terminated. Outside Unix, a
+/// process is taken to run.
+#[allow(unused_variables)]
+pub fn process_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        unix::process_alive(pid)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::ops::ControlFlow;
@@ -38,6 +53,16 @@ mod unix {
     use nix::sys::signal::Signal;
     use tracing::info;
     use tracing::warn;
+
+    pub(crate) fn process_alive(pid: i32) -> bool {
+        let pid = nix::unistd::Pid::from_raw(pid);
+        match nix::sys::signal::kill(pid, None) {
+            Ok(()) => !is_zombie(pid),
+            // It exists, and belongs to someone else.
+            Err(nix::errno::Errno::EPERM) => true,
+            Err(_) => false,
+        }
+    }
 
     pub(crate) async fn try_terminate_process_gracefully(
         pid: i32,

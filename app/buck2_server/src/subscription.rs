@@ -92,12 +92,13 @@ pub(crate) async fn run_subscription_server_command(
         .command_start_event(buck2_data::SubscriptionCommandStart {}.into())
         .await?;
     span_async(start_event, async move {
+        // Outside the `try`, so that it is ended however the subscription ends.
+        let mut interest: Option<InterestSubscription> = None;
         let result: buck2_error::Result<buck2_cli_proto::SubscriptionCommandResponse> = try {
             let mut wants_active_commands = false;
             // This command takes no lock on the daemon's state, so it neither waits for other
             // commands nor holds them up.
             let mut file_changes: Option<FileChangeSubscription> = None;
-            let mut interest: Option<InterestSubscription> = None;
 
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -171,6 +172,11 @@ pub(crate) async fn run_subscription_server_command(
 
             buck2_cli_proto::SubscriptionCommandResponse {}
         };
+        // The session's local resources are released once its last subscription ends, before
+        // this command does.
+        if let Some(interest) = interest {
+            interest.end().await;
+        }
 
         let end_event = command_end(&result, buck2_data::SubscriptionCommandEnd {});
         (result, end_event)

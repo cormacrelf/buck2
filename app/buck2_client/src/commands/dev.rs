@@ -505,6 +505,10 @@ struct Server {
     interactive: bool,
     /// The digest of what the command line names, as it was when the server started.
     digest: String,
+    /// The environment variables that the local resources gave the server.
+    env: Vec<(String, String)>,
+    /// The local resources that ran when the server started. See `DevServer.resources`.
+    resources: Vec<String>,
     /// Connections made since the server started that have not sent `hello` yet.
     unintroduced: BuckMutMap<u64, Connection>,
     /// The connection that sent `hello`. Messages to the server go to it.
@@ -983,7 +987,12 @@ impl<'a> Session<'a> {
             cancelled_files: BTreeSet::new(),
             cancelled_requested: BTreeSet::new(),
         };
-        session.spawn().await?;
+        if session.resources_up()? {
+            session.spawn().await?;
+        } else {
+            // The next change that starts the server sets up the resources again.
+            session.restart_due = true;
+        }
         Ok(Ok(session))
     }
 
@@ -1065,10 +1074,22 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Stop the server before `buck2 dev` exits. Another Ctrl-C kills it at once.
+    /// Stop the server before `buck2 dev` exits, and then have the daemon release the local
+    /// resources. Another Ctrl-C kills the server at once.
     async fn shutdown(&mut self) {
+        let mut interrupted = false;
         if let Some(mut server) = self.link.server.take() {
-            server.stop(&mut self.signals).await;
+            interrupted = server.stop(&mut self.signals).await;
+        }
+        // The daemon holds the local resources. Wait until it has released them, so that what
+        // they used, such as a port, is free once `buck2 dev` exits. Another Ctrl-C stops
+        // waiting; the daemon releases them anyway.
+        if !interrupted && !self.server_info.resources.is_empty() {
+            let release = self.daemon.request(|| DevAction::Release);
+            tokio::select! {
+                _ = release => {}
+                () = self.signals.quit() => {}
+            }
         }
         // Show what the server wrote as it stopped, and take the status line off the terminal.
         self.link.console.send(SessionUpdate::Status(String::new()));
@@ -1565,17 +1586,37 @@ impl<'a> Session<'a> {
         self.resolve_due = false;
         self.resolve_failure = None;
         // Start the server again if a restart is due, or it would start differently, or it
-        // would run something else: what its command line names has other contents.
+        // would run something else: what its command line names has other contents, or a local
+        // resource was set up anew, or the resources give it other variables.
         let restart = std::mem::take(&mut self.restart_due)
             || match &self.link.server {
                 Some(server) => {
                     server.argv != info.server
                         || server.interactive != info.interactive
                         || server.digest != info.digest
+                        || server.env != info.env
+                        || info
+                            .resources
+                            .iter()
+                            .any(|resource| !server.resources.contains(resource))
                 }
                 None => start_exited,
             };
         self.server_info = info;
+        if !self.resources_up()? {
+            // The server runs only with all its resources. The next analysis sets them up
+            // again, and starts it.
+            if let Some(mut server) = self.link.server.take() {
+                if server.stop(&mut self.signals).await {
+                    self.link.exit = Some(ExitResult::signal_interrupt());
+                }
+            }
+            self.restart_due = true;
+            return Ok(Resolved {
+                failed: None,
+                respawned: true,
+            });
+        }
         if restart {
             self.respawn().await?;
         }
@@ -1586,6 +1627,21 @@ impl<'a> Session<'a> {
             failed: None,
             respawned: restart,
         })
+    }
+
+    /// Say what the last analysis did to the local resources. Returns whether all of them run.
+    fn resources_up(&self) -> buck2_error::Result<bool> {
+        for name in &self.server_info.resources_exited {
+            self.link.console.message(format!(
+                "Local resource `{name}` had exited. `buck2 dev` set it up again."
+            ))?;
+        }
+        for error in &self.server_info.resource_errors {
+            self.link.console.message(format!(
+                "{error}\n`buck2 dev` tries again, and starts the server, after the next change."
+            ))?;
+        }
+        Ok(self.server_info.resource_errors.is_empty())
     }
 
     fn send_failed(&mut self, messages: Vec<String>) {
@@ -1633,7 +1689,14 @@ impl<'a> Session<'a> {
         }
         if !changed.is_empty() {
             match self.request(|| DevAction::Server).await? {
-                Outcome::Done(DevResponse::Server(info)) => self.server_info = info,
+                Outcome::Done(DevResponse::Server(info)) => {
+                    self.server_info = info;
+                    if !self.resources_up()? {
+                        self.restart_due = true;
+                        self.queued.extend(changed);
+                        return Ok(());
+                    }
+                }
                 Outcome::Done(_) => return Err(unexpected_response()),
                 Outcome::Failed(messages) => {
                     // No server runs; the next analysis starts it.
@@ -1693,6 +1756,7 @@ impl<'a> Session<'a> {
         let process = ServerProcess::spawn(
             &argv,
             &self.server_info.project_root,
+            &self.server_info.env,
             interactive,
             self.listener.address(),
             output,
@@ -1702,6 +1766,8 @@ impl<'a> Session<'a> {
             argv: self.server_info.server.clone(),
             interactive: self.server_info.interactive,
             digest: self.server_info.digest.clone(),
+            env: self.server_info.env.clone(),
+            resources: self.server_info.resources.clone(),
             unintroduced: BuckMutMap::default(),
             conn: None,
             first_conn,

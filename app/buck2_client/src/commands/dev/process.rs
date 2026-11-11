@@ -54,11 +54,13 @@ pub(super) struct ServerProcess {
 }
 
 impl ServerProcess {
-    /// Start `argv` in `cwd`, with `BUCK2_DEV_SOCKET` set to `socket`. With `output`, its
-    /// stdout and stderr go there as lines, rather than to the terminal.
+    /// Start `argv` in `cwd`, with `env`, from the local resources, and `BUCK2_DEV_SOCKET` set
+    /// to `socket`. With `output`, its stdout and stderr go there as lines, rather than to the
+    /// terminal.
     pub(super) fn spawn(
         argv: &[String],
         cwd: &str,
+        env: &[(String, String)],
         interactive: bool,
         socket: &str,
         output: Option<mpsc::UnboundedSender<SessionUpdate>>,
@@ -75,6 +77,7 @@ impl ServerProcess {
         command
             .args(args)
             .current_dir(cwd)
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .env(super::channel::SOCKET_ENV, socket)
             .stdin(if interactive {
                 Stdio::inherit()

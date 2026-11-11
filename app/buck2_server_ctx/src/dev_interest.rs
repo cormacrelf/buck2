@@ -20,7 +20,11 @@
 //! An interest is a summary, and may be out of date: it lets through more than matters, and what
 //! it holds back cannot change what the target is built from without another change that it
 //! lets through. See `FileInterest::may_matter`.
+//!
+//! A session also holds the local resources of its server here (see `SessionHeld`), so that they
+//! outlive each request, and are released when the session's last subscription ends.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
@@ -30,6 +34,7 @@ use std::sync::Mutex;
 
 use allocative::Allocative;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use futures::future::BoxFuture;
 
 /// A hash of `text` that is the same in another daemon.
 pub fn stable_hash(text: &str) -> u64 {
@@ -137,6 +142,14 @@ impl FileInterest {
     }
 }
 
+/// What a `buck2 dev` session holds in the daemon besides its interest: the local resources of
+/// its server. It lives as long as the session's subscriptions, and is released when the last of
+/// them ends, or when the daemon shuts down.
+pub trait SessionHeld: Send + Sync + 'static {
+    /// Release what is held. It may be called again, and then releases what was taken since.
+    fn release(self: Arc<Self>) -> BoxFuture<'static, ()>;
+}
+
 /// A session's interest, and how many subscriptions of the session there are: a subscription
 /// that replaces a lost one may start before the lost one is gone.
 #[derive(Default)]
@@ -144,6 +157,9 @@ struct Session {
     subscriptions: usize,
     /// `None` until a request of the session leaves it.
     interest: Option<Arc<FileInterest>>,
+    /// What the session holds, once a request has taken something: the same value as each of
+    /// the two types.
+    held: Option<(Arc<dyn Any + Send + Sync>, Arc<dyn SessionHeld>)>,
 }
 
 /// The sessions whose subscriptions asked for their interest.
@@ -154,10 +170,11 @@ fn with_sessions<R>(f: impl FnOnce(&mut HashMap<String, Session>) -> R) -> R {
     f(sessions.get_or_insert_with(HashMap::new))
 }
 
-/// A subscription that drops the changes that cannot matter to a session. Dropping the last one
-/// of a session forgets the session's interest.
+/// A subscription that drops the changes that cannot matter to a session. Ending the last one
+/// of a session forgets the session's interest, and releases what the session holds.
 pub struct InterestSubscription {
     session: String,
+    ended: bool,
 }
 
 impl InterestSubscription {
@@ -165,7 +182,35 @@ impl InterestSubscription {
         with_sessions(|sessions| {
             sessions.entry(session.clone()).or_default().subscriptions += 1;
         });
-        InterestSubscription { session }
+        InterestSubscription {
+            session,
+            ended: false,
+        }
+    }
+
+    /// End the subscription. If it is the last of its session, release what the session holds,
+    /// and wait for that.
+    pub async fn end(mut self) {
+        if let Some(held) = self.leave() {
+            held.release().await;
+        }
+    }
+
+    /// Count this subscription out of its session. Returns what the session holds if this was
+    /// its last subscription.
+    fn leave(&mut self) -> Option<Arc<dyn SessionHeld>> {
+        if std::mem::replace(&mut self.ended, true) {
+            return None;
+        }
+        with_sessions(|sessions| {
+            let session = sessions.get_mut(&self.session)?;
+            session.subscriptions -= 1;
+            if session.subscriptions != 0 {
+                return None;
+            }
+            let session = sessions.remove(&self.session)?;
+            session.held.map(|(_, held)| held)
+        })
     }
 
     /// The session's interest, or `None` until its first request has left one: everything may
@@ -180,16 +225,48 @@ impl InterestSubscription {
 }
 
 impl Drop for InterestSubscription {
+    /// Reached without `end` only if the subscription stops unexpectedly. The release then runs
+    /// on its own.
     fn drop(&mut self) {
-        with_sessions(|sessions| {
-            if let Some(session) = sessions.get_mut(&self.session) {
-                session.subscriptions -= 1;
-                if session.subscriptions == 0 {
-                    sessions.remove(&self.session);
-                }
+        if let Some(held) = self.leave() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(held.release());
             }
-        });
+        }
     }
+}
+
+/// What `session` holds, made by `make` if it holds nothing yet. `None` if the session has no
+/// subscription, and so nothing that would release it.
+pub fn session_held<T: SessionHeld>(session: &str, make: impl FnOnce() -> T) -> Option<Arc<T>> {
+    with_sessions(|sessions| {
+        let session = sessions.get_mut(session)?;
+        let (any, _) = session.held.get_or_insert_with(|| {
+            let held = Arc::new(make());
+            (held.clone(), held)
+        });
+        any.clone().downcast::<T>().ok()
+    })
+}
+
+/// What `session` holds, if it holds something of type `T`.
+pub fn session_held_if_any<T: SessionHeld>(session: &str) -> Option<Arc<T>> {
+    with_sessions(|sessions| {
+        let (any, _) = sessions.get(session)?.held.as_ref()?;
+        any.clone().downcast::<T>().ok()
+    })
+}
+
+/// Release what every session holds: the daemon is shutting down. The sessions stay, so that a
+/// request that runs meanwhile finds them.
+pub async fn release_all_sessions() {
+    let held: Vec<Arc<dyn SessionHeld>> = with_sessions(|sessions| {
+        sessions
+            .values()
+            .filter_map(|session| session.held.as_ref().map(|(_, held)| held.clone()))
+            .collect()
+    });
+    futures::future::join_all(held.into_iter().map(|held| held.release())).await;
 }
 
 /// Leave the interest of `session` for its subscriptions, if it has any.

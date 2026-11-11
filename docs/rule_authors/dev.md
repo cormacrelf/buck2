@@ -20,6 +20,8 @@ says three things:
   [What is built after a change](#what-is-built-after-a-change).
 - `interactive`: whether the server gets the terminal. See
   [The terminal](#the-terminal).
+- `local_resources`: processes that the server needs. See
+  [Local resources](#local-resources).
 
 When it starts, `buck2 dev` builds the server and starts it. Then it finds what
 the server and each output may be built from, which may build what dynamic
@@ -146,6 +148,63 @@ with neither provider is an error.
 The server inherits the environment of `buck2 dev`, so
 `PORT=8080 buck2 dev //:site` gives it `PORT`, and a rule can set a variable
 with `cmd_args("env", "PORT=8080", server)`.
+
+## Local resources
+
+A server may need other processes, such as a database, an emulator or a
+simulator. `DevInfo(local_resources = ...)` names them, as
+`ExternalRunnerTestInfo` does for tests: a dictionary from a name to the label
+of a target with a [`LocalResourceInfo`](../../api/build/LocalResourceInfo).
+
+```python
+DevInfo(
+    server = server,
+    outputs = {"exe": exe},
+    local_resources = {"db": ctx.attrs.db.label},
+)
+```
+
+The daemon sets them up as it does for tests, and holds them for the session.
+Before `buck2 dev` starts the server, the daemon runs the `setup` command of each
+resource that does not run, on the local executor. The setup prints JSON and
+exits:
+
+```json
+{"pid": 4242, "resources": [{"port": "5432"}]}
+```
+
+`pid` is the process that holds the resource. The server gets the first entry of
+`resources`: an environment variable for each entry of `resource_env_vars`,
+with the value of its key. `setup_timeout_seconds` limits the setup, and is 120
+seconds if not given.
+
+A resource keeps running while the server restarts. The files that a setup
+command names count as files of the server, so a change to them makes the
+daemon build the setup command again. A resource is set up again when its setup
+command is new, as a server command is new (see
+[The server command](#the-server-command)), when its `resource_env_vars` are
+new, or when the process of `pid` has exited. The daemon first releases the
+old one, so that the new one can use what it had, such as a port. A resource
+removed from `local_resources` is released. Whenever a resource was set up
+again, `buck2 dev` restarts the server: the server was started against the old
+one.
+
+A resource that exits by itself is noticed at the next change that `buck2 dev`
+acts on, not at once. `buck2 dev` then says so, the daemon sets it up again,
+and the server starts again. Until then the server keeps running.
+
+If a setup fails or times out, `buck2 dev` prints why, with what the setup
+printed, and the server does not run: it is not started, or it is
+stopped. The next change tries the setup again, and starts the server.
+
+To release a resource, the daemon sends `SIGTERM` to the process of `pid`, and
+`SIGKILL` if it has not exited after 20 seconds, as for tests. When `buck2 dev`
+exits, it stops the server first, and then waits for the daemon to release the
+resources. If `buck2 dev` is killed, the daemon releases them when the session's
+connection to it ends. When the daemon is stopped on purpose, by `buck2 kill`,
+`buck2 clean`, another version of buck2, or for being inactive, it sends
+`SIGTERM` to the resources of every session as it shuts down, but does not wait
+for them to exit. Ctrl-Z does not pause the resources.
 
 ## What is built after a change
 
@@ -526,8 +585,9 @@ it gets `ready`, and uses each `built` message.
 ## Other buck2 commands
 
 Each build and each analysis that `buck2 dev` does is a separate, short daemon
-command. Between them `buck2 dev` holds nothing in the daemon, so other
-commands, such as `buck2 build` in another terminal, run as usual.
+command. Between them `buck2 dev` holds no lock in the daemon, only the
+server's [local resources](#local-resources), so other commands, such as
+`buck2 build` in another terminal, run as usual.
 
 If another command starts while a `buck2 dev` command runs, and it sees
 different files or a different configuration, it does not wait for that
