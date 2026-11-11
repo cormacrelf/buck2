@@ -9,13 +9,18 @@
  */
 
 use async_trait::async_trait;
+use buck2_core::bxl::BxlFilePath;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
 use buck2_server_ctx::bxl::BxlServerCommands;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
+use dice::DiceTransaction;
 
 use crate::command::bxl_command;
+use crate::command::bxl_key;
 use crate::profile_command::bxl_profile_command;
 
 struct BxlServerCommandsInstance;
@@ -38,6 +43,17 @@ impl BxlServerCommands for BxlServerCommandsInstance {
         req: buck2_cli_proto::ProfileRequest,
     ) -> buck2_error::Result<buck2_cli_proto::ProfileResponse> {
         Ok(bxl_profile_command(ctx, partial_result_dispatcher, req).await?)
+    }
+
+    async fn bxl_key(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        dice: &DiceTransaction,
+        bxl_label: &str,
+        bxl_args: &[String],
+        global_cfg_options: &GlobalCfgOptions,
+    ) -> buck2_error::Result<(BaseDeferredKeyBxl, BxlFilePath)> {
+        bxl_key(ctx, dice, bxl_label, bxl_args, global_cfg_options).await
     }
 }
 

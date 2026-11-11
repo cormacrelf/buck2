@@ -10,8 +10,10 @@ on save, or a tool that loads new code into a running program.
 
 A rule makes its targets work with `buck2 dev` by returning the
 [`DevInfo`](../../api/build/DevInfo) provider, or only a `RunInfo` (see
-[Arguments and `RunInfo` targets](#arguments-and-runinfo-targets)). `DevInfo`
-says:
+[Arguments and `RunInfo` targets](#arguments-and-runinfo-targets)). A bxl
+function can return them in place of a target (see
+[A bxl function in place of a target](#a-bxl-function-in-place-of-a-target)).
+`DevInfo` says:
 
 - `server`: the command that `buck2 dev` starts and keeps running. It starts it
   again when the command changes. See [The server command](#the-server-command).
@@ -154,6 +156,55 @@ with neither provider is an error.
 The server inherits the environment of `buck2 dev`, so
 `PORT=8080 buck2 dev //:site` gives it `PORT`, and a rule can set a variable
 with `cmd_args("env", "PORT=8080", server)`.
+
+## A bxl function in place of a target
+
+`buck2 dev` also takes a [bxl](../../bxl) function, `path/to/file.bxl:name`, in
+place of a target. The function returns a list of providers, as the
+implementation of a rule does, with a `DefaultInfo`, and a `DevInfo` or a
+`RunInfo`. `buck2 dev` uses them as it would use those of a target.
+
+```python
+def _dev(ctx):
+    target = ctx.configured_targets(ctx.cli_args.target, target_platform = "root//dev:hot_platform")
+    exe = ctx.analysis(target).providers()[DefaultInfo].default_outputs[0]
+    return [
+        DefaultInfo(),
+        DevInfo(
+            server = cmd_args("python3", ctx.fs.source("tools/launcher.py")),
+            outputs = {"exe": exe},
+            scopes = {"app": [target.label]},
+        ),
+    ]
+
+dev = bxl_main(impl = _dev, cli_args = {"target": cli_args.target_label()})
+```
+
+The arguments after `--` are the function's, as with `buck2 bxl`. Those after a
+second `--` are the server's:
+
+```sh
+buck2 dev tools/dev.bxl:dev -- --target //app:main -- --port 8080
+```
+
+A function needs no rule and no target of its own, so one function can run many
+targets. It can configure the targets as it likes, so a target can build in
+one way for `buck2 dev` and in another for `buck2 build`: the target selects on
+a constraint, and the function configures it with a platform that has the
+constraint.
+[`examples/subsecond`](https://github.com/facebook/buck2/tree/main/examples/subsecond)
+does that: its targets link for hot patching only on the platform that its
+function uses. The outputs can also be artifacts that the function makes with
+its own actions (`ctx.bxl_actions().actions`).
+
+What a function's outputs are built from is found as for a target's (see
+[What an output is built from](#what-an-output-is-built-from)), but a function
+is no target, and owns no source files. Its graph is made of the targets that
+the server and the outputs are built from, and their dependencies. An output
+that the function's own action makes from an artifact of a target may be built
+from any source file of that target. The function's file, and the `.bzl` files
+that it loads, count as `.bzl` files of the graph: a change to them makes every
+output stale, and `buck2 dev` evaluates the function again.
 
 ## Local resources
 
@@ -688,7 +739,11 @@ the project, and starting it again to carry on building would undo that.
 
 ## Limits
 
-- `buck2 dev` takes one target.
+- `buck2 dev` takes one target, or one bxl function.
+- A bxl function is evaluated again only after a change to what its graph is
+  made of (see [A bxl function in place of a target](#a-bxl-function-in-place-of-a-target)).
+  A change to a target that the function looks at, but that neither the server
+  nor an output is built from, is not seen until another change is.
 - A change to a file in a package of the graph costs a short daemon command,
   even if nothing is built from the file: it says what the file is. A server
   that keeps writing files in such a package keeps `buck2 dev` asking. Changes

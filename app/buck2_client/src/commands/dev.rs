@@ -110,16 +110,22 @@ mod pty;
 ///
 /// Each build is a separate daemon command that another command may preempt, so `buck2 dev` never
 /// makes other buck2 commands wait.
+///
+/// In place of a target, `buck2 dev` takes a bxl function, `path/to/file.bxl:name`, that returns a
+/// list of providers, as a rule does: `buck2 dev file.bxl:name -- BXL_ARGS -- SERVER_ARGS`.
 #[derive(Debug, clap::Parser)]
 #[clap(name = "dev")]
 pub struct DevCommand {
-    /// The target whose `DevInfo` to run.
+    /// The target whose `DevInfo` to run, or a bxl function, `path/to/file.bxl:name`, that
+    /// returns the providers to use in place of a target's.
     #[clap(name = "TARGET")]
     target: String,
 
     /// Arguments after `--` are appended to the server's command line, for the whole session.
-    #[clap(name = "SERVER_ARGS", last = true)]
-    server_args: Vec<String>,
+    /// For a bxl function, they are the function's arguments, up to a second `--`, and those
+    /// after it are the server's.
+    #[clap(name = "ARGS", last = true)]
+    args: Vec<String>,
 
     /// After a file changes, wait until no file has changed for this many milliseconds before
     /// building.
@@ -221,6 +227,7 @@ impl DevCommand {
         let session = TraceId::new().to_string();
         let changes = FileChanges::subscribe(connection.clone(), &context, session.clone()).await?;
         let (partials_tx, partials) = mpsc::unbounded_channel();
+        let (bxl_args, server_args) = split_args(&self.target, &self.args);
         let daemon = Daemon {
             connection,
             events_ctx,
@@ -228,13 +235,14 @@ impl DevCommand {
             context,
             session,
             target: self.target.clone(),
+            bxl_args,
             target_cfg: self.target_cfg.target_cfg(),
             partials: partials_tx,
         };
         let mut session = match Session::start(
             daemon,
             partials,
-            self.server_args.clone(),
+            server_args,
             Duration::from_millis(self.debounce_ms),
             listener,
             server_rx,
@@ -256,6 +264,25 @@ impl DevCommand {
     }
 }
 
+/// Whether `target` names a bxl function, `path/to/file.bxl:name`, rather than a target.
+fn is_bxl_function(target: &str) -> bool {
+    target
+        .rsplit_once(':')
+        .is_some_and(|(path, _)| path.ends_with(".bxl"))
+}
+
+/// The arguments after `--`, split into those of the bxl function, if `target` is one, and those
+/// of the server. A bxl function takes those up to a second `--`, and the server those after it.
+fn split_args(target: &str, args: &[String]) -> (Option<Vec<String>>, Vec<String>) {
+    if !is_bxl_function(target) {
+        return (None, args.to_vec());
+    }
+    match args.iter().position(|arg| arg == "--") {
+        Some(i) => (Some(args[..i].to_vec()), args[i + 1..].to_vec()),
+        None => (Some(args.to_vec()), Vec::new()),
+    }
+}
+
 /// Sends `buck2 dev` requests to the daemon, one daemon command each.
 struct Daemon<'a> {
     /// The connection to the daemon, shared with the file change subscription. When the daemon
@@ -267,6 +294,8 @@ struct Daemon<'a> {
     /// The name of this session, which its file change subscription gave the daemon too.
     session: String,
     target: String,
+    /// When `target` is a bxl function, its arguments.
+    bxl_args: Option<Vec<String>>,
     target_cfg: buck2_cli_proto::TargetCfg,
     /// Where the results of a streaming build go before its response.
     partials: mpsc::UnboundedSender<DevBuilt>,
@@ -288,6 +317,7 @@ impl Daemon<'_> {
                 || {
                     NewGenericRequest::Dev(DevRequest {
                         target: self.target.clone(),
+                        bxl_args: self.bxl_args.clone(),
                         target_cfg: self.target_cfg.clone(),
                         action: action(),
                         session: self.session.clone(),

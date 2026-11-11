@@ -34,6 +34,8 @@ use buck2_core::bxl::BxlFilePath;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path_with_allowed_relative_dir::CellPathWithAllowedRelativeDir;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::package::PackageLabel;
@@ -41,6 +43,7 @@ use buck2_data::BxlEnsureArtifactsEnd;
 use buck2_data::BxlEnsureArtifactsStart;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_hash::BuckFixedInsertionMap;
 use buck2_hash::BuckMutMap;
@@ -71,6 +74,7 @@ use crate::bxl::eval::get_bxl_callable;
 use crate::bxl::eval::resolve_cli_args;
 use crate::bxl::key::BxlKey;
 use crate::bxl::starlark_defs::cli_args::CliArgValue;
+use crate::bxl::starlark_defs::context::actions::BxlExecutionResolution;
 use crate::bxl::streaming_output_writer::StreamingOutputWriter;
 
 pub(crate) async fn bxl_command(
@@ -532,6 +536,42 @@ pub(crate) async fn get_bxl_cli_args(
     resolve_cli_args(bxl_label, &cli_ctx, bxl_args, frozen_callable.as_ref()).await
 }
 
+/// The key of the bxl function `bxl_label` called with the command line arguments `bxl_args`,
+/// with no stack trace forced, as `buck2 bxl` would evaluate it, and the file of the function.
+pub(crate) async fn bxl_key(
+    server_ctx: &dyn ServerCommandContextTrait,
+    dice: &DiceTransaction,
+    bxl_label: &str,
+    bxl_args: &[String],
+    global_cfg_options: &GlobalCfgOptions,
+) -> buck2_error::Result<(BaseDeferredKeyBxl, BxlFilePath)> {
+    let cwd = server_ctx.working_dir();
+    let cell_resolver = dice.ctx().get_cell_resolver().await?;
+    let cell_alias_resolver = dice.ctx().get_cell_alias_resolver_for_dir(cwd).await?;
+    let label = parse_bxl_label_from_cli(cwd, bxl_label, &cell_resolver, &cell_alias_resolver)?;
+    let args = match get_bxl_cli_args(
+        cwd,
+        dice,
+        &label,
+        &bxl_args.to_vec(),
+        &cell_resolver,
+        global_cfg_options,
+    )
+    .await?
+    {
+        BxlResolvedCliArgs::Resolved(args) => args,
+        BxlResolvedCliArgs::Help => return Err(BxlLabelError::Help(bxl_label.to_owned()).into()),
+    };
+    let file = label.bxl_path.clone();
+    let key = BxlKey::new(label, Arc::new(args), false, global_cfg_options.dupe());
+    match key.into_base_deferred_key(BxlExecutionResolution::unspecified()) {
+        BaseDeferredKey::BxlLabel(key) => Ok((key, file)),
+        _ => Err(internal_error!(
+            "A bxl key is not a `BaseDeferredKey::BxlLabel`"
+        )),
+    }
+}
+
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
 enum BxlLabelError {
@@ -539,6 +579,8 @@ enum BxlLabelError {
         "bxl label should be of format `<cell>//path/to/file.bxl:function_name`, but got `{0}`"
     )]
     Format(String),
+    #[error("Printed the help of `{0}`, which then does not run")]
+    Help(String),
 }
 
 /// Parse the bxl function label out of cli pattern

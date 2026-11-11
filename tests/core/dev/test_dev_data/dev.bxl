@@ -1,0 +1,45 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+# Bxl functions that `buck2 dev` runs in place of a target. See `test_dev_bxl`.
+
+def _app(ctx):
+    """`app/server.py`, with `site`, the default output of `--target`, and `shout`, which an
+    action of this function makes from `site` in capitals. The scope `lib` is `//lib:lib`."""
+    target = ctx.configured_targets(ctx.cli_args.target)
+    site = ctx.analysis(target).providers()[DefaultInfo].default_outputs[0]
+    actions = ctx.bxl_actions().actions
+    shout = actions.declare_output("shout.txt")
+    actions.run(
+        cmd_args("sh", "-c", 'tr a-z A-Z < "$1" > "$2"', "--", site, shout.as_output()),
+        category = "shout",
+        local_only = True,
+    )
+    return [
+        DefaultInfo(),
+        DevInfo(
+            server = cmd_args("python3", ctx.fs.source("app/server.py")),
+            outputs = {"shout": shout, "site": site},
+            scopes = {"lib": [ctx.configured_targets("//lib:lib").label]},
+        ),
+    ]
+
+app = bxl_main(
+    impl = _app,
+    cli_args = {"target": cli_args.target_label()},
+)
+
+def _nothing(_ctx):
+    pass
+
+nothing = bxl_main(impl = _nothing, cli_args = {})
+
+def _no_default_info(ctx):
+    return [DevInfo(server = cmd_args("python3", ctx.fs.source("app/server.py")))]
+
+no_default_info = bxl_main(impl = _no_default_info, cli_args = {})

@@ -55,6 +55,7 @@ use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ArtifactGroupValues;
 use buck2_build_api::artifact_groups::ResolvedArtifactGroup;
 use buck2_build_api::artifact_groups::TransitiveSetProjectionKey;
+use buck2_build_api::bxl::calculation::BXL_CALCULATION_IMPL;
 use buck2_build_api::interpreter::rule_defs::cmd_args::ArtifactPathMapperImpl;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
@@ -95,10 +96,13 @@ use buck2_common::io::IoProvider;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_common::package_listing::resolver::PackageListingResolver;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
+use buck2_core::bxl::BxlFilePath;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_core::cells::name::CellName;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
@@ -120,13 +124,16 @@ use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckMutInsertionMap;
+use buck2_hash::BuckMutInsertionSet;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::load_module::InterpreterCalculation;
+use buck2_interpreter::paths::module::StarlarkModulePath;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_node::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::target_calculation::ConfiguredTargetCalculation;
+use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
 use buck2_server_ctx::ctx::FileChangeBatch;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::dev_interest::FileInterest;
@@ -164,14 +171,15 @@ enum DevError {
     #[error("`buck2 dev` takes exactly one target, but `{0}` matched {1}")]
     NotOneTarget(String, usize),
     #[error(
-        "Target `{0}` has no `DevInfo` provider and no `RunInfo` provider, so `buck2 dev` cannot use it"
+        "{0} has no `DevInfo` provider and no `RunInfo` provider, so `buck2 dev` cannot use it"
     )]
-    NoDevInfo(ConfiguredProvidersLabel),
-    #[error("Target `{target}` has no output named `{name}` in its `DevInfo`")]
-    UnknownOutput {
-        target: ConfiguredProvidersLabel,
-        name: String,
-    },
+    NoDevInfo(DevSubject),
+    #[error(
+        "The bxl function `{0}` returned no providers. For `buck2 dev`, it returns a list of providers, as a rule does, with a `DevInfo` or a `RunInfo`"
+    )]
+    NoProviders(DevSubject),
+    #[error("{subject} has no output named `{name}` in its `DevInfo`")]
+    UnknownOutput { subject: DevSubject, name: String },
     #[error("Output `{0}` of the `DevInfo` produced no artifact")]
     EmptyOutput(String),
     #[error(
@@ -228,6 +236,104 @@ fn slot_bit(slot: usize) -> u64 {
     1 << slot
 }
 
+/// What a session runs: the providers of a target, or those that a bxl function returns, as a
+/// rule does.
+#[derive(Clone, Dupe, Debug, PartialEq, Allocative, Pagable)]
+enum DevSubject {
+    Target(ConfiguredProvidersLabel),
+    Bxl {
+        key: BaseDeferredKeyBxl,
+        /// The file of the function. It and what it loads count as `.bzl` files of the graph.
+        file: CellPath,
+    },
+}
+
+impl Eq for DevSubject {}
+
+impl Hash for DevSubject {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            DevSubject::Target(label) => label.hash(state),
+            DevSubject::Bxl { key, file } => {
+                key.0.hash().hash(state);
+                file.hash(state);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DevSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DevSubject::Target(label) => write!(f, "Target `{label}`"),
+            DevSubject::Bxl { key, .. } => write!(f, "The bxl function `{key}`"),
+        }
+    }
+}
+
+impl DevSubject {
+    /// The target that the command line names, or the bxl function with its arguments.
+    async fn of_request(
+        server_ctx: &dyn ServerCommandContextTrait,
+        ctx: &DiceTransaction,
+        req: &DevRequest,
+    ) -> buck2_error::Result<DevSubject> {
+        let global_cfg_options =
+            global_cfg_options_from_client_context(&req.target_cfg, server_ctx, &mut ctx.ctx())
+                .await?;
+        if let Some(bxl_args) = &req.bxl_args {
+            let (key, file) = BXL_SERVER_COMMANDS
+                .get()?
+                .bxl_key(server_ctx, ctx, &req.target, bxl_args, &global_cfg_options)
+                .await?;
+            return Ok(DevSubject::Bxl {
+                key,
+                file: file.path().dupe(),
+            });
+        }
+        let mut dice = ctx.ctx();
+        let patterns = parse_patterns_from_cli_args::<ProvidersPatternExtra>(
+            &mut dice,
+            std::slice::from_ref(&req.target),
+            server_ctx.working_dir(),
+        )
+        .await?;
+        let [pattern] = patterns.as_slice() else {
+            return Err(DevError::NotOneTarget(req.target.clone(), patterns.len()).into());
+        };
+        let label = pattern.clone().as_providers_label(&req.target)?;
+        Ok(DevSubject::Target(
+            dice.get_configured_provider_label(&label, &global_cfg_options)
+                .await?,
+        ))
+    }
+
+    /// The providers of the target, or those that the bxl function returned.
+    async fn providers(
+        &self,
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<FrozenProviderCollectionValue> {
+        match self {
+            DevSubject::Target(label) => dice.get_providers(label).await?.require_compatible(),
+            DevSubject::Bxl { key, .. } => BXL_CALCULATION_IMPL
+                .get()?
+                .eval_bxl(dice, key.dupe())
+                .await?
+                .providers()?
+                .ok_or_else(|| DevError::NoProviders(self.dupe()).into()),
+        }
+    }
+
+    /// The cell that the target patterns of `DevInfo.scopes` are relative to.
+    fn cell(&self) -> CellName {
+        match self {
+            DevSubject::Target(label) => label.target().pkg().cell_name(),
+            DevSubject::Bxl { file, .. } => file.cell(),
+        }
+    }
+}
+
 /// What `buck2 dev` runs for a target: its `DevInfo`, or, for a target without one, its
 /// `RunInfo`, which is then the server of a `DevInfo` without outputs.
 enum DevProvider {
@@ -245,7 +351,7 @@ enum DevView<'a> {
 impl DevProvider {
     fn of(
         providers: &FrozenProviderCollectionValue,
-        label: &ConfiguredProvidersLabel,
+        subject: &DevSubject,
     ) -> buck2_error::Result<DevProvider> {
         if let Some(info) = providers.builtin_provider_value::<DevInfo>()? {
             return Ok(DevProvider::Dev(info));
@@ -253,7 +359,7 @@ impl DevProvider {
         if let Some(info) = providers.builtin_provider_value::<RunInfo>()? {
             return Ok(DevProvider::Run(info));
         }
-        Err(DevError::NoDevInfo(label.dupe()).into())
+        Err(DevError::NoDevInfo(subject.dupe()).into())
     }
 
     fn view(&self) -> DevView<'_> {
@@ -489,14 +595,10 @@ async fn dev(
         }
         return Ok(DevResponse::Released);
     }
-    let label = configured_label(server_ctx, &mut ctx.ctx(), req).await?;
-    let providers = ctx
-        .ctx()
-        .get_providers(&label)
-        .await?
-        .require_compatible()?;
+    let subject = DevSubject::of_request(server_ctx, ctx, req).await?;
+    let providers = subject.providers(&mut ctx.ctx()).await?;
     // Held across awaits, so this needs the owned form.
-    let info = DevProvider::of(&providers, &label)?;
+    let info = DevProvider::of(&providers, &subject)?;
     let outputs = info.view().outputs()?;
     match &req.action {
         DevAction::Server => {
@@ -558,7 +660,7 @@ async fn dev(
             let resources = dev_resources(&mut ctx.ctx(), &info).await?;
             let policy = dev_policy(info.view(), resource_inputs(&resources)?)?;
             let mut watched =
-                watch_files(&mut ctx.ctx(), &label, &policy, request, &req.session).await?;
+                watch_files(&mut ctx.ctx(), &subject, &policy, request, &req.session).await?;
             // A local resource that exited is set up again by the analysis that the client runs
             // when the server may be new.
             if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
@@ -577,7 +679,7 @@ async fn dev(
             let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
             for name in names {
                 let output = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
-                    target: label.dupe(),
+                    subject: subject.dupe(),
                     name: name.clone(),
                 })?;
                 wanted.push(Wanted {
@@ -634,7 +736,7 @@ async fn dev(
                     .await?,
                 ));
             };
-            let claims = dev_claims(&mut ctx.ctx(), &label).await?;
+            let claims = dev_claims(&mut ctx.ctx(), &subject).await?;
             let io = ctx
                 .ctx()
                 .global_data()
@@ -802,27 +904,6 @@ async fn builds_from_changed(
         .await?
         .map(FileShape::of);
     Ok(before != now)
-}
-
-async fn configured_label(
-    server_ctx: &dyn ServerCommandContextTrait,
-    dice: &mut DiceComputations<'_>,
-    req: &DevRequest,
-) -> buck2_error::Result<ConfiguredProvidersLabel> {
-    let global_cfg_options =
-        global_cfg_options_from_client_context(&req.target_cfg, server_ctx, dice).await?;
-    let patterns = parse_patterns_from_cli_args::<ProvidersPatternExtra>(
-        dice,
-        std::slice::from_ref(&req.target),
-        server_ctx.working_dir(),
-    )
-    .await?;
-    let [pattern] = patterns.as_slice() else {
-        return Err(DevError::NotOneTarget(req.target.clone(), patterns.len()).into());
-    };
-    let label = pattern.clone().as_providers_label(&req.target)?;
-    dice.get_configured_provider_label(&label, &global_cfg_options)
-        .await
 }
 
 /// An output to build.
@@ -1146,20 +1227,24 @@ impl GraphClaims {
     }
 }
 
-/// Walk the configured dependency graph of `label`. Give each target to the slots that claim
-/// it.
+/// Walk the configured dependency graph of the subject. Give each target to the slots that
+/// claim it.
+///
+/// The graph of a target is the target and its dependencies. A bxl function is no target, so its
+/// graph is made of the targets that the server and the outputs are built from, and their
+/// dependencies.
 ///
 /// This reads the contents of no source file, so that a `DevClaims` made from it stays valid
 /// when one changes.
 async fn graph_claims(
     dice: &mut DiceComputations<'_>,
-    label: &ConfiguredProvidersLabel,
+    subject: &DevSubject,
     policy: &Policy,
 ) -> buck2_error::Result<GraphClaims> {
     let slots = &policy.slots;
     let mut timer = Timer::new();
     let cell_resolver = dice.get_cell_resolver().await?;
-    let cell = label.target().pkg().cell_name();
+    let cell = subject.cell();
     let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?;
 
     let scope_patterns: Vec<Vec<ParsedPattern<TargetPatternExtra>>> = policy
@@ -1180,11 +1265,39 @@ async fn graph_claims(
         })
         .collect::<buck2_error::Result<_>>()?;
 
-    let root = dice
-        .get_configured_target_node(label.target())
-        .await
-        .require_compatible()?;
-    let nodes = dependency_closure([root.dupe()]);
+    let mut walks = Vec::with_capacity(slots.len());
+    for spec in slots {
+        walks.push(if spec.inputs.is_empty() {
+            InputsWalk::default()
+        } else {
+            walk_inputs(dice, &spec.inputs).await
+        });
+    }
+    timer.step("the actions of the targets that own the inputs of each slot");
+
+    let roots: Vec<ConfiguredTargetLabel> = match subject {
+        DevSubject::Target(label) => vec![label.target().dupe()],
+        DevSubject::Bxl { .. } => walks
+            .iter()
+            .flat_map(|walk| {
+                walk.owners
+                    .iter()
+                    .chain(walk.beyond.iter())
+                    .chain(walk.failed.iter().filter_map(|(owner, _)| owner.as_ref()))
+            })
+            .map(|label| label.dupe())
+            .collect::<BuckMutInsertionSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    let roots = dice
+        .try_compute_join(roots, async |dice, label| {
+            dice.get_configured_target_node(&label)
+                .await
+                .require_compatible()
+        })
+        .await?;
+    let nodes = dependency_closure(roots.into_iter().map(|node| node.dupe()));
     let by_label: BuckMutMap<ConfiguredTargetLabel, ConfiguredTargetNode> = nodes
         .iter()
         .map(|node| (node.label().dupe(), node.dupe()))
@@ -1211,11 +1324,7 @@ async fn graph_claims(
         }
     }
     let mut incomplete = Vec::new();
-    for (set, spec) in slots.iter().enumerate() {
-        if spec.inputs.is_empty() {
-            continue;
-        }
-        let walk = walk_inputs(dice, &spec.inputs).await;
+    for (set, (spec, walk)) in slots.iter().zip(walks).enumerate() {
         for path in walk.sources {
             claim_file(&mut files, cell_resolver, path, slot_bit(set))?;
         }
@@ -1295,7 +1404,32 @@ async fn graph_claims(
     claim_symlink_targets(dice, cell_resolver, &packages, &mut claims).await?;
     timer.step("the symlinks in the packages");
 
-    claims.bzl_files = loaded_files(dice, cell_resolver, packages).await?;
+    let mut imports: Vec<ImportPath> = Vec::new();
+    for package in packages {
+        imports.extend(
+            dice.get_interpreter_results(package)
+                .await?
+                .imports()
+                .iter()
+                .cloned(),
+        );
+    }
+    if let DevSubject::Bxl { file, .. } = subject {
+        // The function's file says what the outputs are, as a `.bzl` file of a rule does.
+        if let Some(path) = project_path(cell_resolver, file.dupe())? {
+            claims.bzl_files.insert(path, file.dupe());
+        }
+        let file = BxlFilePath::new(file.dupe())?;
+        imports.extend(
+            dice.get_loaded_module(StarlarkModulePath::BxlFile(&file))
+                .await?
+                .imports()
+                .cloned(),
+        );
+    }
+    claims
+        .bzl_files
+        .extend(loaded_files(dice, cell_resolver, imports).await?);
     // A build file changes the graph, even when a target also uses it as a source file.
     for path in claims.build_files.keys() {
         claims.files.remove(path);
@@ -1853,7 +1987,7 @@ impl DevClaims {
 /// The `DevClaims` of a target.
 #[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[pagable_typetag(dice::DiceKeyDyn)]
-struct DevClaimsKey(ConfiguredProvidersLabel);
+struct DevClaimsKey(DevSubject);
 
 impl std::fmt::Display for DevClaimsKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1893,18 +2027,18 @@ impl Key for DevClaimsKey {
 
 async fn dev_claims(
     dice: &mut DiceComputations<'_>,
-    label: &ConfiguredProvidersLabel,
+    subject: &DevSubject,
 ) -> buck2_error::Result<Arc<DevClaims>> {
-    dice.compute(&DevClaimsKey(label.dupe())).await?.dupe()
+    dice.compute(&DevClaimsKey(subject.dupe())).await?.dupe()
 }
 
-/// The `Policy` of the `DevInfo` of a target.
+/// The `Policy` of the `DevInfo` of a target or a bxl function.
 async fn dev_slots(
     dice: &mut DiceComputations<'_>,
-    label: &ConfiguredProvidersLabel,
+    subject: &DevSubject,
 ) -> buck2_error::Result<Policy> {
-    let providers = dice.get_providers(label).await?.require_compatible()?;
-    let info = DevProvider::of(&providers, label)?;
+    let providers = subject.providers(dice).await?;
+    let info = DevProvider::of(&providers, subject)?;
     let resources = dev_resources(dice, &info).await?;
     dev_policy(info.view(), resource_inputs(&resources)?)
 }
@@ -1914,13 +2048,13 @@ async fn dev_slots(
 /// `buck2 dev` asks about did.
 async fn watch_files(
     dice: &mut DiceComputations<'_>,
-    label: &ConfiguredProvidersLabel,
+    subject: &DevSubject,
     policy: &Policy,
     request: &DevWatchRequest,
     session: &str,
 ) -> buck2_error::Result<DevWatched> {
     let mut outputs = OutputChanges::new(policy);
-    let claims = dev_claims(dice, label).await?;
+    let claims = dev_claims(dice, subject).await?;
     // From here on the session's file change subscription drops the changes that cannot matter
     // to these claims. `buck2 dev` asks again after every change that is let through, and so
     // after every change to the claims.
@@ -2338,21 +2472,18 @@ fn is_buck_out(path: &ProjectRelativePath) -> bool {
     path.as_str() == "buck-out" || path.as_str().starts_with("buck-out/")
 }
 
-/// The `.bzl` files that the build files of `packages` load, directly or through other `.bzl`
+/// The `.bzl` files `imports`, and those that they load, directly or through other `.bzl`
 /// files.
 async fn loaded_files(
     dice: &mut DiceComputations<'_>,
     cell_resolver: &CellResolver,
-    packages: BTreeSet<buck2_core::package::PackageLabel>,
+    imports: Vec<ImportPath>,
 ) -> buck2_error::Result<BTreeMap<ProjectRelativePathBuf, CellPath>> {
     let mut seen: BuckMutSet<ImportPath> = BuckMutSet::default();
     let mut queue: VecDeque<ImportPath> = VecDeque::new();
-    for package in packages {
-        let result = dice.get_interpreter_results(package).await?;
-        for import in result.imports() {
-            if seen.insert(import.clone()) {
-                queue.push_back(import.clone());
-            }
+    for import in imports {
+        if seen.insert(import.clone()) {
+            queue.push_back(import);
         }
     }
     while let Some(import) = queue.pop_front() {

@@ -147,8 +147,12 @@ pub enum DocsResponse {
 /// no daemon state between them.
 #[derive(Serialize, Deserialize)]
 pub struct DevRequest {
-    /// The target whose `DevInfo` to use.
+    /// The target whose `DevInfo` to use, or, with `bxl_args`, a bxl function, `path.bxl:name`,
+    /// whose returned providers to use in its place.
     pub target: String,
+    /// When `target` is a bxl function, its command line arguments.
+    #[serde(default)]
+    pub bxl_args: Option<Vec<String>>,
     pub target_cfg: TargetCfg,
     pub action: DevAction,
     /// The name of the session, as it gave it when it subscribed to file changes. The daemon

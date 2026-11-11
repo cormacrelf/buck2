@@ -75,6 +75,11 @@ stdout, and `ctx.output.ensure(artifact)` marks artifacts as to be materialized
 into buck-out by the end of the BXL function, returning an object that lets you
 print the output path via `ctx.output.print(ensured)`.
 
+A BXL function may also return a list of providers, as the implementation of a
+rule does, with a `DefaultInfo`. `buck2 bxl` ignores them. `buck2 dev` runs a
+BXL function that returns a `DevInfo` as it runs a target; see
+[`buck2 dev`](../../../rule_authors/dev/#a-bxl-function-in-place-of-a-target).
+
 ## Passing in and using CLI args
 
 A BXL function can accept a `cli_args` attribute where args names and types are

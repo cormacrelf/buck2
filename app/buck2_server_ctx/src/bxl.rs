@@ -13,7 +13,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use buck2_core::bxl::BxlFilePath;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_util::late_binding::LateBinding;
+use dice::DiceTransaction;
 use dice::UserComputationData;
 use dupe::Dupe;
 
@@ -35,6 +39,17 @@ pub trait BxlServerCommands: Send + Sync + 'static {
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: buck2_cli_proto::ProfileRequest,
     ) -> buck2_error::Result<buck2_cli_proto::ProfileResponse>;
+    /// The key of the bxl function `bxl_label`, `path.bxl:name` as the command line gives it,
+    /// called with the command line arguments `bxl_args`, and the file of the function. `buck2
+    /// dev` evaluates it for the providers that the function returns.
+    async fn bxl_key(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        dice: &DiceTransaction,
+        bxl_label: &str,
+        bxl_args: &[String],
+        global_cfg_options: &GlobalCfgOptions,
+    ) -> buck2_error::Result<(BaseDeferredKeyBxl, BxlFilePath)>;
 }
 
 pub static BXL_SERVER_COMMANDS: LateBinding<&'static dyn BxlServerCommands> =
