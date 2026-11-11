@@ -515,6 +515,19 @@ enum Request {
         outputs: Vec<String>,
     },
     Restart,
+    /// For tests only, and only with `BUCK2_DEV_TEST_SYNC` set: answered with
+    /// `{"type": "_synced", "id": id}` once `buck2 dev` has handled the requests before it and
+    /// the file changes it has heard of, so that a test can tell that nothing more is coming
+    /// without waiting for a while.
+    #[serde(rename = "_sync")]
+    Sync {
+        id: u64,
+    },
+}
+
+/// Whether the server may send `_sync`. See `Request::Sync`.
+fn test_sync_enabled() -> bool {
+    buck2_core::buck2_env!("BUCK2_DEV_TEST_SYNC", bool, applicability = testing).unwrap_or(false)
 }
 
 /// An output that the server asked for, with the changes since the server last got it.
@@ -794,6 +807,12 @@ impl ServerLink {
                         if let Some(stale) = stale {
                             server.send(stale);
                         }
+                    }
+                    Ok(Request::Sync { .. }) if !test_sync_enabled() => {
+                        self.console.message(format!(
+                            "`buck2 dev` ignored a request from the server: {}",
+                            line
+                        ))?;
                     }
                     Ok(_) if !introduced => {
                         self.console.message(format!(
@@ -1252,6 +1271,16 @@ impl<'a> Session<'a> {
                 return Ok(exit);
             }
             self.show_status();
+            if let Some(Request::Sync { id }) = self.link.requests.front() {
+                let id = *id;
+                if self.sync_changes().await? {
+                    // Handled changes: answer once they have settled.
+                    continue;
+                }
+                self.link.requests.pop_front();
+                self.link.send(json!({"type": "_synced", "id": id}));
+                continue;
+            }
             if let Some(request) = self.link.requests.pop_front() {
                 self.on_request(request).await?;
                 continue;
@@ -1346,6 +1375,25 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// Before `buck2 dev` answers `_sync`: handle the changes it has queued and those that reach it
+    /// within a moment. Returns whether there were any.
+    async fn sync_changes(&mut self) -> buck2_error::Result<bool> {
+        let mut paths = std::mem::take(&mut self.queued);
+        let mut missed = std::mem::take(&mut self.missed_queued);
+        while let Ok(change) =
+            tokio::time::timeout(Duration::from_millis(20), self.changes.next()).await
+        {
+            missed |= collect_paths(change, &mut paths, &mut self.link.exit);
+        }
+        if self.link.exit.is_some() || (paths.is_empty() && !missed) {
+            return Ok(false);
+        }
+        self.missed |= missed;
+        let paths = self.debounce(paths).await;
+        self.on_changes(paths).await?;
+        Ok(true)
+    }
+
     /// Add the paths of further changes to `paths` until files stop changing, but for no longer
     /// than `MAX_DEBOUNCE`, in case they never do.
     async fn debounce(&mut self, mut paths: BTreeSet<String>) -> BTreeSet<String> {
@@ -1398,6 +1446,8 @@ impl<'a> Session<'a> {
             Request::Restart => self.restart().await?,
             // Answered as soon as it arrives.
             Request::Hello { .. } => {}
+            // Answered by `run`.
+            Request::Sync { .. } => {}
         }
         Ok(())
     }

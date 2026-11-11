@@ -49,6 +49,7 @@ class DevSession:
         self.process = process
         self.events_path: Path = buck.cwd / "buck-out" / "dev_events.jsonl"
         self.offset = 0
+        self.syncs = 0
 
     def _events(self) -> List[Dict[str, Any]]:
         if not self.events_path.exists():
@@ -135,9 +136,27 @@ class DevSession:
                 )
         return got
 
+    async def sync(self, timeout: float) -> bool:
+        """Have the running server send `_sync`, and wait up to `timeout` for `buck2 dev` to
+        answer it, which it does once it has handled the requests before it and the file changes
+        that reached it. Returns whether it answered: it does not if no server is connected, or
+        if `buck2 dev` is busy for longer."""
+        self.syncs += 1
+        sync_id = self.syncs
+        deadline = time.monotonic() + timeout
+        self.request({"type": "_sync", "id": sync_id})
+        while True:
+            for e in self._events()[self.offset :]:
+                if e["type"] == "_synced" and e.get("id") == sync_id:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.02)
+
     async def quiet(self, seconds: float = 3) -> None:
-        """Assert that no message arrives and no server starts within `seconds`."""
-        await asyncio.sleep(seconds)
+        """Assert that no message arrives and no server starts: until `buck2 dev` answers a
+        `sync`, or within `seconds` if it does not."""
+        await self.sync(seconds)
         later = [e for e in self._events()[self.offset :] if e["type"] in OBSERVED]
         if later:
             output = await self.stop()
@@ -145,27 +164,34 @@ class DevSession:
                 f"Expected nothing more, got {summary(later)}\n{output}"
             )
 
+    def _count(self) -> int:
+        return len([e for e in self._events() if e["type"] != "_synced"])
+
     async def wait_until_quiet(self, seconds: float = 2, timeout: float = 60) -> None:
-        """Skip what arrives until nothing has for `seconds`."""
+        """Skip what arrives until `buck2 dev` answers a `sync` with nothing new before it, or,
+        if it does not answer, until nothing has arrived for `seconds`."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            count = len(self._events())
-            await asyncio.sleep(seconds)
-            if len(self._events()) == count:
-                self.offset = count
+            count = self._count()
+            await self.sync(seconds)
+            if self._count() == count:
+                self.offset = len(self._events())
                 return
         output = await self.stop()
         raise AssertionError(f"Messages kept coming\n{output}")
 
     async def collect(self, seconds: float = 3) -> List[Dict[str, Any]]:
-        """The messages and server starts that arrive until nothing has for `seconds`."""
+        """The messages and server starts that arrive until nothing more does (see
+        `wait_until_quiet`)."""
         start = self.offset
         await self.wait_until_quiet(seconds)
         return [e for e in self._events()[start:] if e["type"] in OBSERVED]
 
     async def assert_none(self, kind: str, seconds: float) -> None:
-        """Assert that no message of type `kind` arrives within `seconds`."""
-        await asyncio.sleep(seconds)
+        """Assert that no message of type `kind` arrives: until `buck2 dev` answers a `sync`, or
+        within `seconds` if it does not. With no `seconds`, of those that have arrived."""
+        if seconds:
+            await self.sync(seconds)
         later = [e for e in self._events()[self.offset :] if e["type"] == kind]
         assert later == [], later
 
@@ -242,6 +268,8 @@ async def start_dev(
     env: Optional[Dict[str, str]] = None,
 ) -> DevSession:
     """Start `buck2 dev`. `env` adds to the environment of the `buck2 dev` client."""
+    # The fixture server may send `_sync` (see `DevSession.sync`).
+    env = {"BUCK2_DEV_TEST_SYNC": "true", **(env or {})}
     process = await buck.run_buck_command(
         "dev", target, "--console", console, "--debounce-ms", "200", *args, env=env
     ).start()
