@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>dev_modules</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/app/main.js"></script>
+    <script>
+      // The server sends `reload` when a module that this page loaded is stale.
+      new EventSource("/_events").addEventListener("reload", () => location.reload());
+    </script>
+  </body>
+</html>

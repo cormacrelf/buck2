@@ -1,0 +1,37 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//:defs.bzl", "JsModules")
+
+def _dev(ctx):
+    """The dev server: `index.html` is an output, and every module is built on demand by the
+    handler `module`."""
+    index = ctx.analysis(ctx.configured_targets("root//app:index.html")).providers()[DefaultInfo].default_outputs[0]
+    return [
+        DefaultInfo(),
+        DevInfo(
+            server = cmd_args("python3", ctx.fs.source("server/server.py")),
+            outputs = {"index": index},
+            handlers = {"module": "root//dev.bxl:module"},
+        ),
+    ]
+
+dev = bxl_main(impl = _dev, cli_args = {})
+
+def _module(ctx):
+    """A `buck2 dev` handler: the compiled module of the source file `--path`, from the
+    `js_library` that owns it."""
+    path = ctx.cli_args.path
+    owners = ctx.uquery().owner(path)
+    if len(owners) != 1:
+        fail("`{}` has {} owners".format(path, len(owners)))
+    target = ctx.configured_targets(owners[0].label)
+    modules = ctx.analysis(target).providers()[JsModules]
+    return [DefaultInfo(default_output = modules.js[path])]
+
+module = bxl_main(impl = _module, cli_args = {"path": cli_args.string()})
