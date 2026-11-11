@@ -5,7 +5,7 @@ with [subsecond](https://crates.io/crates/subsecond), the hot patching library
 of Dioxus. Linux only.
 
 ```sh
-buck2 dev //app:dev
+buck2 dev dev.bxl:app -- --binary //app:main --lib //app:app
 ```
 
 The app prints a line every second. Edit `tick` in `app/src/lib.rs` and save:
@@ -17,6 +17,16 @@ access for the crates from crates.io.
 ## How it works
 
 `//app:app` is the crate that is patched, and `//app:main` is the binary.
+`dev.bxl:app` is a bxl function that returns the `DevInfo` for them, as a rule
+would: it needs no target of its own, and runs any binary and crate given to it.
+
+### Building for hot patching
+
+A binary that subsecond patches links differently from a plain one. The
+function configures `--binary` and `--lib` for `//dev:subsecond_platform`, the
+default platform with the constraint `//dev:subsecond`, and the targets in
+`app/BUCK` select their link on that constraint. So `buck2 build //app:main`
+builds a plain binary, and `buck2 dev` a binary that can be patched.
 `//app:app` includes a module that `//app:slow` makes after a 10 second sleep,
 so each build of the crate is slow: change `src/lib.rs` again during a build,
 and the daemon stops the build, and `buck2 dev` starts a new one.
@@ -27,10 +37,11 @@ The linker of the toolchain is ThinLink, `toolchains/thinlink.rs`: a version of
 the linker of the same name in the Dioxus CLI. It wraps `clang++`. rustc runs
 it with the target's `env`, and `SUBSECOND_LINK` there sets what it does:
 
-- `fat`, set by `//app:main`: link every object file of the dependencies, keep
+- `fat`, set by `//app:main` when built for hot patching: link every object file of the dependencies, keep
   every section, and export every symbol. A patch can then call any function of
   the dependencies, including those the binary does not call.
-- `thin`, set by `//app:app`, for `//app:app[cdylib]`: link only the crate's
+- `thin`, set by `//app:app` when built for hot patching, for
+  `//app:app[cdylib]`: link only the crate's
   own code into a shared library. It leaves out the dependencies, the standard
   library and rustc's allocator shim; when the app loads the patch, the dynamic
   loader finds them in the binary. `-Clink-dead-code` makes rustc generate all
@@ -39,7 +50,7 @@ it with the target's `env`, and `SUBSECOND_LINK` there sets what it does:
 ThinLink is built with `rustc` alone, by a `genrule`: a `rust_binary` would
 need the toolchain that ThinLink is part of.
 
-`buck2 dev` builds two outputs of `//app:dev`:
+`buck2 dev` builds two outputs of the `DevInfo`:
 
 - `exe`: the binary.
 - `patch`: `//app:app[cdylib]`, linked by ThinLink.
@@ -60,8 +71,8 @@ app's binary is not in the command: it is the `exe` output, which the server
 asks for when it starts. So a new binary restarts the app, not the server.
 
 `buck2 dev` builds an output only when the server asks for it. The server asks
-for both when it starts. `defs.bzl` names one scope, `lib`, the crate
-`//app:app`. After a change, `buck2 dev` sends the server `stale`, which says for
+for both when it starts. `dev.bxl` names one scope, `lib`, the crate given as
+`--lib`. After a change, `buck2 dev` sends the server `stale`, which says for
 each output the files that changed since the server last got it, and `within`:
 the scopes that hold all of those changes.
 

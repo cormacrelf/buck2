@@ -1,0 +1,61 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+# `buck2 dev dev.bxl:app -- --binary //app:main --lib //app:app` runs the Rust binary `--binary`,
+# and patches the code of the crate `--lib` into it when a source file of the crate changes,
+# with subsecond (https://crates.io/crates/subsecond).
+#
+# The targets are built for `//dev:subsecond_platform`, on which they select how they link:
+# `--binary` with `SUBSECOND_LINK = "fat"`, and `--lib` with `SUBSECOND_LINK = "thin"` and
+# `-Clink-dead-code`. A plain `buck2 build` of them links as usual.
+#
+# Only Linux is supported: ThinLink, the toolchain's linker, handles ELF only.
+
+PLATFORM = "root//dev:subsecond_platform"
+
+def _app(ctx):
+    binary = ctx.configured_targets(ctx.cli_args.binary, target_platform = PLATFORM)
+    lib = ctx.configured_targets(ctx.cli_args.lib, target_platform = PLATFORM)
+    exe = ctx.analysis(binary).providers()[DefaultInfo].default_outputs[0]
+
+    # The crate as a shared library. ThinLink links it as a patch: only the crate's own code.
+    patch = ctx.analysis(lib).providers()[DefaultInfo].sub_targets["cdylib"][DefaultInfo].default_outputs[0]
+
+    # The server runs ThinLink here, so it is built for this machine.
+    thinlink = ctx.configured_targets("toolchains//:thinlink", target_platform = "prelude//platforms:default")
+    thinlink = ctx.analysis(thinlink).providers()[RunInfo]
+    server = cmd_args(
+        "python3",
+        ctx.fs.source("server/server.py"),
+        "--thinlink",
+        thinlink,
+    )
+    return [
+        DefaultInfo(),
+        DevInfo(
+            # The command names the server script and ThinLink, so a change to either
+            # restarts the server, and so the app, which the new server builds again. The
+            # app's binary is not in the command: a new binary would then restart the server.
+            # It is an output, which the server asks for when it starts.
+            server = server,
+            # The patch does not depend on the binary, so a new patch leaves the binary the
+            # one that is running.
+            outputs = {"exe": exe, "patch": patch},
+            # Only a change to the patched crate can go into a patch. `stale` tells the server
+            # whether every change since the running binary was built is in it.
+            scopes = {"lib": [lib.label]},
+        ),
+    ]
+
+app = bxl_main(
+    impl = _app,
+    cli_args = {
+        "binary": cli_args.target_label(doc = "The binary to run. It must depend on `lib`."),
+        "lib": cli_args.target_label(doc = "The crate to patch while the binary runs."),
+    },
+)

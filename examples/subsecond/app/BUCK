@@ -6,8 +6,6 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("//:defs.bzl", "subsecond_app")
-
 # A slow step in the build of `:app`, to show what happens to a build when a file changes during
 # it: the daemon stops the build, and `buck2 dev` starts again. It runs when `src/lib.rs`
 # changes, and writes an empty module that `:app` includes.
@@ -23,32 +21,37 @@ rust_library(
     name = "app",
     srcs = ["src/lib.rs"],
     crate_root = "src/lib.rs",
-    # `:app[cdylib]` is the patch. When rustc links it, ThinLink (see `toolchains/thinlink.rs`)
-    # links only this crate's objects, and leaves the dependencies to the running binary.
-    env = {"SUBSECOND_LINK": "thin"},
+    # `:app[cdylib]` is the patch. When rustc links it for hot patching, ThinLink (see
+    # `toolchains/thinlink.rs`) links only this crate's objects, and leaves the dependencies to
+    # the running binary.
+    env = select({
+        "//dev:subsecond": {"SUBSECOND_LINK": "thin"},
+        "DEFAULT": {},
+    }),
     mapped_srcs = {":slow": "src/slow.rs"},
     # The patch exports nothing, so without this rustc would generate no code for it.
-    rustc_flags = ["-Clink-dead-code"],
+    rustc_flags = select({
+        "//dev:subsecond": ["-Clink-dead-code"],
+        "DEFAULT": [],
+    }),
     deps = [
         "//third-party:serde_json",
         "//third-party:subsecond",
     ],
 )
 
-# The binary that `buck2 dev` starts. ThinLink links all of the dependencies' code into it, and
-# exports their symbols, so that a patch can call any of them.
+# The binary that `buck2 dev` starts. For hot patching, ThinLink links all of the dependencies'
+# code into it, and exports their symbols, so that a patch can call any of them.
+#
+# `buck2 dev dev.bxl:app -- --binary //app:main --lib //app:app` runs it, and patches `:app`
+# into it.
 rust_binary(
     name = "main",
     srcs = ["main.rs"],
     crate_root = "main.rs",
-    env = {"SUBSECOND_LINK": "fat"},
+    env = select({
+        "//dev:subsecond": {"SUBSECOND_LINK": "fat"},
+        "DEFAULT": {},
+    }),
     deps = [":app"],
-)
-
-# `buck2 dev //app:dev` runs `:main`, and patches `:app` into it.
-subsecond_app(
-    name = "dev",
-    binary = ":main",
-    lib = ":app",
-    server = "//server:server.py",
 )
