@@ -52,6 +52,11 @@ use buck2_build_api::interpreter::rule_defs::provider::builtin::local_resource_i
 use buck2_build_api::interpreter::rule_defs::provider::builtin::worker_info::WorkerInfo;
 use buck2_build_api::interpreter::rule_defs::required_test_local_resource::StarlarkRequiredTestLocalResource;
 use buck2_build_api::keep_going::KeepGoing;
+use buck2_build_api::local_resources::HasLocalResourceRegistry;
+use buck2_build_api::local_resources::PreparedLocalResourceSetupContext;
+use buck2_build_api::local_resources::local_resource_executor;
+use buck2_build_api::local_resources::prepare_local_resource;
+use buck2_build_api::local_resources::start_local_resource;
 use buck2_build_api::materialize::invocation_re_use_case;
 use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingCategory;
@@ -68,11 +73,8 @@ use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::execution_group::ExecutionGroup;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
-use buck2_core::execution_types::executor_config::CommandGenerationOptions;
 use buck2_core::execution_types::executor_config::Executor;
-use buck2_core::execution_types::executor_config::LocalExecutorOptions;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
-use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuckOutPathKind;
@@ -82,8 +84,6 @@ use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::EndOfTestResults;
-use buck2_data::SetupLocalResourcesEnd;
-use buck2_data::SetupLocalResourcesStart;
 use buck2_data::TestDiscovery;
 use buck2_data::TestDiscoveryEnd;
 use buck2_data::TestDiscoveryStart;
@@ -94,8 +94,6 @@ use buck2_data::TestSuite;
 use buck2_data::ToProtoMessage;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
-use buck2_error::ErrorTag;
-use buck2_error::conversion::from_any_with_tag;
 use buck2_error::internal_error;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::artifact::fs::ExecutorFs;
@@ -192,8 +190,6 @@ use pagable::Pagable;
 use pagable::pagable_typetag;
 
 use crate::command::InternalRunnerConfig;
-use crate::local_resource_api::LocalResourcesSetupResult;
-use crate::local_resource_registry::HasLocalResourceRegistry;
 use crate::local_resource_setup::TestStageSimple;
 use crate::local_resource_setup::required_providers;
 use crate::remote_storage;
@@ -678,7 +674,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             .executor()
             .is_local_execution_possible(executor_preference)
         {
-            let setup_local_resources_executor = Self::get_local_executor(dice, fs)?;
+            let setup_local_resources_executor = local_resource_executor(dice, fs)?;
             let simple_stage = stage.as_ref().into();
 
             let available_resources: BuckMutMap<_, _> =
@@ -924,12 +920,6 @@ impl Display for TestExecutionKey {
     }
 }
 
-struct PreparedLocalResourceSetupContext {
-    pub target: ConfiguredTargetLabel,
-    pub execution_request: CommandExecutionRequest,
-    pub env_var_mapping: BuckMutInsertionMap<String, String>,
-}
-
 #[derive(Clone, Dupe, Allocative)]
 enum CancellationReason {
     NotSpecified,
@@ -1085,7 +1075,7 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
         // In contrast from actual test execution we do not check if local execution is possible.
         // We leave that decision to actual local execution runner that requests local execution preparation.
         let setup_local_resources_executor =
-            Self::get_local_executor(&mut self.dice.dupe().ctx(), fs)?;
+            local_resource_executor(&mut self.dice.dupe().ctx(), fs)?;
         let available_resources: BuckMutMap<_, _> =
             test_info.local_resources().into_iter().collect();
         let rule_required_names = test_info.execution_required_local_resource_names();
@@ -1104,8 +1094,7 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             .dupe()
             .ctx()
             .try_compute_join(providers, async |dice, provider| {
-                Self::prepare_local_resource(dice, provider, fs, &executor_fs, Duration::default())
-                    .await
+                prepare_local_resource(dice, provider, fs, &executor_fs, Duration::default()).await
             })
             .await?;
 
@@ -1640,41 +1629,6 @@ impl BuckTestOrchestrator<'_> {
         Ok(executor)
     }
 
-    fn get_local_executor(
-        dice: &mut DiceComputations<'_>,
-        fs: &ArtifactFs,
-    ) -> buck2_error::Result<CommandExecutor> {
-        let executor_config = CommandExecutorConfig {
-            executor: Executor::Local(LocalExecutorOptions::default()),
-            options: CommandGenerationOptions {
-                path_separator: PathSeparatorKind::system_default(),
-                output_paths_behavior: Default::default(),
-                use_bazel_protocol_remote_persistent_workers: false,
-                network_access: None,
-            },
-        };
-        let CommandExecutorResponse {
-            executor,
-            platform,
-            action_cache_checker: _,
-            remote_dep_file_cache_checker: _,
-            cache_uploader: _,
-            output_trees_download_config: _,
-            write_action_cache: _,
-        } = dice.get_command_executor_from_dice(fs, &executor_config)?;
-        let executor = CommandExecutor::new(
-            executor,
-            Arc::new(NoOpCommandOptionalExecutor {}),
-            Arc::new(NoOpCommandOptionalExecutor {}),
-            Arc::new(NoOpCacheUploader {}),
-            None,
-            fs.dupe(),
-            executor_config.options,
-            platform,
-        );
-        Ok(executor)
-    }
-
     async fn get_test_info(
         dice: &mut DiceComputations<'_>,
         test_target: &ConfiguredProvidersLabel,
@@ -2047,7 +2001,7 @@ impl BuckTestOrchestrator<'_> {
         }
         let setup_commands = dice
             .try_compute_join(required_providers, async |dice, provider| {
-                Self::prepare_local_resource(
+                prepare_local_resource(
                     dice,
                     provider,
                     &executor.fs(),
@@ -2078,7 +2032,7 @@ impl BuckTestOrchestrator<'_> {
             .filter(|ctx| !lock.contains_key(&ctx.target))
             .map(|ctx| {
                 let missing_target = ctx.target.dupe();
-                let setup = Self::start_local_resource(
+                let setup = start_local_resource(
                     events.dupe(),
                     liveliness_observer.dupe(),
                     digest_config.dupe(),
@@ -2108,166 +2062,6 @@ impl BuckTestOrchestrator<'_> {
             .map(|t| lock.get(t).unwrap().clone())
             .collect();
         Ok(result?)
-    }
-
-    async fn prepare_local_resource(
-        dice: &mut DiceComputations<'_>,
-        provider: (&ConfiguredTargetLabel, OwnedLocalResourceInfo),
-        fs: &ArtifactFs,
-        executor_fs: &ExecutorFs<'_>,
-        default_timeout: Duration,
-    ) -> buck2_error::Result<PreparedLocalResourceSetupContext> {
-        let digest_config = dice.global_data().get_digest_config();
-
-        let (target, provider) = provider;
-        // The `'v`-branded view of the provider must not be held across an await (only the
-        // `OwnedFrozen` may be), so this is scoped and re-derived below.
-        let visited_inputs = {
-            let info = provider.as_ref().value().as_ref();
-            let mut artifact_visitor = SimpleCommandLineArtifactVisitor::new();
-            info.setup_command_line()
-                .visit_artifacts(&mut artifact_visitor)?;
-            artifact_visitor.inputs
-        };
-
-        let inputs = dice
-            .try_compute_join(visited_inputs, async |dice, group| {
-                dice.ensure_artifact_group(&group).await
-            })
-            .await?;
-
-        let info = provider.as_ref().value().as_ref();
-        let artifact_path_mapping: BuckMutMap<_, _> = inputs
-            .iter()
-            .flat_map(|v| v.iter())
-            .map(|(a, v)| (a, v.content_based_path_hash()))
-            .collect();
-        let mut cmd: Vec<String> = vec![];
-        info.setup_command_line()
-            .add_to_command_line(&mut CommandLineBuilder::new(
-                &mut cmd,
-                &artifact_path_mapping,
-                executor_fs,
-            ))?;
-
-        let inputs = inputs
-            .into_iter()
-            .map(|group_values| CommandExecutionInput::Artifact(Box::new(group_values)))
-            .collect();
-        let paths = CommandExecutionPaths::new(
-            inputs,
-            buck_mut_insertion_set![],
-            fs,
-            digest_config,
-            dice.per_transaction_data()
-                .get_run_action_knobs()
-                .action_paths_interner
-                .as_ref(),
-        )?;
-        let mut execution_request =
-            CommandExecutionRequest::new(vec![], cmd, paths, Default::default());
-        execution_request =
-            execution_request.with_timeout(info.setup_timeout().unwrap_or(default_timeout));
-        execution_request = execution_request.with_skip_resource_control();
-        Ok(PreparedLocalResourceSetupContext {
-            target: target.dupe(),
-            execution_request,
-            env_var_mapping: info.env_var_mapping(),
-        })
-    }
-
-    async fn start_local_resource(
-        events: EventDispatcher,
-        liveliness_observer: Arc<dyn LivelinessObserver>,
-        digest_config: DigestConfig,
-        executor: CommandExecutor,
-        context: PreparedLocalResourceSetupContext,
-        cancellation: &CancellationContext,
-    ) -> buck2_error::Result<LocalResourceState> {
-        let manager = CommandExecutionManager::new(
-            Box::new(MutexClaimManager::new()),
-            events.dupe(),
-            liveliness_observer,
-            WaitingData::new(),
-        );
-
-        let local_resource_target = LocalResourceTarget {
-            target: &context.target,
-        };
-        let prepared_action =
-            executor.prepare_action(&context.execution_request, digest_config, false)?;
-        let prepared_command = PreparedCommand {
-            target: &local_resource_target as _,
-            request: &context.execution_request,
-            prepared_action: &prepared_action,
-            digest_config,
-        };
-        let command = executor.exec_cmd(manager, &prepared_command, cancellation);
-
-        let start = SetupLocalResourcesStart {
-            target_label: Some(context.target.as_proto()),
-        };
-        let end = SetupLocalResourcesEnd {};
-        let execution_result = events
-            .span_async(start, async move { (command.await, end) })
-            .await;
-
-        let CommandExecutionResult {
-            outputs: _,
-            report:
-                CommandExecutionReport {
-                    std_streams,
-                    exit_code,
-                    status,
-                    ..
-                },
-            ..
-        } = execution_result;
-
-        let std_streams = std_streams
-            .into_bytes()
-            .await
-            .buck_error_context("Error accessing setup local resource output")?;
-
-        match status {
-            CommandExecutionStatus::Success { .. } => {}
-            CommandExecutionStatus::Failure { .. }
-            | CommandExecutionStatus::WorkerFailure { .. } => {
-                return Err(buck2_error::buck2_error!(
-                    ErrorTag::LocalResourceSetup,
-                    "Local resource setup command failed with `{}` exit code, stdout:\n{}\nstderr:\n{}\n",
-                    exit_code.unwrap_or(1),
-                    String::from_utf8_lossy(&std_streams.stdout),
-                    String::from_utf8_lossy(&std_streams.stderr),
-                ));
-            }
-            CommandExecutionStatus::TimedOut { duration, .. } => {
-                return Err(buck2_error::buck2_error!(
-                    ErrorTag::LocalResourceSetup,
-                    "Local resource setup command timed out after `{}s`, stdout:\n{}\nstderr:\n{}\n",
-                    duration.as_secs(),
-                    String::from_utf8_lossy(&std_streams.stdout),
-                    String::from_utf8_lossy(&std_streams.stderr),
-                ));
-            }
-            CommandExecutionStatus::Error { error, .. } => {
-                return Err(error);
-            }
-            CommandExecutionStatus::Cancelled { .. } => {
-                return Err(buck2_error::buck2_error!(
-                    ErrorTag::LocalResourceSetup,
-                    "Local resource setup command cancelled"
-                ));
-            }
-        };
-
-        let string_content = String::from_utf8_lossy(&std_streams.stdout);
-        let data: LocalResourcesSetupResult = serde_json::from_str(&string_content)
-            // .buck_error_context("Error parsing local resource setup command output")
-            .map_err(|e| from_any_with_tag(e, ErrorTag::LocalResourceSetup))?;
-        let state = data.into_state(context.target.dupe(), &context.env_var_mapping)?;
-
-        Ok(state)
     }
 }
 
@@ -2743,38 +2537,6 @@ fn create_action_key_suffix(stage: &TestStage) -> String {
     action_key_suffix
 }
 
-#[derive(Debug)]
-struct LocalResourceTarget<'a> {
-    target: &'a ConfiguredTargetLabel,
-}
-
-impl CommandExecutionTarget for LocalResourceTarget<'_> {
-    fn re_action_key(&self) -> String {
-        String::new()
-    }
-
-    fn re_affinity_key(&self) -> String {
-        String::new()
-    }
-
-    fn as_proto_action_key(&self) -> buck2_data::ActionKey {
-        buck2_data::ActionKey {
-            id: Default::default(),
-            owner: Some(buck2_data::action_key::Owner::LocalResourceSetup(
-                self.target.as_proto(),
-            )),
-            key: Default::default(),
-        }
-    }
-
-    fn as_proto_action_name(&self) -> buck2_data::ActionName {
-        buck2_data::ActionName {
-            category: "setup_local_resource".to_owned(),
-            identifier: "".to_owned(),
-        }
-    }
-}
-
 struct TestExecutor {
     test_executor: CommandExecutor,
     executor_config: CommandExecutorConfig,
@@ -2827,6 +2589,8 @@ mod tests {
     use buck2_core::cells::CellResolver;
     use buck2_core::cells::name::CellName;
     use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::execution_types::executor_config::CommandGenerationOptions;
+    use buck2_core::execution_types::executor_config::PathSeparatorKind;
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_execute::digest_config::SetDigestConfig;

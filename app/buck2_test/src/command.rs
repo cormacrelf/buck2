@@ -37,6 +37,7 @@ use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProvide
 use buck2_build_api::interpreter::rule_defs::provider::test_provider::TestProvider;
 use buck2_build_api::interpreter::rule_defs::provider::test_provider::build_external_runner_spec;
 use buck2_build_api::interpreter::rule_defs::provider::test_provider::test_provider_from_collection;
+use buck2_build_api::local_resources::HasLocalResourceRegistry;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_cli_proto::HasClientContext;
 use buck2_cli_proto::TestRequest;
@@ -125,7 +126,6 @@ use crate::executor_launcher::ExecutorLauncher;
 use crate::executor_launcher::ExecutorOutput;
 use crate::executor_launcher::OutOfProcessTestExecutor;
 use crate::executor_launcher::TestExecutorClientWrapper;
-use crate::local_resource_registry::HasLocalResourceRegistry;
 use crate::orchestrator::BuckTestOrchestrator;
 use crate::orchestrator::ExecutorMessage;
 use crate::session::TestSession;

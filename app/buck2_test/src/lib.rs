@@ -14,8 +14,6 @@ pub mod command;
 pub mod downward_api;
 pub mod executor_launcher;
 pub(crate) mod internal_runner;
-pub(crate) mod local_resource_api;
-pub mod local_resource_registry;
 pub(crate) mod local_resource_setup;
 pub mod orchestrator;
 pub(crate) mod remote_storage;
