@@ -818,6 +818,21 @@ impl RecordedAnalysisValues {
         Ok(FrozenProviderCollectionValueRef::from_inner(inner))
     }
 
+    /// The provider collection, if the analysis returned one. A bxl function may return none.
+    pub fn provider_collection_if_returned(
+        &self,
+    ) -> buck2_error::Result<Option<FrozenProviderCollectionValueRef<'_>>> {
+        let Some(storage) = &self.analysis_storage else {
+            return Ok(None);
+        };
+        let collection = storage
+            .read()?
+            .maybe_map::<FrozenValueTyped<'static, ProviderCollection<'static>>, _>(|v| {
+                FrozenValueTyped::new(v.as_ref().value.result_value?.to_value())
+            });
+        Ok(collection.map(FrozenProviderCollectionValueRef::from_inner))
+    }
+
     pub(crate) fn provider_collection_if_present(
         &self,
     ) -> buck2_error::Result<Option<FrozenProviderCollectionValueRef<'_>>> {

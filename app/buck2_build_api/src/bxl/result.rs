@@ -14,6 +14,7 @@ use pagable::Pagable;
 
 use crate::analysis::registry::RecordedAnalysisValues;
 use crate::artifact_groups::ArtifactGroup;
+use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 
 /// The result of evaluating a bxl function
 #[derive(Allocative, Pagable)]
@@ -55,6 +56,14 @@ impl BxlResult {
 
     pub(crate) fn analysis_values(&self) -> &RecordedAnalysisValues {
         &self.analysis_values
+    }
+
+    /// The providers that the bxl function returned, if it returned any.
+    pub fn providers(&self) -> buck2_error::Result<Option<FrozenProviderCollectionValue>> {
+        Ok(self
+            .analysis_values
+            .provider_collection_if_returned()?
+            .map(|providers| providers.to_owned()))
     }
 
     pub fn output(&self) -> &Vec<u8> {

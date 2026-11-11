@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 use allocative::Allocative;
 use buck2_build_api::bxl::result::BxlResult;
 use buck2_build_api::bxl::types::BxlFunctionLabel;
+use buck2_build_api::interpreter::rule_defs::provider::collection::ProviderCollection;
 use buck2_common::events::HasEvents;
 use buck2_common::scope::scope_and_collect_with_dice;
 use buck2_common::target_aliases::BuckConfigTargetAliasResolver;
@@ -54,6 +55,7 @@ use starlark::values::OwnedFrozenRef;
 use starlark::values::UnpackValue;
 use starlark::values::ValueOfUnchecked;
 use starlark::values::ValueTyped;
+use starlark::values::list::ListRef;
 use starlark::values::structs::AllocStruct;
 use starlark::values::structs::StructRef;
 use tokio::sync::Semaphore;
@@ -230,7 +232,7 @@ impl BxlInnerEvaluator {
 
                         let bxl_ctx = ValueTyped::<BxlContext>::new_err(env.heap().alloc(bxl_ctx))?;
 
-                        tokio::task::block_in_place(|| {
+                        let returned = tokio::task::block_in_place(|| {
                             with_dispatcher(dispatcher.clone(), || {
                                 dispatcher.clone().span(
                                     BxlExecutionStart {
@@ -251,7 +253,11 @@ impl BxlInnerEvaluator {
                             })
                         })?;
 
-                        BxlContext::take_state(bxl_ctx)
+                        let (actions, outcome) = BxlContext::take_state(bxl_ctx)?;
+                        if let Some(providers) = returned {
+                            actions.analysis_value_storage.set_result_value(providers)?;
+                        }
+                        Ok((actions, outcome))
                     })
                     // When eval fails, we want to include the streaming cache file in Error, so
                     // that we can still print out the streaming content even if the bxl is cached.
@@ -323,12 +329,14 @@ async fn eval_bxl_inner(
     eval_ctx.do_eval(eval_provider, ctx)
 }
 
+/// Call the bxl function. It returns `None`, or a list of providers as a rule implementation
+/// does, which is then the result value of its analysis registry.
 fn eval_bxl<'v>(
     eval: &mut Evaluator<'v, '_, '_>,
     frozen_callable: OwnedBxlFunction,
     ctx: ValueTyped<'v, BxlContext<'v>>,
     force_print_stacktrace: bool,
-) -> buck2_error::Result<()> {
+) -> buck2_error::Result<Option<ValueTyped<'v, ProviderCollection<'v>>>> {
     let bxl_impl = frozen_callable
         .as_ref()
         .add_to_heap(eval.heap())
@@ -338,11 +346,16 @@ fn eval_bxl<'v>(
 
     let e = match result {
         Ok(v) => {
-            if !v.is_none() {
+            if v.is_none() {
+                return Ok(None);
+            }
+            if ListRef::from_value(v).is_none() {
                 return Err(NotAValidReturnType(v.get_type()).into());
             }
-
-            return Ok(());
+            let providers = eval
+                .heap()
+                .alloc_typed(ProviderCollection::try_from_value(v)?);
+            return Ok(Some(providers));
         }
         Err(e) => e,
     };
@@ -435,6 +448,6 @@ pub(crate) async fn resolve_cli_args<'a>(
 }
 
 #[derive(Debug, buck2_error::Error)]
-#[error("Expected `NoneType` to be returned from bxl. Got return value `{0}`")]
+#[error("Expected `None`, or a list of providers, to be returned from bxl. Got return value `{0}`")]
 #[buck2(tag = Input)]
 struct NotAValidReturnType(&'static str);
