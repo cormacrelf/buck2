@@ -493,8 +493,15 @@ environment, a process that the server starts, such as the real program behind
 a wrapper script, can connect instead of the server. If a second connection
 sends `hello`, it takes over from the first.
 
-`buck2 dev` may add new message types and new fields. A server must ignore
-messages whose `type` it does not know, and fields it does not know.
+`version` is the version of the protocol that the server speaks. If `buck2 dev`
+does not speak it, it answers `{"type": "unsupported", "versions": [1]}`, with
+the versions that it does speak, and nothing else until the server sends
+`hello` again, on the same connection, with one of them. `hello` and
+`unsupported` keep this shape in every version.
+
+Within a version, `buck2 dev` may add new message types and new fields. A
+server must ignore messages whose `type` it does not know, and fields it does
+not know.
 `buck2 dev` reports a line that is not a valid request, and ignores it. It
 closes the connection of a server that sends a line longer than 4 MiB, or that
 stops reading, so that a thousand messages wait for it. The server keeps
@@ -568,7 +575,8 @@ console, and prints only errors and that the server exited or restarts.
 
 | `type`          | Fields                                                    | Sent when                                                                                                    |
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`, `scopes`: the names in `DevInfo.scopes` | The server sent `hello`.                                                              |
+| `ready`         | `version`: as in `hello`, `outputs`: the names in `DevInfo.outputs`, `scopes`: the names in `DevInfo.scopes` | The server sent `hello` with a version that `buck2 dev` speaks.          |
+| `unsupported`   | `versions`: the versions that `buck2 dev` speaks          | The server sent `hello` with another version.                                                                |
 | `building`      | `gen`, `outputs`: names, `files`: the changes of these outputs since the server got them | The server asked for a build, and it starts.                                     |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
@@ -608,7 +616,7 @@ are not sent again. Once the analysis works again, the server gets
 
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
-| `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`. Send it before anything else.            |
+| `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`, or `unsupported`. Send it before anything else. |
 | `build`   | `outputs`: a list of names | Build these outputs now, with all changes, and track them from now on. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. |
 | `restart` |                           | Build the server again and restart it. The new server has asked for nothing. If the build fails, the old server keeps running until the next analysis restarts it. |
 

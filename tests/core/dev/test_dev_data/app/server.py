@@ -107,13 +107,20 @@ def main():
             conn.flush()
 
     threading.Thread(target=control, args=(request,), daemon=True).start()
-    request({"type": "hello", "version": 1})
+    version = 1
+    for arg in args:
+        if arg.startswith("--hello-version="):
+            version = int(arg.split("=", 1)[1])
+    request({"type": "hello", "version": version})
     builds = 0
     for line in conn:
         message = json.loads(line)
         log(message)
         kind = message["type"]
-        if kind == "ready":
+        if kind == "unsupported":
+            # Try again with the newest version that `buck2 dev` speaks.
+            request({"type": "hello", "version": max(message["versions"])})
+        elif kind == "ready":
             if "--too-long" in args:
                 request({"type": "build", "pad": "x" * (5 << 20)})
             if "--bad-request" in args:

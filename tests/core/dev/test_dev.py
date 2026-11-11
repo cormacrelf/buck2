@@ -58,6 +58,19 @@ class DevTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
+    async def test_hello_with_a_version_not_spoken(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//app:future_version")
+        try:
+            # The server asks again with a version from the list, on the same connection.
+            _, unsupported, ready = await dev.expect("started", "unsupported", "ready")
+            assert unsupported["versions"] == [1], unsupported
+            assert ready["version"] == 1
+            await dev.wait_for("built")
+        finally:
+            output = await dev.stop()
+        assert "asked for protocol version 2" in output, output
+
+    @dev_test()
     async def test_unknown_request_is_reported(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:bad_request")
         try:

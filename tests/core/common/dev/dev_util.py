@@ -35,6 +35,7 @@ PROTOCOL = {
     "stale",
     "graph_changed",
     "shutdown",
+    "unsupported",
 }
 
 # What `DevSession.next` and `DevSession.expect` see: the messages, and `started`, which each

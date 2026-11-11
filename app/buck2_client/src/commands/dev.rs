@@ -468,8 +468,10 @@ fn signal_ignored(signal: libc::c_int) -> bool {
     }
 }
 
-/// The version of the protocol between `buck2 dev` and its server, in `hello` and `ready`.
-const PROTOCOL_VERSION: u64 = 1;
+/// The versions of the protocol between `buck2 dev` and its server that `buck2 dev` speaks. A
+/// server names one in `hello`; `ready` repeats it. `hello` and `unsupported` keep their shape in
+/// every version, so that a server can find one that both sides speak.
+const PROTOCOL_VERSIONS: &[u64] = &[1];
 
 /// A message from the server.
 #[derive(serde::Deserialize)]
@@ -700,15 +702,33 @@ impl ServerLink {
                     return Ok(());
                 }
                 match serde_json::from_str::<Request>(&line) {
-                    Ok(Request::Hello { version }) => {
-                        if version != PROTOCOL_VERSION {
-                            // Answer anyway: `ready` says which version `buck2 dev` speaks.
-                            self.console.message(format!(
-                                "The `buck2 dev` server asked for protocol version {}, but `buck2 dev` speaks version {}",
-                                version,
-                                PROTOCOL_VERSION
-                            ))?;
+                    Ok(Request::Hello { version }) if !PROTOCOL_VERSIONS.contains(&version) => {
+                        self.console.message(format!(
+                            "The `buck2 dev` server asked for protocol version {}, but `buck2 dev` speaks {}",
+                            version,
+                            PROTOCOL_VERSIONS
+                                .iter()
+                                .map(|v| format!("version {v}"))
+                                .collect::<Vec<_>>()
+                                .join(" and ")
+                        ))?;
+                        // The connection stays open, unintroduced, so that it can send `hello`
+                        // again with a version from the list. One that had sent `hello` before
+                        // gets nothing more until it does.
+                        if introduced {
+                            if let Some((conn, connection)) = server.conn.take() {
+                                server.announced = None;
+                                server.unintroduced.insert(conn, connection);
+                            }
                         }
+                        if let Some(connection) = server.unintroduced.get(&conn) {
+                            let _ignored = connection.send(&json!({
+                                "type": "unsupported",
+                                "versions": PROTOCOL_VERSIONS,
+                            }));
+                        }
+                    }
+                    Ok(Request::Hello { version }) => {
                         // Another connection that sends `hello`, such as the real server behind a
                         // wrapper that connected first, takes over from the first.
                         if let Some(connection) = server.unintroduced.remove(&conn) {
@@ -717,7 +737,7 @@ impl ServerLink {
                         }
                         server.send(json!({
                             "type": "ready",
-                            "version": PROTOCOL_VERSION,
+                            "version": version,
                             "outputs": info.outputs,
                             "scopes": info.scopes,
                         }));
