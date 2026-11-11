@@ -12,14 +12,9 @@ usage: gen.py <dir> <packages> <targets per package> <sources per target>
 
 Each target is a `lib` with its own source files and two dependencies on targets of earlier
 packages. `//app:<mode>` depends on the last targets of every package, so its graph is all of
-them. The modes differ in their watch sets:
+them. The modes differ in their outputs:
 
-- `targets`: one `targets = None` set that builds a trivial output.
-- `inputs`: before it, a set with `inputs` that are built from every library, through a
-  transitive set of the libraries' outputs. It only builds.
-- `restart`: the same `inputs` set, but it restarts, so its files are compared by content.
-- `outputs`: no watch sets. The outputs carry the policy: the trivial output, and one that is
-  built from every library.
+- `outputs`: a trivial output, and one that is built from every library.
 - `outputs8`: the same, with eight outputs that are built from every library, to see what
   each further output costs.
 """
@@ -80,42 +75,25 @@ lib = rule(
 
 def _app(ctx):
     outs = ctx.actions.tset(LibOuts, children = [d[LibInfo].outs for d in ctx.attrs.deps])
-    everything = ctx.actions.declare_output("everything.txt")
-    ctx.actions.run(
-        cmd_args("sh", "-c", 'out="$1"; shift; cat "$@" > "$out"', "--", everything.as_output(), outs.project_as_args("out")),
-        category = "everything",
-        local_only = True,
-    )
     small = ctx.actions.write("small.txt", ctx.attrs.small)
     server = cmd_args("python3", ctx.attrs.server)
-    if ctx.attrs.mode.startswith("outputs"):
-        # No watch sets: `buck2 dev` finds what each output may be built from.
-        # These are built, so the paths are in a file: there are too many for a command line.
-        outputs = {"small": small}
-        for i in range(int(ctx.attrs.mode.removeprefix("outputs") or 1)):
-            name = "everything{}".format(i)
-            paths = ctx.actions.write(name + ".args", outs.project_as_args("out"), with_inputs = True)
-            more = ctx.actions.declare_output(name + ".txt")
-            ctx.actions.run(
-                cmd_args("sh", "-c", 'xargs cat < "$1" > "$2"', "--", paths, more.as_output()),
-                category = "everything",
-                identifier = name,
-                local_only = True,
-            )
-            outputs[name] = more
-        return [
-            DefaultInfo(default_output = small),
-            DevInfo(server = server, outputs = outputs),
-        ]
-    rest = DevWatch(targets = None, build = ["small"])
-    watch = {
-        "targets": [rest],
-        "inputs": [DevWatch(inputs = everything, build = ["small"]), rest],
-        "restart": [DevWatch(inputs = everything, restart = True), rest],
-    }[ctx.attrs.mode]
+    # The outputs built from every library. Their inputs are in a file: there are too many
+    # paths for a command line.
+    outputs = {"small": small}
+    for i in range(int(ctx.attrs.mode.removeprefix("outputs") or 1)):
+        name = "everything{}".format(i)
+        paths = ctx.actions.write(name + ".args", outs.project_as_args("out"), with_inputs = True)
+        more = ctx.actions.declare_output(name + ".txt")
+        ctx.actions.run(
+            cmd_args("sh", "-c", 'xargs cat < "$1" > "$2"', "--", paths, more.as_output()),
+            category = "everything",
+            identifier = name,
+            local_only = True,
+        )
+        outputs[name] = more
     return [
         DefaultInfo(default_output = small),
-        DevInfo(server = server, outputs = {"small": small}, watch = watch),
+        DevInfo(server = server, outputs = outputs),
     ]
 
 app = rule(
@@ -185,7 +163,7 @@ tops = [
 ]
 
 app = ['load("//:defs.bzl", "app")', ""]
-for mode in ("targets", "inputs", "restart", "outputs", "outputs8"):
+for mode in ("outputs", "outputs8"):
     app.append(
         f'app(name = "{mode}", mode = "{mode}", server = "server.py", deps = {tops!r})'.replace(
             "'", '"'

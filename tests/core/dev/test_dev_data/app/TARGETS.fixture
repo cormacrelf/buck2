@@ -9,32 +9,15 @@
 load("//:defs.bzl", "concat", "dev_app")
 
 dev_app(
-    name = "auto",
-    mode = "auto",
-    srcs = ["main.txt"],
-    deps = ["//lib:lib"],
-    server = "server.py",
-)
-
-dev_app(
-    name = "auto_build_on_stale",
-    mode = "auto",
-    srcs = ["main.txt"],
-    deps = ["//lib:lib"],
-    server = "server.py",
-    server_args = ["--build-on-stale"],
-)
-
-dev_app(
     name = "all",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
 )
 
 dev_app(
     name = "bad_request",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--bad-request"],
@@ -42,21 +25,14 @@ dev_app(
 
 dev_app(
     name = "pages",
-    mode = "all",
+    mode = "outputs",
     srcs = glob(["pages/*.txt"]),
     server = "server.py",
 )
 
 dev_app(
-    name = "restart",
-    mode = "restart",
-    srcs = ["main.txt"],
-    server = "server.py",
-)
-
-dev_app(
     name = "slow",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     delay = "delay.txt",
     server = "server.py",
@@ -64,7 +40,7 @@ dev_app(
 
 dev_app(
     name = "slow_flood",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     delay = "delay.txt",
     server = "server.py",
@@ -73,7 +49,7 @@ dev_app(
 
 dev_app(
     name = "no_connect",
-    mode = "restart",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--no-connect"],
@@ -81,7 +57,7 @@ dev_app(
 
 dev_app(
     name = "crash",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--crash-once"],
@@ -89,7 +65,7 @@ dev_app(
 
 dev_app(
     name = "run_once",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--exit-after-built"],
@@ -97,7 +73,7 @@ dev_app(
 
 dev_app(
     name = "too_long",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--too-long"],
@@ -105,32 +81,16 @@ dev_app(
 
 dev_app(
     name = "tree",
-    mode = "all",
+    mode = "outputs",
     srcs = glob(["tree/**/*.txt"]),
     server = "server.py",
 )
 
 dev_app(
-    name = "auto_slow",
-    mode = "auto",
-    srcs = ["main.txt"],
-    deps = ["//lib:lib"],
-    delay = "delay.txt",
-    server = "server.py",
-)
-
-dev_app(
     name = "pages_slow",
-    mode = "all",
+    mode = "outputs",
     srcs = glob(["pages/*.txt"]),
     delay = "delay.txt",
-    server = "server.py",
-)
-
-dev_app(
-    name = "inputs",
-    mode = "inputs",
-    srcs = ["main.txt"],
     server = "server.py",
 )
 
@@ -140,49 +100,22 @@ dev_app(
     srcs = ["main.txt"],
     deps = ["//lib:lib"],
     server = "server.py",
+    server_args = ["--all-outputs"],
 )
 
 dev_app(
     name = "patch",
-    mode = "patch",
+    mode = "outputs",
     srcs = glob(["pages/*.txt"]),
+    extra_outputs = {"patch": glob(["pages/*.txt"])},
     deps = ["//lib:lib"],
     server = "server.py",
     server_args = ["--all-outputs"],
 )
 
 dev_app(
-    name = "pages_auto",
-    mode = "auto",
-    srcs = glob(["pages/*.txt"]),
-    deps = ["//lib:lib"],
-    server = "server.py",
-)
-
-dev_app(
-    name = "unwatched",
-    mode = "unwatched",
-    srcs = ["main.txt"],
-    server = "server.py",
-)
-
-dev_app(
-    name = "wait",
-    mode = "wait",
-    srcs = ["main.txt"],
-    server = "server.py",
-)
-
-dev_app(
-    name = "kept",
-    mode = "kept",
-    srcs = ["main.txt"],
-    server = "server.py",
-)
-
-dev_app(
     name = "split",
-    mode = "split",
+    mode = "outputs",
     srcs = ["main.txt"],
     deps = [":part"],
     server = "server.py",
@@ -195,7 +128,7 @@ concat(
 
 dev_app(
     name = "built_server",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_check = "check.txt",
@@ -208,7 +141,7 @@ concat(
 
 dev_app(
     name = "multi",
-    mode = "multi",
+    mode = "outputs",
     srcs = ["main.txt"],
     extra_outputs = {"extra": ["extra.txt"]},
     server = "server.py",
@@ -217,23 +150,15 @@ dev_app(
 
 dev_app(
     name = "with_dep",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     deps = ["//lib:lib"],
     server = "server.py",
 )
 
 dev_app(
-    name = "restart_built_server",
-    mode = "restart",
-    srcs = ["main.txt"],
-    server = "server.py",
-    server_check = "check.txt",
-)
-
-dev_app(
     name = "slow_shutdown",
-    mode = "restart",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--slow-shutdown"],
@@ -241,14 +166,14 @@ dev_app(
 
 dev_app(
     name = "configured",
-    mode = "all",
+    mode = "outputs",
     srcs = [read_config("dev_test", "src", "main.txt")],
     server = "server.py",
 )
 
 dev_app(
     name = "project_log",
-    mode = "all",
+    mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
     server_args = ["--log-in-project"],

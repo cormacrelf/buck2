@@ -12,15 +12,14 @@
 # its own, whose types do not clash with `buck2 dev` messages. With `--log-in-project`, it also
 # appends each to `server.log` in the project root, as a server that logs to the project would.
 #
-# On `ready` it asks for the `site` output. With `--build-on-stale`, it asks for `site` again
-# whenever `buck2 dev` reports files of a `notify` set as changed. With `--bad-request`, it also
-# sends a request of an unknown type on `ready`. With `--no-connect`, it never connects, and only
-# logs `started`. With `--crash-once`, the first server to get `built` exits with an error. With
-# `--exit-after-built`, every server exits successfully after `built`. With
-# `--flood-on-second-build`, it sends one long request when the second build starts, and logs
-# `flooded` once `buck2 dev` has read it. With `--too-long`, it sends a line longer than
-# `buck2 dev` accepts on `ready`. With `--all-outputs`, it asks for every output that `ready` names
-# instead of `site`. With `--slow-shutdown`, it takes 3 seconds to exit after `shutdown`.
+# On `ready` it asks for the `site` output. With `--bad-request`, it also sends a request of an
+# unknown type on `ready`. With `--no-connect`, it never connects, and only logs `started`. With
+# `--crash-once`, the first server to get `built` exits with an error. With `--exit-after-built`,
+# every server exits successfully after `built`. With `--flood-on-second-build`, it sends one
+# long request when the second build starts, and logs `flooded` once `buck2 dev` has read it.
+# With `--too-long`, it sends a line longer than `buck2 dev` accepts on `ready`. With
+# `--all-outputs`, it asks for every output that `ready` names instead of `site`. With
+# `--slow-shutdown`, it takes 3 seconds to exit after `shutdown`.
 #
 # Every server logs `started` when it starts. The tests control the running server through
 # `buck-out/dev_control.jsonl`, which the file watcher does not report: the server sends each line
@@ -119,8 +118,6 @@ def main():
                 request({"type": "build", "outputs": message["outputs"]})
             else:
                 request({"type": "build", "outputs": ["site"]})
-        elif kind == "stale" and message["files"] and "--build-on-stale" in args:
-            request({"type": "build", "outputs": ["site"]})
         elif kind == "building":
             builds += 1
             if builds == 2 and "--flood-on-second-build" in args:

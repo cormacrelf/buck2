@@ -25,6 +25,7 @@ from buck2.tests.core.common.dev.dev_util import (
     dev_test,
     edit_target,
     files,
+    read,
     site,
     start_dev,
     summary,
@@ -42,9 +43,9 @@ class DevFailuresTest(BuckTestCase):
     async def test_unrelated_change_while_server_build_broken_sends_nothing(
         self, buck: Buck
     ) -> None:
-        """After the server's build failed on a restart, a change to a file that nothing uses
-        sends nothing, as it does while the server builds."""
-        dev = await start_dev(buck, "//app:restart_built_server")
+        """After the server's build failed, a change to a file that nothing uses sends nothing,
+        as it does while the server builds."""
+        dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
@@ -192,7 +193,7 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_one_of_several_outputs_fails(self, buck: Buck) -> None:
-        """One of two outputs breaks: its set fails; the other still builds on its own."""
+        """One of two outputs breaks: its build fails; the other still builds on its own."""
         dev = await start_dev(buck, "//app:multi")
         try:
             first = await dev.start()
@@ -236,9 +237,9 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_server_build_fails_on_restart(self, buck: Buck) -> None:
-        """The server's own build fails when a change restarts it: `failed`, and the old server
-        keeps running, until a fix restarts it."""
-        dev = await start_dev(buck, "//app:restart_built_server")
+        """The server's own build fails when a change to its script would restart it: `failed`,
+        and the old server keeps running, until a fix restarts it."""
+        dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
@@ -250,6 +251,8 @@ class DevFailuresTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, "app/main.txt", "app v2\n")
+            server = read(buck, "app/server.py")
+            write(buck, "app/server.py", server + "# changed\n")
             await dev.wait_until_quiet()
             assert_kept(dev, first)
 
@@ -268,16 +271,17 @@ class DevFailuresTest(BuckTestCase):
     async def test_change_while_server_build_broken_fails_once(
         self, buck: Buck
     ) -> None:
-        """While the server's build is broken, a change that restarts the server sends one
+        """While the server's build is broken, a change to the server's script sends one
         `failed`."""
-        dev = await start_dev(buck, "//app:restart_built_server")
+        dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
             await dev.expect("failed")
             await dev.quiet()
 
-            write(buck, "app/main.txt", "app v2\n")
+            server = read(buck, "app/server.py")
+            write(buck, "app/server.py", server + "# changed\n")
             await dev.expect("failed")
             await dev.quiet()
             assert_kept(dev, first)
@@ -285,17 +289,15 @@ class DevFailuresTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_server_build_fails_with_a_build_set(self, buck: Buck) -> None:
-        """The server's own build broken, with a set that builds: each change builds the server
-        again, which fails, and the old server keeps running. Changes still build the output."""
+    async def test_server_build_fails_while_the_output_builds(self, buck: Buck) -> None:
+        """The server's own build broken: each change builds the server again, which fails, and
+        the old server keeps running. Changes still build the output."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            failed, building, built = await dev.expect("failed", "building", "built")
+            (failed,) = await dev.expect("failed")
             assert "Failed to build the `buck2 dev` server" in failed["error"]
-            assert files(buck, building) == ["app/check.txt"]
-            assert changed(built) == {"site": False}
 
             write(buck, "app/main.txt", "app v2\n")
             _, _, built = await dev.expect("failed", "building", "built")
@@ -327,8 +329,8 @@ class DevFailuresTest(BuckTestCase):
                 buck,
                 APP,
                 "all",
-                'mode = "all",',
-                'mode = "all",\n    server_exe = "no-such-program-for-buck2-dev",',
+                'mode = "outputs",',
+                'mode = "outputs",\n    server_exe = "no-such-program-for-buck2-dev",',
             )
             (shutdown,) = await dev.expect("shutdown")
             assert shutdown["pid"] == first["pid"]
@@ -349,7 +351,7 @@ class DevFailuresTest(BuckTestCase):
     async def test_restarted_server_crashes_at_start(self, buck: Buck) -> None:
         """An edit to the server's script that makes it crash at once: the old server is
         stopped, the new one exits, `buck2 dev` keeps running, and the fix starts it again."""
-        dev = await start_dev(buck, "//app:inputs")
+        dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             server = (buck.cwd / "app/server.py").read_text()
@@ -376,7 +378,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            await dev.expect("failed", "building", "built")
+            await dev.expect("failed")
 
             dev.request({"type": "restart"})
             (failed,) = await dev.expect("failed")
@@ -405,7 +407,7 @@ class DevFailuresTest(BuckTestCase):
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
-            edit_target(buck, APP, "all", 'mode = "all"', 'mode = "bogus"')
+            edit_target(buck, APP, "all", 'mode = "outputs"', 'mode = "bogus"')
             await dev.expect("failed")
 
             await dev.quiet()
@@ -449,53 +451,38 @@ class DevFailuresTest(BuckTestCase):
             await dev.stop()
 
     @dev_test()
-    async def test_failed_requested_build_keeps_the_change_waiting(
-        self, buck: Buck
-    ) -> None:
-        """With a `notify` set, a build that the server asked for and that failed does not end
-        the wait: a change to the app's own files builds nothing until a build that the server
+    async def test_failed_requested_build_keeps_the_output_held(self, buck: Buck) -> None:
+        """A build of a held output that the server asked for and that failed does not let the
+        output go: a change inside its `only` does not build it until a build that the server
         asks for works."""
-        dev = await start_dev(buck, "//app:auto")
+        dev = await start_dev(buck, "//app:only")
         try:
             first = await dev.start()
             write(buck, "lib/lib.txt", "FAIL lib\n")
-            (stale,) = await dev.expect("stale")
-            assert files(buck, stale) == ["lib/lib.txt"]
+            stale, building, _ = await dev.expect("stale", "building", "failed")
+            assert stale["outputs"] == ["exe", "patch"]
+            assert building["outputs"] == ["site"]
 
-            dev.request({"type": "build", "outputs": ["site"]})
+            dev.request({"type": "build", "outputs": ["patch"]})
             await dev.expect("building", "failed")
             await dev.wait_until_quiet()
 
             write(buck, "app/main.txt", "app v2\n")
-            await dev.quiet()
+            stale, building, _ = await dev.expect("stale", "building", "failed")
+            assert stale["outputs"] == ["exe", "patch"]
+            assert building["outputs"] == ["site"]
 
             write(buck, "lib/lib.txt", "lib v1\n")
+            building, _ = await dev.expect("building", "built")
+            assert building["outputs"] == ["site"]
             await dev.quiet()
 
-            dev.request({"type": "build", "outputs": ["site"]})
+            dev.request({"type": "build", "outputs": ["patch"]})
             _, built, stale = await dev.expect(
                 "building", "built", "stale", timeout=EXPECTED_WITHIN
             )
-            assert site(built) == "lib v1\napp v2\n"
-            assert stale["files"] == []
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_waiting_change_that_breaks_the_build(self, buck: Buck) -> None:
-        """With a `notify` set, a change that waits and breaks the build: `stale`, nothing
-        builds until the server asks, and the server's request fails."""
-        dev = await start_dev(buck, "//app:auto_build_on_stale")
-        try:
-            first = await dev.start()
-            write(buck, "lib/lib.txt", "FAIL lib\n")
-            # The server asks for a build on `stale`.
-            stale, building, failed = await dev.expect("stale", "building", "failed")
-            assert files(buck, stale) == ["lib/lib.txt"]
-            assert building["files"] == []
-            assert failed["gen"] == building["gen"]
-            await dev.wait_until_quiet()
+            assert contents(built) == {"patch": "lib v1\napp v2\n"}
+            assert stale["outputs"] == ["exe"]
             assert_kept(dev, first)
         finally:
             await dev.stop()

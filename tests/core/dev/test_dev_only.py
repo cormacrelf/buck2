@@ -8,11 +8,9 @@
 
 # pyre-strict
 
-# A prototype of the `only` proposal in `dev_review.md`: a `DevInfo` without `watch`, whose
-# outputs carry the policy. `buck2 dev` finds what the server's command and each output may be
-# built from. A file may belong to several of them, and an output with `only` is held back
-# after a change outside its `only` until the server asks for it. They use the fixture of
-# `test_dev`:
+# What the server's command and each output may be built from, and `DevOutput`. A file may
+# belong to several of them, and an output with `only` is held back after a change outside its
+# `only` until the server asks for it. They use the fixture of `test_dev`:
 #
 # - `//app:outputs` has `site`, built from `app/main.txt` and `//lib:lib`, and `extra`, built
 #   from `app/extra.txt`.

@@ -11,8 +11,8 @@
 usage: bench.py <buck2> <project> <mode>
 
 `<buck2>` is the buck2 to time, such as the one `./bootstrap/buck2 build //:buck2` builds.
-`<mode>` is a target of the project's `app` package: `targets`, `inputs`, `restart`, `outputs`
-or `outputs8`.
+`<mode>` is a target of the project's `app` package: `outputs` or `outputs8`. Do not run either
+without a limit on memory; see `README.md`.
 
 It starts `buck2 dev`, with a daemon of its own, and prints how long these take:
 
@@ -20,7 +20,7 @@ It starts `buck2 dev`, with a daemon of its own, and prints how long these take:
 - a change to a source file, three times: until the server gets `building`;
 - a comment added to a build file: until the server gets `graph_changed`;
 - every daemon command of the session, from its event log;
-- the steps of finding what the watch sets claim, which the daemon logs.
+- the steps of finding what the server and the outputs are built from, which the daemon logs.
 """
 
 import json

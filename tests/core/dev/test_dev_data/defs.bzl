@@ -81,32 +81,19 @@ def _dev_app(ctx):
 
     # More outputs, each the concatenation of its own source files.
     extra = {name: _concat_output(ctx, name + ".txt", inputs = srcs) for name, srcs in ctx.attrs.extra_outputs.items()}
-    if ctx.attrs.mode == "auto":
-        # The app's own files build the site; any other change waits for the server.
-        watch = [
-            DevWatch(targets = [ctx.label], build = [site_name]),
-            DevWatch(targets = None, notify = True),
-        ]
-    elif ctx.attrs.mode == "all":
-        watch = [DevWatch(targets = None, build = [site_name])]
-    elif ctx.attrs.mode == "restart":
-        watch = [DevWatch(targets = None, restart = True)]
-    elif ctx.attrs.mode == "inputs":
-        # The server script is a source file of this target, like `srcs`.
-        watch = [
-            DevWatch(inputs = server, restart = True),
-            DevWatch(targets = None, build = [site_name]),
-        ]
+    if ctx.attrs.mode == "outputs":
+        # `buck2 dev` finds what the server and each output may be built from.
+        pass
     elif ctx.attrs.mode == "deep":
         # `deep` is built by an action that a dynamic action makes, from a transitive set of
-        # the outputs of `deps`. Its `inputs` set reaches their source files only through both.
+        # the outputs of `deps`. `buck2 dev` reaches their source files only through both.
         outs = ctx.actions.tset(
             ConcatOuts,
             children = [d[ConcatInfo].outs for d in ctx.attrs.deps],
         )
         if ctx.attrs.watch_delay:
-            # Finding the files of the `inputs` set builds this, which takes the number of
-            # seconds in `watch_delay`.
+            # Finding what `deep` is built from builds this, which takes the number of seconds
+            # in `watch_delay`.
             trigger = ctx.actions.declare_output("trigger.txt")
             ctx.actions.run(
                 cmd_args(
@@ -144,52 +131,16 @@ def _dev_app(ctx):
             outputs = [deep.as_output()],
             f = _deep,
         )
-        watch = [
-            DevWatch(inputs = deep, restart = True),
-            DevWatch(targets = None, build = [site_name]),
-        ]
-    elif ctx.attrs.mode == "multi":
-        # Each extra output is built when its own source files change, `site` for the rest.
-        watch = [DevWatch(inputs = extra[name], build = [name]) for name in sorted(extra)]
-        watch.append(DevWatch(targets = None, build = [site_name]))
-    elif ctx.attrs.mode == "patch":
-        # As a rule that patches a running program has it: `patch` is built from `srcs` only,
-        # the files that it is built from build it, and any other change waits.
-        extra["patch"] = _concat_output(ctx, "patch.txt", inputs = ctx.attrs.srcs)
-        watch = [
-            DevWatch(inputs = extra["patch"], build = ["patch"]),
-            DevWatch(targets = None, notify = True),
-        ]
-    elif ctx.attrs.mode == "unwatched":
-        # No set claims any file.
-        watch = []
-    elif ctx.attrs.mode == "wait":
-        # Every change waits, also one to what the server is built from.
-        watch = [DevWatch(targets = None, notify = True)]
-    elif ctx.attrs.mode == "kept":
-        # A set that does nothing keeps the server's files from the `notify` set.
-        watch = [
-            DevWatch(inputs = server),
-            DevWatch(targets = None, notify = True),
-        ]
-    elif ctx.attrs.mode == "split":
-        watch = [
-            DevWatch(targets = [ctx.label], build = [site_name]),
-            DevWatch(targets = None, restart = True),
-        ]
-    elif ctx.attrs.mode == "outputs":
-        # No watch list: `buck2 dev` finds what the server and each output may be built from.
-        watch = None
+        extra["deep"] = deep
     elif ctx.attrs.mode == "only":
-        # As a rule that patches a running program has it, without a watch list. `exe` and
-        # `patch` are built from `srcs` and `deps`, like `site`. `buck2 dev` builds `patch`
-        # again by itself only after a change to this target's own files, and never `exe`.
+        # As a rule that patches a running program has it. `exe` and `patch` are built from
+        # `srcs` and `deps`, like `site`. `buck2 dev` builds `patch` again by itself only after
+        # a change to this target's own files, and never `exe`.
         extra["exe"] = _concat_output(ctx, "exe.txt")
         extra["patch"] = _concat_output(ctx, "patch.txt")
-        watch = None
     elif ctx.attrs.mode == "flood":
-        # No watch list. The action of `flood` writes many files under `buck-out` at once,
-        # as the actions of a large build do together, before it concatenates `srcs`.
+        # The action of `flood` writes many files under `buck-out` at once, as the actions of a
+        # large build do together, before it concatenates `srcs`.
         flood = ctx.actions.declare_output("flood.txt")
         ctx.actions.run(
             cmd_args(
@@ -207,11 +158,9 @@ def _dev_app(ctx):
             local_only = True,
         )
         extra["flood"] = flood
-        watch = None
     elif ctx.attrs.mode == "sidecars":
-        # No watch list, and one output. The extra outputs are its sidecars, and so is its
-        # first source file.
-        watch = None
+        # One output. The extra outputs are its sidecars, and so is its first source file.
+        pass
     else:
         fail("unknown mode " + ctx.attrs.mode)
     outputs = {site_name: site}
@@ -230,7 +179,6 @@ def _dev_app(ctx):
         DevInfo(
             server = server,
             outputs = outputs,
-            watch = watch,
         ),
     ]
 

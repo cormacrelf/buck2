@@ -23,6 +23,7 @@ from buck2.tests.core.common.dev.dev_util import (
     dev_test,
     edit_target,
     files,
+    read,
     site,
     start_dev,
     write,
@@ -75,7 +76,7 @@ class DevTimingTest(BuckTestCase):
                 "cancelled", "graph_changed", "building", "built"
             )
             assert cancelled["gen"] == building["gen"]
-            assert files(buck, second) == ["app/delay.txt"], second
+            assert files(buck, second) == [APP, "app/delay.txt"], second
             assert site(built) == "app v1\nother v1\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -105,21 +106,19 @@ class DevTimingTest(BuckTestCase):
     @dev_test()
     async def test_change_while_the_daemon_says_what_changed(self, buck: Buck) -> None:
         """A change while the daemon takes its time to say what changed, because finding the
-        files to watch builds what a dynamic action needs: it is handled afterwards."""
+        files to watch builds what a dynamic action needs: it is handled afterwards. No output
+        is built from `watch_delay.txt` itself."""
         dev = await start_dev(buck, "//app:slow_watch")
         try:
             first = await dev.start()
             write(buck, "app/watch_delay.txt", "3\n")
             await asyncio.sleep(1.5)
             write(buck, "app/main.txt", "app v2\n")
-            events = await dev.expect("building", "built", "building", "built")
-            assert [files(buck, e) for e in events[::2]] == [
-                ["app/watch_delay.txt"],
-                ["app/main.txt"],
-            ], events
-            assert site(events[1]) == "lib v1\napp v2\n"
-            assert changed(events[3]) == {"site": False}
-            assert events[3]["pid"] == first["pid"]
+            building, built = await dev.expect("building", "built")
+            assert building["outputs"] == ["site"]
+            assert files(buck, building) == ["app/main.txt"]
+            assert site(built) == "lib v1\napp v2\n"
+            assert built["pid"] == first["pid"]
             await dev.quiet()
         finally:
             await dev.stop()
@@ -163,21 +162,21 @@ class DevTimingTest(BuckTestCase):
 
     @dev_test()
     async def test_change_during_a_server_restart(self, buck: Buck) -> None:
-        """A change while the old server takes its time to stop: the new server starts after
-        the change, so it is not restarted again for it, and gets a build with it."""
+        """A change to the server's script while the old server takes its time to stop: the
+        new server is built after the change, so it is not restarted again for it."""
         dev = await start_dev(buck, "//app:slow_shutdown")
         try:
             first = await dev.start()
-            write(buck, "app/main.txt", "app v2\n")
+            server = read(buck, "app/server.py")
+            write(buck, "app/server.py", server + "# v2\n")
             (shutdown,) = await dev.expect("shutdown")
             assert shutdown["pid"] == first["pid"]
             # The old server takes 3 seconds to exit.
-            write(buck, "app/main.txt", "app v3\n")
+            write(buck, "app/server.py", server + "# v3\n")
             started, _, _, built = await dev.expect(
                 "started", "ready", "building", "built", timeout=15
             )
             assert built["pid"] == started["pid"]
-            assert site(built) == "app v3\n"
             await dev.quiet(5)
         finally:
             await dev.stop()
@@ -235,32 +234,13 @@ class DevTimingTest(BuckTestCase):
             await dev.start()
             dev.request({"type": "_exit", "code": 1})
             await dev.wait_for("exiting")
-            targets = edit_target(buck, APP, "all", 'mode = "all"', 'mode = "bogus"')
+            targets = edit_target(buck, APP, "all", 'mode = "outputs"', 'mode = "bogus"')
             await dev.quiet()
             assert dev.running()
 
             write(buck, APP, targets)
             await dev.expect("started", "ready", "building", "built")
             await dev.quiet()
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_waiting_change_while_server_exited(self, buck: Buck) -> None:
-        """With a `notify` set, the server exited, then a file of the `notify` set changed: a
-        later change to the app's own file starts the server, which gets `stale` after
-        `ready`."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            await dev.start()
-            dev.request({"type": "_exit", "code": 1})
-            await dev.wait_for("exiting")
-            write(buck, "lib/lib.txt", "lib v2\n")
-            await dev.quiet(2)
-
-            write(buck, "app/main.txt", "app v2\n")
-            _, _, stale = await dev.expect("started", "ready", "stale", timeout=10)
-            assert files(buck, stale) == ["lib/lib.txt"]
         finally:
             await dev.stop()
 

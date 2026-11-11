@@ -153,8 +153,8 @@ class DevGraphTest(BuckTestCase):
                 buck,
                 APP,
                 "all",
-                'mode = "all",',
-                'mode = "all",\n    dev_info = False,',
+                'mode = "outputs",',
+                'mode = "outputs",\n    dev_info = False,',
             )
             (failed,) = await dev.expect("failed")
             assert "no `DevInfo` provider" in failed["error"], failed["error"]
@@ -183,8 +183,8 @@ class DevGraphTest(BuckTestCase):
                     buck,
                     APP,
                     "all",
-                    'mode = "all",',
-                    'mode = "all",\n    dev_info = False,',
+                    'mode = "outputs",',
+                    'mode = "outputs",\n    dev_info = False,',
                 ),
             ),
         )
@@ -254,15 +254,15 @@ class DevGraphTest(BuckTestCase):
         )
 
     @dev_test()
-    async def test_bzl_change_builds_every_set(self, buck: Buck) -> None:
-        """A `.bzl` change that changes no output: `graph_changed`, and every set builds, with no
-        files, and an unchanged output."""
+    async def test_bzl_change_builds_every_output(self, buck: Buck) -> None:
+        """A `.bzl` change that changes no output: `graph_changed`, and every output builds,
+        with the `.bzl` file in `files`, and is unchanged."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             write(buck, "defs.bzl", read(buck, "defs.bzl") + "# changed\n")
             _, building, built = await dev.expect("graph_changed", "building", "built")
-            assert building["files"] == []
+            assert files(buck, building) == ["defs.bzl"]
             assert building["outputs"] == ["site"]
             assert changed(built) == {"site": False}
             assert built["pid"] == first["pid"]
@@ -276,7 +276,7 @@ class DevGraphTest(BuckTestCase):
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
-            edit_target(buck, APP, "all", 'mode = "all"', 'mode = "bogus"')
+            edit_target(buck, APP, "all", 'mode = "outputs"', 'mode = "bogus"')
             (failed,) = await dev.expect("failed")
             assert "unknown mode bogus" in failed["error"], failed["error"]
             await dev.quiet()
@@ -289,7 +289,7 @@ class DevGraphTest(BuckTestCase):
         """`fail()` in the analysis of the dev target, then fixed: `failed`, then
         `graph_changed`."""
         await broken_analysis_then_fixed(
-            buck, "//app:all", lambda: bogus_mode(buck, "all", "all")
+            buck, "//app:all", lambda: bogus_mode(buck, "all", "outputs")
         )
 
     @dev_test()
@@ -409,11 +409,11 @@ class DevGraphTest(BuckTestCase):
                 buck,
                 APP,
                 "all",
-                'mode = "all",',
-                'mode = "all",\n    deps = ["//lib:lib"],',
+                'mode = "outputs",',
+                'mode = "outputs",\n    deps = ["//lib:lib"],',
             )
             _, building, built = await dev.expect("graph_changed", "building", "built")
-            assert building["files"] == []
+            assert files(buck, building) == [APP]
             assert site(built) == "lib v1\napp v1\n"
             assert built["pid"] == first["pid"]
 
@@ -453,8 +453,8 @@ class DevGraphTest(BuckTestCase):
                 buck,
                 APP,
                 "all",
-                'mode = "all",',
-                'mode = "all",\n    server_args = ["--new"],',
+                'mode = "outputs",',
+                'mode = "outputs",\n    server_args = ["--new"],',
             )
             shutdown, started = await dev.expect("shutdown", "started")
             assert shutdown["pid"] == first["pid"]
@@ -506,8 +506,8 @@ class DevGraphTest(BuckTestCase):
 
     @dev_test()
     async def test_output_added(self, buck: Buck) -> None:
-        """An output added to `DevInfo`: `graph_changed` and a build of the outputs that the sets
-        name. The server can ask for the new output."""
+        """An output added to `DevInfo`: `graph_changed` and a build of every output, the new one
+        too. The server can ask for the new output."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
@@ -515,12 +515,12 @@ class DevGraphTest(BuckTestCase):
                 buck,
                 APP,
                 "all",
-                'mode = "all",',
-                'mode = "all",\n    extra_outputs = {"extra": ["extra.txt"]},',
+                'mode = "outputs",',
+                'mode = "outputs",\n    extra_outputs = {"extra": ["extra.txt"]},',
             )
             _, building, built = await dev.expect("graph_changed", "building", "built")
-            assert building["outputs"] == ["site"]
-            assert changed(built) == {"site": False}
+            assert building["outputs"] == ["extra", "site"]
+            assert changed(built) == {"extra": True, "site": False}
             await dev.quiet()
 
             dev.request({"type": "build", "outputs": ["extra"]})
@@ -542,8 +542,8 @@ class DevGraphTest(BuckTestCase):
                 buck,
                 APP,
                 "all",
-                'mode = "all",',
-                'mode = "all",\n    site_name = "page",',
+                'mode = "outputs",',
+                'mode = "outputs",\n    site_name = "page",',
             )
             _, building, built = await dev.expect("graph_changed", "building", "built")
             assert building["outputs"] == ["page"]
@@ -562,8 +562,8 @@ class DevGraphTest(BuckTestCase):
 
     @dev_test()
     async def test_output_removed(self, buck: Buck) -> None:
-        """An output and the set that builds it removed: `graph_changed`, the rest builds, and the
-        server's request for the removed output fails."""
+        """An output removed: `graph_changed`, the rest builds, and the server's request for the
+        removed output fails."""
         dev = await start_dev(buck, "//app:multi")
         try:
             first = await dev.start()
@@ -584,50 +584,6 @@ class DevGraphTest(BuckTestCase):
             assert "no output named `extra`" in failed["error"], failed["error"]
             await dev.quiet()
             assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_watch_set_becomes_restart(self, buck: Buck) -> None:
-        """The watch set changes from building to restarting: `graph_changed`, then the server
-        restarts, and later changes restart it."""
-        dev = await start_dev(buck, "//app:all")
-        try:
-            first = await dev.start()
-            edit_target(buck, APP, "all", 'mode = "all"', 'mode = "restart"')
-            graph_changed, shutdown, started = await dev.expect(
-                "graph_changed", "shutdown", "started"
-            )
-            assert graph_changed["pid"] == first["pid"]
-            assert shutdown["pid"] == first["pid"]
-            await dev.expect("ready", "building", "built")
-            await dev.quiet()
-
-            write(buck, "app/main.txt", "app v2\n")
-            _, second, _, _, built = await dev.expect(
-                "shutdown", "started", "ready", "building", "built"
-            )
-            assert second["pid"] != started["pid"]
-            assert site(built) == "app v2\n"
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_watch_set_becomes_build(self, buck: Buck) -> None:
-        """The watch set changes from restarting to building: `graph_changed` and a build, and
-        later changes build without a restart."""
-        dev = await start_dev(buck, "//app:restart")
-        try:
-            first = await dev.start()
-            edit_target(buck, APP, "restart", 'mode = "restart"', 'mode = "all"')
-            _, _, built = await dev.expect("graph_changed", "building", "built")
-            assert built["pid"] == first["pid"]
-
-            write(buck, "app/main.txt", "app v2\n")
-            _, built = await dev.expect("building", "built")
-            assert site(built) == "app v2\n"
-            assert built["pid"] == first["pid"]
-            await dev.quiet()
         finally:
             await dev.stop()
 
@@ -705,7 +661,7 @@ class DevGraphTest(BuckTestCase):
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
-            edit_target(buck, APP, "all", 'mode = "all"', 'mode = "bogus"')
+            edit_target(buck, APP, "all", 'mode = "outputs"', 'mode = "bogus"')
             await dev.expect("failed")
             await dev.quiet()
 
@@ -726,166 +682,9 @@ class DevGraphTest(BuckTestCase):
             first = await dev.start()
             # A working analysis: logging `built` changes nothing.
             await dev.quiet(2)
-            edit_target(buck, APP, "project_log", 'mode = "all"', 'mode = "bogus"')
+            edit_target(buck, APP, "project_log", 'mode = "outputs"', 'mode = "bogus"')
             await dev.expect("failed")
             await dev.quiet()
             assert_kept(dev, first)
         finally:
             await dev.stop()
-
-
-class DevGraphNotifyTest(BuckTestCase):
-    """The same with a `notify` set: `//app:auto` builds `site` for its own files, and waits on
-    `//lib:lib`. dev.md says that a change to a build file of a package with a target in the
-    `notify` set waits, and so does any `.bzl` change, and that the target is not analysed
-    while changes wait."""
-
-    @dev_test()
-    async def test_syntax_error_in_waiting_build_file(self, buck: Buck) -> None:
-        """A syntax error in the build file of a package in the `notify` set waits: `stale` with
-        the build file. Fixing it leaves the change waiting until the server asks for a build."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            first = await dev.start()
-            lib = read(buck, LIB)
-            write(buck, LIB, lib + "\nthis is not starlark (\n")
-            (stale,) = await dev.expect("stale", timeout=EXPECTED_WITHIN)
-            assert files(buck, stale) == [LIB]
-            await dev.quiet()
-            assert_kept(dev, first)
-
-            write(buck, LIB, lib)
-            await dev.quiet()
-
-            dev.request({"type": "build", "outputs": ["site"]})
-            _, built, stale = await dev.expect("building", "built", "stale")
-            assert site(built) == "lib v1\napp v1\n"
-            assert stale["files"] == []
-            await dev.quiet()
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_syntax_error_in_bzl_file_with_notify_set(self, buck: Buck) -> None:
-        """A syntax error in a `.bzl` file with a `notify` set waits: `stale` with the `.bzl`
-        file. Fixing it leaves the change waiting until the server asks for a build."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            first = await dev.start()
-            defs = read(buck, "defs.bzl")
-            write(buck, "defs.bzl", defs + "\ndef broken(:\n")
-            (stale,) = await dev.expect("stale", timeout=EXPECTED_WITHIN)
-            assert files(buck, stale) == ["defs.bzl"]
-            await dev.quiet()
-            assert_kept(dev, first)
-
-            write(buck, "defs.bzl", defs)
-            await dev.quiet()
-
-            dev.request({"type": "build", "outputs": ["site"]})
-            _, built, stale = await dev.expect("building", "built", "stale")
-            assert site(built) == "lib v1\napp v1\n"
-            assert stale["files"] == []
-            await dev.quiet()
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_waiting_build_file_changed(self, buck: Buck) -> None:
-        """A comment in the build file of a package in the `notify` set: `stale` with the build
-        file, and nothing is analysed or built until the server asks for a build, even once the
-        comment is gone."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            first = await dev.start()
-            lib = read(buck, LIB)
-            write(buck, LIB, lib + "# a comment\n")
-            (stale,) = await dev.expect("stale")
-            assert files(buck, stale) == [LIB]
-            await dev.quiet()
-            assert_kept(dev, first)
-
-            write(buck, LIB, lib)
-            await dev.quiet()
-
-            dev.request({"type": "build", "outputs": ["site"]})
-            _, built, stale = await dev.expect("building", "built", "stale")
-            assert site(built) == "lib v1\napp v1\n"
-            assert stale["files"] == []
-            await dev.quiet()
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_waiting_dependency_deleted(self, buck: Buck) -> None:
-        """The dependency in the `notify` set deleted from its build file waits: `stale` with
-        the build file. Putting it back leaves the change waiting until the server asks for a
-        build."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            first = await dev.start()
-            lib = remove_target(buck, LIB, "lib")
-            (stale,) = await dev.expect("stale", timeout=EXPECTED_WITHIN)
-            assert files(buck, stale) == [LIB]
-            await dev.quiet()
-            assert_kept(dev, first)
-
-            write(buck, LIB, lib)
-            await dev.quiet()
-
-            dev.request({"type": "build", "outputs": ["site"]})
-            _, built, stale = await dev.expect("building", "built", "stale")
-            assert site(built) == "lib v1\napp v1\n"
-            assert stale["files"] == []
-            await dev.quiet()
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_own_build_file_changed_with_notify_set(self, buck: Buck) -> None:
-        """A change to the dev target in its own build file does not wait: `graph_changed` and a
-        build."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            first = await dev.start()
-            edit_target(
-                buck,
-                APP,
-                "auto",
-                'srcs = ["main.txt"],',
-                'srcs = ["main.txt", "other.txt"],',
-            )
-            _, building, built = await dev.expect("graph_changed", "building", "built")
-            assert site(built) == "lib v1\napp v1\nother v1\n"
-            assert built["pid"] == first["pid"]
-            await dev.quiet()
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_fail_in_analysis_with_notify_set(self, buck: Buck) -> None:
-        """`fail()` in the analysis of the dev target with a `notify` set: its own build file
-        does not wait, so `failed`, and the server keeps running."""
-        dev = await start_dev(buck, "//app:auto")
-        try:
-            first = await dev.start()
-            edit_target(buck, APP, "auto", 'mode = "auto"', 'mode = "bogus"')
-            await dev.expect("failed")
-            await dev.quiet()
-            assert_kept(dev, first)
-        finally:
-            await dev.stop()
-
-    @dev_test()
-    async def test_fail_in_analysis_with_notify_set_fixed_is_reported(
-        self, buck: Buck
-    ) -> None:
-        """`fail()` in the analysis of the dev target with a `notify` set, then fixed: `failed`,
-        then `graph_changed`."""
-        await broken_analysis_then_fixed(
-            buck, "//app:auto", lambda: bogus_mode(buck, "auto", "auto")
-        )
