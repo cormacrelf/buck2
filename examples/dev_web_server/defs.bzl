@@ -75,8 +75,9 @@ def _static_site_impl(ctx):
             # `buck2 dev` starts the server, and starts it again only when the server script
             # changes: the command names nothing else. The site is not in the command. It is
             # an output, which the server asks for when it starts, and it serves the newest
-            # one it has been told about. `buck2 dev` builds it again after a change to
-            # anything that it may be built from: a page, or the theme.
+            # one it has been told about. After a change to anything that it may be built
+            # from, a page or the theme, `buck2 dev` says that it is stale, and the server
+            # asks for it again.
             server = server,
             outputs = {"www": www},
         ),

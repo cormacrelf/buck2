@@ -8,13 +8,16 @@
 
 """Runs the app, and sends it each patch that `buck2 dev` builds.
 
-`buck2 dev` builds two outputs:
+`buck2 dev` builds two outputs when this server asks for them:
 
 - `exe`: the app's binary. This server starts a copy of it, and starts it again when it
-  changes. `buck2 dev` builds it only when this server asks.
+  changes.
 - `patch`: a shared library with the newest code of the patched crate, linked by ThinLink.
-  `buck2 dev` builds it after each change to that crate, until another crate changes: then
-  it says that `patch` is stale, and this server asks for both outputs again.
+
+After a change, `buck2 dev` sends `stale`. If every change since the running binary was built
+is in the scope `lib`, the patched crate, this server asks for a new `patch`. Otherwise
+something else changed, which a patch cannot carry: it asks for both outputs, and starts the
+app again.
 
 For each new `patch`, this server writes a subsecond jump table to the app's stdin: the
 address of each function in the running binary, and the address of the same function in
@@ -138,10 +141,12 @@ def main():
             if kind == "ready":
                 request({"type": "build", "outputs": ["exe", "patch"]})
             elif kind == "stale":
-                # `exe` is stale after every change, and that is how patching works. `patch`
-                # is stale after a change that cannot be patched, to another crate: build
-                # both again, and the new binary starts below.
-                if "patch" in message.get("outputs", []):
+                # `exe`'s changes are those since the running binary was built, which is what
+                # a patch is built against.
+                exe = message["outputs"].get("exe", {})
+                if "lib" in exe.get("within", []):
+                    request({"type": "build", "outputs": ["patch"]})
+                else:
                     log("a change cannot be patched; building the app again")
                     request({"type": "build", "outputs": ["exe", "patch"]})
             elif kind == "built":

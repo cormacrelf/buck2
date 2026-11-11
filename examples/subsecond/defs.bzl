@@ -32,16 +32,12 @@ def _subsecond_app_impl(ctx):
             # app's binary is not in the command: a new binary would then restart the server.
             # It is an output, which the server asks for when it starts.
             server = server,
-            outputs = {
-                # `buck2 dev` never builds the binary by itself: the server asks for it.
-                "exe": DevOutput(exe, only = []),
-                # A change to the patched crate builds a patch. The patch does not depend on
-                # the binary, so the binary stays the one that is running. A change to any
-                # other crate cannot be patched: `buck2 dev` stops building patches and
-                # tells the server that `patch` is stale. The server then asks for both
-                # outputs, and starts the app again.
-                "patch": DevOutput(patch, only = [ctx.attrs.lib.label]),
-            },
+            # The patch does not depend on the binary, so a new patch leaves the binary the
+            # one that is running.
+            outputs = {"exe": exe, "patch": patch},
+            # Only a change to the patched crate can go into a patch. `stale` tells the server
+            # whether every change since the running binary was built is in it.
+            scopes = {"lib": [ctx.attrs.lib.label]},
         ),
     ]
 

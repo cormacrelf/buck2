@@ -59,15 +59,17 @@ restarts the server, and the app with it, when either gets new contents. The
 app's binary is not in the command: it is the `exe` output, which the server
 asks for when it starts. So a new binary restarts the app, not the server.
 
-The outputs in `defs.bzl` say when `buck2 dev` builds them by itself:
+`buck2 dev` builds an output only when the server asks for it. The server asks
+for both when it starts. `defs.bzl` names one scope, `lib`, the crate
+`//app:app`. After a change, `buck2 dev` sends the server `stale`, which says for
+each output the files that changed since the server last got it, and `within`:
+the scopes that hold all of those changes.
 
-1. `patch` has `only = [//app:app]`: a change to that crate builds `patch`.
-   After any other change that `patch` may be built from, `buck2 dev` stops
-   building it, and tells the server that it is stale.
-2. `exe` has `only = []`: `buck2 dev` builds it only when the server asks.
-
-The server asks for both when it starts, and again when `patch` is stale. It
-starts the app again if the binary changed.
+The server reads `exe`'s entry, because its changes are those since the running
+binary was built, which is what a patch is built against. If `within` has
+`lib`, every change is in the crate, and the server asks for `patch`. Otherwise
+something else changed, which a patch cannot carry: the server asks for both,
+and starts the app again if the binary changed.
 
 If a patch calls a function that the binary does not have, such as a function
 of the standard library that the binary does not use, or a generic function with

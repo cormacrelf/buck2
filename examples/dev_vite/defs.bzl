@@ -86,11 +86,11 @@ def _vite_app_impl(ctx):
         DevInfo(
             # The command names only the server script, so only a change to the script
             # restarts the server, and so Vite too. The app's files and the packages are
-            # outputs, which the server asks for when it starts. `buck2 dev` builds each
-            # again after a change to what it may be built from. A new `package.json` or
-            # lockfile installs the packages again, and the server restarts Vite when they
-            # change. A change to the app's files builds them again; the server copies the
-            # changed files to where Vite serves them, and Vite updates the browser.
+            # outputs, which the server asks for when it starts, and again when
+            # `buck2 dev` says that they are stale. A new `package.json` or lockfile makes the
+            # packages stale, and the server restarts Vite on the new ones. A change to the
+            # app's files makes them stale; the server copies the changed files of the new
+            # build to where Vite serves them, and Vite updates the browser.
             #
             # Each file of the app is also a sidecar of `app`, under its path in the app.
             # `buck2 dev` tells the server which of them changed, so the server does not

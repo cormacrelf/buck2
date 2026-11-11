@@ -8,7 +8,8 @@
 
 """Runs the Vite dev server on the files that `buck2 dev` builds.
 
-`buck2 dev` builds two outputs:
+`buck2 dev` builds two outputs, when this server asks for them: when it starts, and when
+`buck2 dev` says that they are stale:
 
 - `packages`: the installed `node_modules`.
 - `app`: the app's files, sources and generated files together.
@@ -129,6 +130,9 @@ def main():
             kind = message.get("type")
             if kind == "ready":
                 request({"type": "build", "outputs": ["packages", "app"]})
+            elif kind == "stale":
+                # A file that the app or the packages are built from changed.
+                request({"type": "build", "outputs": list(message["outputs"])})
             elif kind == "built":
                 outputs = message["outputs"]
                 if "app" in outputs:

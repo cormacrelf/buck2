@@ -9,8 +9,8 @@
 """A web server for a directory that `buck2 dev` rebuilds.
 
 Under `buck2 dev`, the server connects to the socket in `BUCK2_DEV_SOCKET`, and exchanges
-JSON lines with `buck2 dev` there. It asks for the `www` output when it starts, and serves the
-newest `www` directory it has been told about. A browser gets the new pages on its next request.
+JSON lines with `buck2 dev` there. It asks for the `www` output when it starts and whenever
+`buck2 dev` says that it is stale, and serves the newest `www` directory it has been told about. A browser gets the new pages on its next request.
 
 With `--root DIR` (`buck2 run`), it serves DIR and does not connect to `buck2 dev`.
 """
@@ -81,6 +81,9 @@ def follow_buck2_dev(site, server):
         kind = message.get("type")
         if kind == "ready":
             request({"type": "build", "outputs": ["www"]})
+        elif kind == "stale":
+            # A file that the site is built from changed.
+            request({"type": "build", "outputs": list(message["outputs"])})
         elif kind == "building":
             sys.stderr.write("Building the site...\n")
         elif kind == "built":
