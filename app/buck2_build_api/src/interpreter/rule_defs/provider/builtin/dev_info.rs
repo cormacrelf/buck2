@@ -17,11 +17,13 @@ use buck2_error::BuckErrorContext;
 use buck2_hash::BuckMutInsertionMap;
 use dupe::Dupe;
 use dupe::IterDupedExt;
+use either::Either;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
+use starlark::values::Heap;
 use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
@@ -43,6 +45,7 @@ use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInpu
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueIsInputArtifactAnnotation;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::FrozenStarlarkCmdArgs;
+use crate::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use crate::interpreter::rule_defs::provider::builtin::dev_output::DevOutput;
@@ -54,6 +57,12 @@ enum DevInfoError {
     EmptyServer,
     #[error("Expected a dictionary of artifacts, but key `{key}` contained `{got}`")]
     ExpectedArtifact { key: String, got: String },
+    #[error(
+        "A `DevInfo` output must be an artifact, or a command line such as a `RunInfo`, but got `{got}`"
+    )]
+    ExpectedOutput { got: String },
+    #[error("A `DevInfo` output is an empty command line")]
+    EmptyCommand,
     #[error("Expected a dictionary with string keys, but got key `{0}`")]
     ExpectedStringKey(String),
 }
@@ -90,6 +99,45 @@ impl DevArtifact {
     }
 }
 
+/// An output of a `DevInfo`.
+#[derive(Clone)]
+pub enum DevOutputSpec {
+    /// An artifact.
+    Artifact(DevArtifact),
+    /// A command line, such as a `RunInfo`, with the artifacts that it names, hidden ones too.
+    /// `buck2 dev` builds those, and resolves the command line to `argv`.
+    Command(Vec<ArtifactGroup>),
+}
+
+impl DevOutputSpec {
+    /// What `buck2 dev` builds and materialises for the output.
+    pub fn groups(&self) -> Vec<ArtifactGroup> {
+        match self {
+            DevOutputSpec::Artifact(artifact) => artifact.groups(),
+            DevOutputSpec::Command(inputs) => inputs.clone(),
+        }
+    }
+}
+
+/// An output as `DevInfo` keeps it: an artifact as it is, and anything else that `cmd_args`
+/// takes as a `cmd_args`.
+pub(crate) fn dev_output_value<'v>(
+    heap: Heap<'v>,
+    output: Value<'v>,
+) -> buck2_error::Result<Value<'v>> {
+    if ValueAsInputArtifactLike::unpack_value(output)?.is_some() {
+        return Ok(output);
+    }
+    let command =
+        StarlarkCmdArgs::try_from_value(output).map_err(|_| DevInfoError::ExpectedOutput {
+            got: output.get_type().to_owned(),
+        })?;
+    if command.is_empty() {
+        return Err(DevInfoError::EmptyCommand.into());
+    }
+    Ok(heap.alloc(command))
+}
+
 /// Provider that makes a target usable with `buck2 dev`.
 #[internal_provider(dev_info_creator)]
 #[derive(
@@ -106,8 +154,11 @@ impl DevArtifact {
 pub struct DevInfo<'v> {
     /// The command `buck2 dev` starts and keeps running, and starts again when it changes.
     server: ValueOfUnchecked<'v, FrozenStarlarkCmdArgs<'static>>,
-    /// The outputs `buck2 dev` builds by name.
-    outputs: ValueOfUnchecked<'v, DictType<String, ValueIsInputArtifactAnnotation>>,
+    /// The outputs `buck2 dev` builds by name: artifacts, and command lines.
+    outputs: ValueOfUnchecked<
+        'v,
+        DictType<String, Either<ValueIsInputArtifactAnnotation, FrozenStarlarkCmdArgs<'static>>>,
+    >,
     /// For each output that was given as a `DevOutput` with `only`: the target patterns.
     only: ValueOfUnchecked<'v, DictType<String, ListType<String>>>,
     /// For each output that was given as a `DevOutput` with `sidecars`: those, by name.
@@ -131,6 +182,8 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     ///   every change that the output may be built from. Give an output as
     ///   `DevOutput(artifact, only = [...])` to hold it back after some of them. An artifact
     ///   with associated artifacts is built with them, and they count as part of the output.
+    ///   An output may also be a `RunInfo` or another command line: `buck2 dev` builds what it
+    ///   names, hidden artifacts too, and gives the server its `argv`.
     /// * `interactive`: give the server the terminal, for a server that reads keys or lines
     ///   from it, such as a REPL. Otherwise its stdin is empty, and Ctrl-C reaches only
     ///   `buck2 dev`.
@@ -152,6 +205,7 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
         for (name, output) in outputs.entries {
             match ValueTyped::<DevOutput>::new(output) {
                 Some(output) => {
+                    // `DevOutput` keeps it as `dev_output_value` does.
                     artifacts.push((name, output.as_ref().artifact()));
                     if let Some(patterns) = output.as_ref().only() {
                         only.push((name, heap.alloc(AllocList(patterns))));
@@ -161,7 +215,11 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
                         sidecars.push((name, with));
                     }
                 }
-                None => artifacts.push((name, output)),
+                None => artifacts.push((
+                    name,
+                    dev_output_value(heap, output)
+                        .with_buck_error_context(|| format!("For output `{}`", name.to_str()))?,
+                )),
             }
         }
         let info = DevInfo {
@@ -216,16 +274,53 @@ impl<'v> DevInfo<'v> {
         DictRef::from_value(self.outputs.get()).expect("Value is a Dict")
     }
 
-    pub fn outputs(&self) -> buck2_error::Result<BuckMutInsertionMap<String, DevArtifact>> {
-        Self::outputs_iter(&self.outputs_dict())
+    /// The outputs, by name, each an artifact or a command line.
+    fn outputs_values(&self) -> impl Iterator<Item = buck2_error::Result<(&'v str, Value<'v>)>> {
+        self.outputs_dict()
+            .iter()
+            .map(|(k, v)| {
+                let k = k
+                    .unpack_str()
+                    .ok_or_else(|| DevInfoError::ExpectedStringKey(k.to_string()))?;
+                Ok((k, v))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    pub fn outputs(&self) -> buck2_error::Result<BuckMutInsertionMap<String, DevOutputSpec>> {
+        self.outputs_values()
             .map(|x| {
                 let (k, v) = x?;
-                Ok((
-                    k.to_owned(),
-                    DevArtifact::new(&v).with_buck_error_context(|| format!("For output `{k}`"))?,
-                ))
+                let output = match ValueAsInputArtifactLike::unpack_value(v)? {
+                    Some(artifact) => DevOutputSpec::Artifact(
+                        DevArtifact::new(&artifact)
+                            .with_buck_error_context(|| format!("For output `{k}`"))?,
+                    ),
+                    None => {
+                        let mut visitor = SimpleCommandLineArtifactVisitor::new();
+                        Self::command_line(v).visit_artifacts(&mut visitor)?;
+                        DevOutputSpec::Command(visitor.inputs.into_iter().collect())
+                    }
+                };
+                Ok((k.to_owned(), output))
             })
             .collect()
+    }
+
+    fn command_line(value: Value<'v>) -> &'v dyn CommandLineArgLike<'v> {
+        ValueAsCommandLineLike::unpack_value_err(value)
+            .expect("validated at construction")
+            .0
+    }
+
+    /// The command line of output `name`, if it is one.
+    pub fn output_command_line(&self, name: &str) -> Option<&'v dyn CommandLineArgLike<'v>> {
+        let value = self.outputs_dict().get_str(name)?;
+        match ValueAsInputArtifactLike::unpack_value(value) {
+            Ok(None) => Some(Self::command_line(value)),
+            _ => None,
+        }
     }
 
     /// The sidecars of each output that has some, by name.
@@ -285,8 +380,16 @@ fn validate_dev_info<'v>(info: &DevInfo<'v>) -> buck2_error::Result<()> {
     if server.is_empty() {
         return Err(DevInfoError::EmptyServer.into());
     }
-    for x in DevInfo::outputs_iter(&info.outputs_dict()) {
-        x?;
+    for x in info.outputs_values() {
+        let (_, v) = x?;
+        if ValueAsInputArtifactLike::unpack_value(v)?.is_none()
+            && ValueAsCommandLineLike::unpack_value(v)?.is_none()
+        {
+            return Err(DevInfoError::ExpectedOutput {
+                got: v.get_type().to_owned(),
+            }
+            .into());
+        }
     }
     Ok(())
 }

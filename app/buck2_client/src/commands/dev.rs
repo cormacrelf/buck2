@@ -848,8 +848,9 @@ struct Session<'a> {
     /// How the last build went, and how long it took.
     last_build: Option<(&'static str, Duration)>,
     generation: u64,
-    /// The digest of each output when it was last built.
-    digests: BuckMutMap<String, Option<String>>,
+    /// The digest of each output when it was last built, with its `argv` if it is a command
+    /// line.
+    digests: BuckMutMap<String, (Option<String>, Option<Vec<String>>)>,
     /// The digest of each sidecar, by the names of its output and its own, when it was last
     /// built.
     sidecar_digests: BuckMutMap<(String, String), Option<String>>,
@@ -1452,14 +1453,20 @@ impl<'a> Session<'a> {
                     // The server has the output as the files are now.
                     self.held.remove(&name);
                     self.fresh.insert(name.clone(), known.clone());
-                    let changed =
-                        self.digests.get(&name) != Some(&output.digest) || output.digest.is_none();
-                    self.digests.insert(name.clone(), output.digest.clone());
+                    let key = (output.digest.clone(), output.argv.clone());
+                    let changed = self.digests.get(&name) != Some(&key) || output.digest.is_none();
+                    self.digests.insert(name.clone(), key);
                     let mut built = json!({
-                        "path": output.path,
                         "digest": output.digest,
                         "changed": changed,
                     });
+                    // An artifact has a `path`, and a command line has an `argv`.
+                    if let Some(path) = output.path {
+                        built["path"] = json!(path);
+                    }
+                    if let Some(argv) = output.argv {
+                        built["argv"] = json!(argv);
+                    }
                     if !output.sidecars.is_empty() {
                         // Each sidecar says by itself whether it changed.
                         let mut sidecars = serde_json::Map::new();

@@ -346,6 +346,40 @@ new output, also when the artifact itself is the same: `changed` is true, and
 the `digest` covers the associated artifacts too. A sidecar may have associated
 artifacts as well, and they belong to the sidecar in the same way.
 
+### A command line as an output
+
+A rule that wraps a binary of another rule has only its `RunInfo`. The
+`RunInfo` says how to run the binary, and names the files that it needs, often
+as hidden artifacts. An output may be that `RunInfo`, or anything else that
+`cmd_args` takes:
+
+```python
+DevInfo(server = server, outputs = {"app": ctx.attrs.binary[RunInfo]})
+```
+
+This differs from a target with only a `RunInfo` (see
+[Arguments and `RunInfo` targets](#arguments-and-runinfo-targets)). There the
+`RunInfo` is the server. Here it is an output, and the server runs it.
+
+`buck2 dev` builds and materialises every artifact that the command line names,
+hidden ones too. `built` then has `argv` for the output, and no `path`:
+
+```json
+{"type": "built", "gen": 3, "outputs": {"app": {
+    "argv": ["/project/buck-out/.../run.sh", "--port", "8080"], "digest": "...", "changed": true}}}
+```
+
+`argv` is the command line resolved as the server's own command is: the paths
+in it are absolute. The server runs it, and may add arguments. The `digest`
+covers the contents of every artifact that the command line names, as for the
+server's command. `changed` is true when the digest or `argv` is new.
+
+An output that is a command line works as an artifact does in all else. It may
+be a `DevOutput` with `only` and `sidecars`. What its artifacts are built from
+counts as what the output may be built from, and it is held back in the same
+way. Only an artifact by itself is an artifact output: `cmd_args(exe)` is a
+command line, whose `argv` is the path of `exe`.
+
 ## The server protocol
 
 `buck2 dev` starts the server in the project root, with the environment
@@ -440,7 +474,7 @@ console, and prints only errors and that the server exited or restarts.
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `ready`         | `version`: 1, `outputs`: the names in `DevInfo.outputs`   | The server sent `hello`.                                                                                     |
 | `building`      | `gen`, `outputs`: names, `files`: the changed files       | A build starts.                                                                                              |
-| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
+| `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), and `failed`: name to error if some outputs failed | A build of at least one output succeeded. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
 | `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. The next build builds its outputs too.           |
 | `stale`         | `outputs`: the names of the outputs that are held back, `files`: the changed files that hold them back | These lists change. Empty lists mean that nothing is held back. After missed changes the project root is in `files`: any file may have changed. See [What is built after a change](#what-is-built-after-a-change). |

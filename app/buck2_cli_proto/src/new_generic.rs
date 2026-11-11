@@ -265,9 +265,16 @@ pub struct DevBuilt {
 
 #[derive(Serialize, Deserialize)]
 pub struct DevBuiltOutput {
-    /// Absolute path of the output.
-    pub path: String,
-    /// The content digest of the output, if it is a file or a directory.
+    /// Absolute path of the output, for an output that is an artifact.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// For an output that is a command line: the command line, resolved as `DevServer.server`
+    /// is, with absolute paths.
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// The content digest of the output, if it is a file or a directory. For an output with
+    /// associated artifacts, or a command line, a digest of the contents of all that it names,
+    /// as `DevServer.digest`.
     pub digest: Option<String>,
     /// The sidecars of the output, by name.
     #[serde(default)]

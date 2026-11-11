@@ -57,6 +57,7 @@ use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevArtifact;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevInfo;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::DevOutputSpec;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::dev_info::OwnedDevInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::OwnedRunInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
@@ -228,10 +229,18 @@ impl<'a> DevView<'a> {
         }
     }
 
-    fn outputs(self) -> buck2_error::Result<BuckMutInsertionMap<String, DevArtifact>> {
+    fn outputs(self) -> buck2_error::Result<BuckMutInsertionMap<String, DevOutputSpec>> {
         match self {
             DevView::Dev(info) => info.outputs(),
             DevView::Run(_) => Ok(BuckMutInsertionMap::default()),
+        }
+    }
+
+    /// The command line of output `name`, if it is one.
+    fn output_command_line(self, name: &str) -> Option<&'a dyn CommandLineArgLike<'a>> {
+        match self {
+            DevView::Dev(info) => info.output_command_line(name),
+            DevView::Run(_) => None,
         }
     }
 
@@ -403,19 +412,28 @@ async fn dev(
             let sidecars = info.view().sidecars()?;
             let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
             for name in names {
-                let artifact = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
+                let output = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
                     target: label.dupe(),
                     name: name.clone(),
                 })?;
                 wanted.push(Wanted {
                     name: name.clone(),
-                    artifact: artifact.clone(),
+                    output: output.clone(),
                     sidecars: sidecars.get(name).cloned().unwrap_or_default(),
                 });
             }
+            let info = &info;
+            let argv = move |name: &str, artifact_fs: &ArtifactFs, ensured: &Ensured| {
+                let command = info
+                    .view()
+                    .output_command_line(name)
+                    .ok_or_else(|| internal_error!("Output `{name}` is not a command line"))?;
+                command_argv(artifact_fs, command, ensured)
+            };
+            let argv: Argv = &argv;
             let Some(changes) = changes else {
                 return Ok(DevResponse::Build(
-                    build(server_ctx.project_root(), &mut ctx.ctx(), wanted).await?,
+                    build(server_ctx.project_root(), &mut ctx.ctx(), wanted, argv).await?,
                 ));
             };
             // The slots that this build is built from. A change to a file of one of them stops
@@ -444,7 +462,7 @@ async fn dev(
                 .compute2(
                     async move |dice| {
                         tokio::select! {
-                            built = build(project_root, dice, wanted) => {
+                            built = build(project_root, dice, wanted, argv) => {
                                 let _ignored = built_tx.send(());
                                 Some(built)
                             }
@@ -492,18 +510,8 @@ async fn build_command<'a>(
     let ensured = materialize_groups(dice, inputs.into_iter().collect())
         .await
         .with_buck_error_context(|| what.to_owned())?;
-    let path_separator = if cfg!(windows) {
-        PathSeparatorKind::Windows
-    } else {
-        PathSeparatorKind::Unix
-    };
-    let executor_fs = ExecutorFs::new(&artifact_fs, path_separator);
     let digest = contents_digest(contents(&artifact_fs, &ensured)?);
-    let mut args = Vec::<String>::new();
-    let mapper = ArtifactPathMapperImpl::from(&ensured);
-    let mut builder =
-        CommandLineBuilder::new_with_options(&mut args, &mapper, &executor_fs, true, None);
-    line().add_to_command_line(&mut builder)?;
+    let args = command_argv(&artifact_fs, line(), &ensured)?;
     Ok((args, digest))
 }
 
@@ -631,16 +639,43 @@ async fn configured_label(
 /// An output to build.
 struct Wanted {
     name: String,
-    artifact: DevArtifact,
+    output: DevOutputSpec,
     /// The sidecars of the output, by name. They are built with it.
     sidecars: Vec<(String, DevArtifact)>,
+}
+
+/// Resolves the command line of an output, by its name, once what it names is built.
+type Argv<'a> =
+    &'a (dyn Fn(&str, &ArtifactFs, &Ensured) -> buck2_error::Result<Vec<String>> + Sync);
+
+/// Built artifacts, as `materialize_groups` gives them.
+type Ensured = Vec<(ArtifactGroup, ArtifactGroupValues)>;
+
+/// `command` as the server gets it, with the absolute paths of the artifacts in `ensured`.
+fn command_argv<'v>(
+    artifact_fs: &ArtifactFs,
+    command: &'v dyn CommandLineArgLike<'v>,
+    ensured: &Ensured,
+) -> buck2_error::Result<Vec<String>> {
+    let path_separator = if cfg!(windows) {
+        PathSeparatorKind::Windows
+    } else {
+        PathSeparatorKind::Unix
+    };
+    let executor_fs = ExecutorFs::new(artifact_fs, path_separator);
+    let mut args = Vec::<String>::new();
+    let mapper = ArtifactPathMapperImpl::from(ensured);
+    let mut builder =
+        CommandLineBuilder::new_with_options(&mut args, &mapper, &executor_fs, true, None);
+    command.add_to_command_line(&mut builder)?;
+    Ok(args)
 }
 
 /// Build and materialise each of `groups`, all or none.
 async fn materialize_groups(
     dice: &mut DiceComputations<'_>,
     groups: Vec<ArtifactGroup>,
-) -> buck2_error::Result<Vec<(ArtifactGroup, ArtifactGroupValues)>> {
+) -> buck2_error::Result<Ensured> {
     dice.try_compute_join(groups, async |dice, group| {
         materialize_and_upload_artifact_group(
             dice,
@@ -680,35 +715,37 @@ async fn build(
     project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
     wanted: Vec<Wanted>,
+    argv: Argv<'_>,
 ) -> buck2_error::Result<DevBuilt> {
     let artifact_fs = dice.get_artifact_fs().await?;
     let built = dice
         .compute_join(wanted, async |dice, wanted| {
             let Wanted {
                 name,
-                artifact,
+                output,
                 sidecars,
             } = wanted;
+            let command = matches!(output, DevOutputSpec::Command(_));
             // The output itself has no name here.
-            let mut artifacts = vec![(None, artifact)];
+            let mut artifacts = vec![(None, output.groups())];
             artifacts.extend(
                 sidecars
                     .into_iter()
-                    .map(|(sidecar, artifact)| (Some(sidecar), artifact)),
+                    .map(|(sidecar, artifact)| (Some(sidecar), artifact.groups())),
             );
             let values = dice
-                .try_compute_join(artifacts, async |dice, (sidecar, artifact)| {
-                    let groups = materialize_groups(dice, artifact.groups()).await?;
+                .try_compute_join(artifacts, async |dice, (sidecar, groups)| {
+                    let groups = materialize_groups(dice, groups).await?;
                     buck2_error::Ok((sidecar, groups))
                 })
                 .await;
-            (name, values)
+            (name, command, values)
         })
         .await;
     let mut outputs = BTreeMap::new();
     let mut failed = BTreeMap::new();
-    for (name, values) in built {
-        let values = match values {
+    for (name, command, values) in built {
+        let mut values = match values {
             Ok(values) => values,
             Err(e) => {
                 failed.insert(name, output_error(&e));
@@ -716,6 +753,20 @@ async fn build(
             }
         };
         let mut output = None;
+        if command {
+            // The output comes first. What its command line names is all that it is.
+            let (_, groups) = values.remove(0);
+            match argv(&name, &artifact_fs, &groups) {
+                Ok(argv) => {
+                    let digest = contents_digest(contents(&artifact_fs, &groups)?);
+                    output = Some((None, Some(argv), Some(digest)));
+                }
+                Err(e) => {
+                    failed.insert(name, output_error(&e));
+                    continue;
+                }
+            }
+        }
         let mut sidecars = BTreeMap::new();
         for (sidecar, groups) in values {
             // The artifact comes first, and then those associated with it.
@@ -736,14 +787,15 @@ async fn build(
                 Some(sidecar) => {
                     sidecars.insert(sidecar, DevBuiltSidecar { path, digest });
                 }
-                None => output = Some((path, digest)),
+                None => output = Some((Some(path), None, digest)),
             }
         }
-        let (path, digest) = output.ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
+        let (path, argv, digest) = output.ok_or_else(|| DevError::EmptyOutput(name.clone()))?;
         outputs.insert(
             name,
             DevBuiltOutput {
                 path,
+                argv,
                 digest,
                 sidecars,
             },

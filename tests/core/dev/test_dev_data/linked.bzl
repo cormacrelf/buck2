@@ -68,3 +68,46 @@ associated_app = rule(
         "server": attrs.source(),
     },
 )
+
+def _hidden_binary(ctx):
+    data = _copy(ctx, "data.txt", ctx.attrs.data)
+
+    # As in `associated_app`, but the binary's `RunInfo` names `data` as a hidden artifact.
+    exe = _script(ctx, "run.sh", "data", data)
+    return [
+        DefaultInfo(default_output = exe),
+        RunInfo(args = cmd_args(exe, ctx.attrs.args, hidden = data)),
+    ]
+
+# A binary: a script that prints a copy of `data`, which its `RunInfo` has as a hidden
+# artifact, and then its arguments.
+hidden_binary = rule(
+    impl = _hidden_binary,
+    attrs = {
+        "args": attrs.list(attrs.string(), default = []),
+        "data": attrs.source(),
+    },
+)
+
+def _run_info_app(ctx):
+    app = ctx.attrs.binary[RunInfo]
+    if ctx.attrs.only != None:
+        app = DevOutput(app, only = ctx.attrs.only)
+    return [
+        DefaultInfo(),
+        DevInfo(
+            server = cmd_args("python3", ctx.attrs.server),
+            outputs = {"app": app},
+        ),
+    ]
+
+# A `DevInfo` with one output, `app`: the `RunInfo` of `binary`, as a `DevOutput` with `only`
+# if that is given.
+run_info_app = rule(
+    impl = _run_info_app,
+    attrs = {
+        "binary": attrs.dep(providers = [RunInfo]),
+        "only": attrs.option(attrs.list(attrs.string()), default = None),
+        "server": attrs.source(),
+    },
+)

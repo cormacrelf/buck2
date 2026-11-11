@@ -6,7 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("//:linked.bzl", "associated_app")
+load("//:linked.bzl", "associated_app", "hidden_binary", "run_info_app")
 
 associated_app(
     name = "associated",
@@ -18,5 +18,24 @@ associated_app(
     name = "sidecar",
     extra = "extra.txt",
     lib = "lib.txt",
+    server = "server.py",
+)
+
+hidden_binary(
+    name = "binary",
+    args = ["--flag"],
+    data = "data.txt",
+)
+
+run_info_app(
+    name = "run_info",
+    binary = ":binary",
+    server = "server.py",
+)
+
+run_info_app(
+    name = "run_info_only",
+    binary = ":binary",
+    only = [],
     server = "server.py",
 )

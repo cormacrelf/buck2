@@ -16,11 +16,20 @@
 #   `linked/lib.txt`, which the script prints.
 # - `//linked:sidecar` is the same, and `app` has a sidecar `check`, another script, with one
 #   associated artifact, a copy of `linked/extra.txt`. The server runs the sidecar too.
+# - `//linked:run_info` has `app`, the `RunInfo` of `//linked:binary`: a script, an argument,
+#   and a hidden artifact, a copy of `linked/data.txt`, which the script prints.
+# - `//linked:run_info_only` is the same, with `app` a `DevOutput` with `only = []`.
 
 import os
 from typing import Any, Dict
 
-from buck2.tests.core.common.dev.dev_util import dev_test, files, start_dev, write
+from buck2.tests.core.common.dev.dev_util import (
+    dev_test,
+    edit_target,
+    files,
+    start_dev,
+    write,
+)
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.buck_workspace import BuckTestCase
 
@@ -90,5 +99,66 @@ class DevLinkedTest(BuckTestCase):
             assert new_check["changed"]
             assert not new["changed"]
             await dev.quiet()
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_run_info_output(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//linked:run_info")
+        try:
+            built = await dev.start()
+            app = built["outputs"]["app"]
+            # A command line has `argv`, with absolute paths as in the server's command, and no
+            # `path`. The hidden artifact is there when the server runs it.
+            assert "path" not in app, app
+            assert os.path.isabs(app["argv"][0]), app
+            assert app["argv"][1:] == ["--flag"], app
+            assert_ran(app, "data: data v1\nargs: --flag\n")
+            assert app["changed"]
+
+            # Only the hidden artifact is built from `data.txt`.
+            write(buck, "linked/data.txt", "data v2\n")
+            building, built = await dev.expect("building", "built")
+            assert building["outputs"] == ["app"]
+            assert files(buck, building) == ["linked/data.txt"]
+            new = built["outputs"]["app"]
+            assert_ran(new, "data: data v2\nargs: --flag\n")
+            assert new["argv"] == app["argv"]
+            assert new["changed"]
+            assert new["digest"] != app["digest"]
+
+            # A new argument is a new output, with the same artifacts.
+            edit_target(buck, "linked/TARGETS.fixture", "binary", '"--flag"', '"--other"')
+            built = await dev.wait_for("built")
+            other = built["outputs"]["app"]
+            assert_ran(other, "data: data v2\nargs: --other\n")
+            assert other["digest"] == new["digest"]
+            assert other["changed"]
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_run_info_output_with_only(self, buck: Buck) -> None:
+        dev = await start_dev(buck, "//linked:run_info_only")
+        try:
+            built = await dev.start()
+            app = built["outputs"]["app"]
+            assert_ran(app, "data: data v1\nargs: --flag\n")
+
+            # A change to what the hidden artifact is built from holds the output back.
+            write(buck, "linked/data.txt", "data v2\n")
+            (stale,) = await dev.expect("stale")
+            assert stale["outputs"] == ["app"]
+            assert files(buck, stale) == ["linked/data.txt"]
+            await dev.quiet()
+
+            # The server asks for it, and gets it as the files are now.
+            dev.request({"type": "build", "outputs": ["app"]})
+            building, built, stale = await dev.expect("building", "built", "stale")
+            assert building["outputs"] == ["app"]
+            new = built["outputs"]["app"]
+            assert_ran(new, "data: data v2\nargs: --flag\n")
+            assert new["changed"]
+            assert stale["outputs"] == []
         finally:
             await dev.stop()

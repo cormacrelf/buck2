@@ -17,6 +17,7 @@ use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProv
 use buck2_interpreter::types::configured_providers_label::StarlarkProvidersLabel;
 use buck2_interpreter::types::target_label::StarlarkConfiguredTargetLabel;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
+use either::Either;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
@@ -25,7 +26,6 @@ use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOf;
 use starlark::values::ValueOfUnchecked;
 use starlark::values::dict::AllocDict;
 use starlark::values::dict::DictType;
@@ -39,6 +39,8 @@ use starlark::values::none::NoneOr;
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueIsInputArtifactAnnotation;
+use crate::interpreter::rule_defs::cmd_args::FrozenStarlarkCmdArgs;
+use crate::interpreter::rule_defs::provider::builtin::dev_info::dev_output_value;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
@@ -81,8 +83,11 @@ fn target_to_pattern(value: Value) -> buck2_error::Result<String> {
 )]
 #[repr(C)]
 pub struct DevOutput<'v> {
-    /// The artifact.
-    artifact: ValueOfUnchecked<'v, ValueIsInputArtifactAnnotation>,
+    /// The artifact, or the command line.
+    artifact: ValueOfUnchecked<
+        'v,
+        Either<ValueIsInputArtifactAnnotation, FrozenStarlarkCmdArgs<'static>>,
+    >,
     /// Target patterns, or `None` for an output that is built again after any change.
     only: ValueOfUnchecked<'v, NoneOr<ListType<String>>>,
     /// Other artifacts that are built with this one, by name.
@@ -94,7 +99,9 @@ fn dev_output_creator(globals: &mut GlobalsBuilder) {
     /// An output of `DevInfo`, with the changes after which `buck2 dev` builds it again by
     /// itself.
     ///
-    /// * `artifact`: the artifact to build, with its associated artifacts.
+    /// * `artifact`: the artifact to build, with its associated artifacts. Or a `RunInfo` or
+    ///   another command line: `buck2 dev` builds what it names, and gives the server its
+    ///   `argv`.
     /// * `only`: target patterns (`"root//lib/..."`) or labels. `buck2 dev` builds the output
     ///   again by itself only after a change to the own source files of these targets. After
     ///   any other change that the output may be built from, it stops building the output and
@@ -108,7 +115,7 @@ fn dev_output_creator(globals: &mut GlobalsBuilder) {
     ///   output is built from. The server cannot ask for a sidecar by itself.
     #[starlark(as_type = DevOutput<'static>)]
     fn DevOutput<'v>(
-        #[starlark(require = pos)] artifact: ValueOf<'v, ValueIsInputArtifactAnnotation>,
+        #[starlark(require = pos)] artifact: Value<'v>,
         #[starlark(require = named, default = NoneOr::None)] only: NoneOr<
             UnpackListOrTuple<Value<'v>>,
         >,
@@ -137,8 +144,9 @@ fn dev_output_creator(globals: &mut GlobalsBuilder) {
                 heap.alloc(AllocList(patterns))
             }
         };
+        let artifact = dev_output_value(heap, artifact)?;
         Ok(DevOutput {
-            artifact: artifact.as_unchecked().cast(),
+            artifact: ValueOfUnchecked::new(artifact),
             only: ValueOfUnchecked::new(only),
             sidecars: ValueOfUnchecked::new(heap.alloc(AllocDict(sidecars.entries))),
         })
