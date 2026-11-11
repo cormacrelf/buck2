@@ -4,9 +4,9 @@ I read this as a design, at the head of the stack, and did not run anything. The
 
 **`InstallInfo` is the closest precedent, not tests.** `InstallInfo(installer, files = {name: artifact})` plus `FileReady{name, digest, path, size}` is the same shape as `DevInfo(server, outputs)` plus `built`. Worth aligning names and fields with it deliberately, or saying why not.
 
-**`outputs` is weaker than test commands.** A test's `command` and `env` are `cmd_args`, and `prepare_for_local_execution` materialises everything they reference and returns argv, env and cwd. `DevInfo.outputs` takes one bound artifact and rejects associated artifacts (`dev_info.rs` `AssociatedArtifacts`). An `exe` that needs shared libraries or resources cannot be expressed, so the subsecond example only works because it links statically. I would let outputs be `cmd_args`/`RunInfo` and have `built` return a resolved argv as well as a path. **Partly done:** `DevOutput(artifact, sidecars = {...})` builds more artifacts with an output, and `built` has each by name. An output is still one bound artifact with no associated artifacts, and `built` has no argv.
+**`outputs` is weaker than test commands.** A test's `command` and `env` are `cmd_args`, and `prepare_for_local_execution` materialises everything they reference and returns argv, env and cwd. `DevInfo.outputs` takes one bound artifact and rejects associated artifacts (`dev_info.rs` `AssociatedArtifacts`). An `exe` that needs shared libraries or resources cannot be expressed, so the subsecond example only works because it links statically. I would let outputs be `cmd_args`/`RunInfo` and have `built` return a resolved argv as well as a path. **Done:** an output may have associated artifacts, which are built with it, or be a `RunInfo` or `cmd_args`, and then `built` has its `argv`. `DevOutput(artifact, sidecars = {...})` names more artifacts with an output. `built` has no env or cwd.
 
-**Local resources are missing.** `LocalResourceInfo` already covers "a helper process Buck starts, reads JSON from, and kills by pid" for simulators, emulators and databases. Dev servers need the same sidecars. `DevInfo(local_resources = {...})` with the env vars passed to the server would reuse it; today each server script has to do this itself.
+**Local resources are missing.** `LocalResourceInfo` already covers "a helper process Buck starts, reads JSON from, and kills by pid" for simulators, emulators and databases. Dev servers need the same sidecars. `DevInfo(local_resources = {...})` with the env vars passed to the server would reuse it; today each server script has to do this itself. **Done:** `DevInfo(local_resources = {name: label})`. The daemon sets them up with the code that tests use, now in `buck2_build_api::local_resources`, holds them for the session, and gives the server their env vars.
 
 **Results are all-or-nothing.** `build()` uses `try_compute_join`, so one failing output drops `built` for the others, and `failed.error` is error messages joined by newlines. `buck2 build` and the build report give per-target results and structured errors. A type-check-on-save server needs both. **Partly done:** `built` has the outputs that built, and `failed`, name to error, for the others. The errors are still text.
 
@@ -76,7 +76,7 @@ The flag is named for what the server needs rather than `tui`: a REPL or a debug
 
 ## Configuration
 
-**Not done** for a `DevInfo` with a watch list: all four points stand. Without one (the `only` prototype below) there are no sets to name and holds are per output. `-- args`, `env` and a target with only `RunInfo` are missing either way.
+**Done by deleting the watch list:** `DevWatch` and `DevInfo(watch = ...)` are gone, and the outputs carry the policy (the `only` proposal below). `buck2 dev //t -- args` and a target with only `RunInfo` work. There is no `env` parameter: the server has the environment of `buck2 dev`.
 
 **`DevWatch` mixes two things: naming a file set and choosing an action.** I would name the sets (`watch = {"server": ..., "lib": ...}`) and include the set name in `building` and `stale`. The server currently gets raw paths and has to work out again what Buck already classified. The three flags, with `notify` exclusive and "none" meaning ignore, read better as one `action`.
 
@@ -97,33 +97,35 @@ This section comes from changing the code, not only from reading it. `buck2 dev`
 - It restarted the server on a save that changed nothing.
 - It could only be made exact by hashing every file of the set, which was removed because of what it cost on a large set.
 
-Once Buck checked the command itself, the line went away in all three examples. `restart` is left for a server that reads files its command does not declare, which is a gap in the command more than a policy. I would keep it as an escape hatch and stop presenting it as the normal way. **Done** in the docs.
+Once Buck checked the command itself, the line went away in all three examples. `restart` is left for a server that reads files its command does not declare, which is a gap in the command more than a policy. I would keep it as an escape hatch and stop presenting it as the normal way. **Done**, and further: the `restart` set is deleted with the watch list. The server's `restart` request and `hidden` stay.
 
 **`build` mostly fails the same test.** A `build` set maps files to outputs, and the build graph already has that map. Where the author's map names fewer outputs than the graph does, the result is a stale output and no message. Claims are exclusive, so with `DevWatch(targets = ["//styles/..."], build = ["css"])` ahead of `DevWatch(targets = None, build = ["js"])`, a file under `//styles` that the JS bundle also reads builds only `css`. `js` stays old until some other change builds it. (This is from reading the claims code; I did not test it.) The author has to know the build graph to write a correct list, and nothing checks the list against it.
 
 Where the author's map does carry information is exclusion. In subsecond, a change to the crate must build `patch` and must not build `exe`, though `exe` is built from the crate too. That is a real policy, and it needs a list. `notify` is the same kind of thing: a hold, not a trigger.
 
-**So I would invert the default.** With no `watch`, `buck2 dev` builds every output after any change (or every output the server has asked for), and `changed` tells the server which are new. A build that has nothing to do is cheap: about 1ms on the 50k-target project with `-m opt`. `dev_web_server` and `dev_vite` would then need no watch list at all. The list stays for subtraction: "for these files, build only these outputs", and "hold". That also answers "There is no default" above. **Done** as a prototype: a `DevInfo` without `watch`, which all three examples now are. It builds every plain output, asked for or not; see the loop below.
+**So I would invert the default.** With no `watch`, `buck2 dev` builds every output after any change (or every output the server has asked for), and `changed` tells the server which are new. A build that has nothing to do is cheap: about 1ms on the 50k-target project with `-m opt`. `dev_web_server` and `dev_vite` would then need no watch list at all. The list stays for subtraction: "for these files, build only these outputs", and "hold". That also answers "There is no default" above. **Done:** it is the only behaviour. It builds every plain output, asked for or not; see the loop below. **Since:** `buck2 dev` builds nothing by itself. After a change it sends `stale` for the outputs the server has asked for, and the server sends `build`.
 
 **Automatic behaviour and first-match claims do not compose yet.** The server check is the first thing `buck2 dev` does that is not a rule, and it met the list in three places:
 - **A server file that a `build` set claims.** Saving `server/server.py` unchanged in `dev_web_server` falls to `DevWatch(targets = None, build = ["www"])`, and the server is told of a build that built nothing. Observed by running the example.
 - **A server file that a `notify` set claims.** The change waits, so the server is not checked until it asks for a build. The author has to put a set with no action first to keep the file out. So "no action" no longer means "ignore": it means "claim the file, and leave it to the server check".
 - **A server file that no set claims.** It still has to be checked, so the check runs for every reported change, and each one now costs two daemon commands.
 
-I would have the server command claim its own files ahead of the list. Only the precise part of the claim: the source files that the actions of the targets owning the command's artifacts read. That covers `server.py` in all three examples and `thinlink.rs` in subsecond. A save without a change then does nothing, a real change restarts, neither can wait behind `notify`, and the set with no action goes back to meaning "ignore". **Done without a watch list** (`test_server_file_is_only_checked`). With one, the three points above stand.
+I would have the server command claim its own files ahead of the list. Only the precise part of the claim: the source files that the actions of the targets owning the command's artifacts read. That covers `server.py` in all three examples and `thinlink.rs` in subsecond. A save without a change then does nothing, a real change restarts, neither can wait behind `notify`, and the set with no action goes back to meaning "ignore". **Done** (`test_server_file_is_only_checked`).
 
-**Over-claiming is only safe under an action that does everything.** Below the owning target, an `inputs` set claims whole targets and all their dependencies, whether or not the input is built from each file. Under `restart` that was harmless: the worst case was an extra restart, and the new server asked for everything again. Under `build`, or under the server check, an exclusive claim on a file the set is not built from takes the file away from the set that is. So this is why the implicit server claim above should not use the full `inputs` closure: a dependency shared by the server and an output would go to the server only, and when the server came out the same, the output would stay old. I would make the over-claimed part of any `inputs` claim non-exclusive, so that such a file also goes to the next set that matches it. **Not done** for watch lists. Without one nothing is exclusive.
+**Over-claiming is only safe under an action that does everything.** Below the owning target, an `inputs` set claims whole targets and all their dependencies, whether or not the input is built from each file. Under `restart` that was harmless: the worst case was an extra restart, and the new server asked for everything again. Under `build`, or under the server check, an exclusive claim on a file the set is not built from takes the file away from the set that is. So this is why the implicit server claim above should not use the full `inputs` closure: a dependency shared by the server and an output would go to the server only, and when the server came out the same, the output would stay old. I would make the over-claimed part of any `inputs` claim non-exclusive, so that such a file also goes to the next set that matches it. **Done:** nothing is exclusive now.
 
 | Part | Verdict | Status |
 |---|---|---|
 | `server` / `outputs` split | Keep, and make it the centre of the docs. Warn when an output is also in the server command | Docs done, no warning |
-| `restart` | An escape hatch for files the command does not declare, not the normal way | Done in the docs |
-| `build` sets | Default to every output; keep the list for building fewer | Done without a watch list |
-| `notify` | A hold, as under Configuration | Per output with `only`; as it was with a watch list |
-| First-match exclusivity | Right for `targets`, wrong for the over-claimed part of `inputs` | As it was with a watch list |
-| A set with no action | Goes back to "ignore" once the server command claims its own files | As it was with a watch list |
+| `restart` | An escape hatch for files the command does not declare, not the normal way | Done: the set is deleted |
+| `build` sets | Default to every output; keep the list for building fewer | Replaced: the server asks for every build |
+| `notify` | A hold, as under Configuration | Replaced: `stale` tells the server, which decides |
+| First-match exclusivity | Right for `targets`, wrong for the over-claimed part of `inputs` | Done: nothing is exclusive |
+| A set with no action | Goes back to "ignore" once the server command claims its own files | Done: there are no sets |
 
 ### Proposal: put the policy on the outputs, with `only`
+
+**Replaced.** `only` was built, and then taken out again. `buck2 dev` now builds an output only when the server asks. `DevInfo(scopes = {name: [targets]})` names sets of targets, and `stale` says for each output which scopes hold all of its changes (`within`). The server decides from that what to build, so the policy is in the server, not on the output. What follows is as it was written.
 
 The points above patch the watch list. This goes further and drops it. The list makes the author split the files into parts and give each part an action, but Buck already knows when the server is out of date and which outputs a file can affect. What the author knows is where to hold back. So the policy goes on the output, as one argument:
 
@@ -157,7 +159,7 @@ DevInfo(
 - **Holds that were not needed.** Below the owning target, membership is still by whole target, so a hold can start for a file that the output is not built from. The server asks, and gets `changed: false`.
 - **The protocol.** `stale` gets the output names, so every server that reads it changes.
 - **"Ignore these files" cannot be said.** I do not think anything needs it once the server's files are found from its command, but I have not checked every fixture.
-- **Prototyped since, on the branch `buck2-dev-only`.** One output can be held while the others build from the same files: `tests/core/dev/test_dev_only.py` shows it on the fixture, which has two targets. On a project of 10k targets the prototype looped; see the next section. `DevOutput(only = ...)` is in and the three examples use it. The watch list is not dropped: both exist, a `DevInfo` with `watch` cannot have `only`, and most of the tests still use a watch list.
+- **Prototyped since, on the branch `buck2-dev-only`.** One output can be held while the others build from the same files: `tests/core/dev/test_dev_only.py` shows it on the fixture, which has two targets. On a project of 10k targets the prototype looped; see the next section. `DevOutput(only = ...)` is in, the three examples use it, and the watch list is deleted.
 
 ### Found by the prototype: a build that `buck2 dev` starts by itself can loop
 
@@ -184,16 +186,16 @@ What is still as it was:
 - The bench was not run again, so the 10k-target case itself is not shown fixed, only the small one with the same cause.
 - What started the first build is still not known. It may have been the same overflow: the second run started on a `buck-out` that the first had filled.
 - Directories that the project's ignore rules exclude are still watched, and their events dropped afterwards. One that gets many writes, such as `node_modules` or a Cargo `target`, can still fill the queue.
-- The points under "What it says about the design" below stand. The watcher no longer causes missed changes by itself, but after changes that are missed for another reason `buck2 dev` still builds every plain output, asked for or not, and nothing bounds a build that keeps being stopped.
+- The points under "What it says about the design" below stand. The watcher no longer causes missed changes by itself, but after changes that are missed for another reason `buck2 dev` still builds every plain output, asked for or not, and nothing bounds a build that keeps being stopped. **Since:** `buck2 dev` builds only what the server asks for, so the first and the third point below no longer apply.
 
 **Why the tests did not find it.** The fixture has two targets. `test_missed_changes_hold_the_outputs_with_only` has changes missed once, and gets one build.
 
 **What it says about the design.**
-- **Build by itself only what the server has asked for.** The proposal above says "builds every output after any change (or every output the server has asked for)". The prototype did the first, and this is the case against it: an output that no server wants, built after every change and after every missed one. I would take the second. An output that the server has not asked for since it started is then never built by `buck2 dev` itself.
-- **The loop is not the prototype's alone.** With a watch list, `buck2 dev` also builds what every `build` set names after missed changes, and a build also stops when changes are missed. If the guess is right, a watch list whose `build` set names a large enough output loops the same way. I did not test that. The old bench modes never build the large artifact.
-- **Nothing bounds it.** A build that is stopped is started again at once, however often that has happened, and memory grew all the while. `buck2 dev` should give up, or wait longer each time, after some number of builds in a row that were stopped without a file to name, and send `failed`.
+- **Build by itself only what the server has asked for.** The proposal above says "builds every output after any change (or every output the server has asked for)". The prototype did the first, and this is the case against it: an output that no server wants, built after every change and after every missed one. I would take the second. An output that the server has not asked for since it started is then never built by `buck2 dev` itself. **Done**, and further: it builds nothing by itself, and `stale` names only the outputs that the server has asked for.
+- **The loop is not the prototype's alone.** With a watch list, `buck2 dev` also builds what every `build` set names after missed changes, and a build also stops when changes are missed. If the guess is right, a watch list whose `build` set names a large enough output loops the same way. I did not test that. The old bench modes never build the large artifact. **No longer applies:** the watch list is deleted.
+- **Nothing bounds it.** A build that is stopped is started again at once, however often that has happened, and memory grew all the while. `buck2 dev` should give up, or wait longer each time, after some number of builds in a row that were stopped without a file to name, and send `failed`. **No longer applies:** a build that is stopped is not started again by `buck2 dev`. The server gets `cancelled`, then `stale`, and asks again if it wants to.
 
-**The bench.** The `outputs` and `outputs8` modes are still in `tests/dev_bench`. They looped before the fix to the watcher, and have not been run since. They should not be run without a limit on memory.
+**The bench.** The `outputs` and `outputs8` modes are still in `tests/dev_bench`. They looped before the fix to the watcher, and have not been run since. They should not be run without a limit on memory. The watch-list modes (`targets`, `inputs`, `restart`) are deleted from it.
 
 ### To think about: a file added after the sets were found
 
@@ -207,23 +209,23 @@ So I think "these files" is the wrong way to think of a set, and the answer to "
 
 **What is tested.**
 - One set: `test_new_source_file_changes_the_graph` (a glob takes the new file, `targets = None` builds) and `test_file_that_the_glob_does_not_match` (nothing happens).
-- A narrow set that builds `patch`, then a catch-all `notify` set: `test_new_file_joins_the_inputs_set_of_its_target` (the narrow set is named by `inputs`) and `test_new_file_joins_the_targets_set_of_its_target` (by `targets`). In both, a new file that the glob matches sends `graph_changed`, builds, and does not wait; it is in `building.files`. A later change to it builds as any other file of the set does, and removing it builds again. Both pass, so the code already does the right thing here.
+- A narrow set that builds `patch`, then a catch-all `notify` set: `test_new_file_joins_the_inputs_set_of_its_target` (the narrow set is named by `inputs`) and `test_new_file_joins_the_targets_set_of_its_target` (by `targets`). In both, a new file that the glob matches sends `graph_changed`, builds, and does not wait; it is in `building.files`. A later change to it builds as any other file of the set does, and removing it builds again. Both pass, so the code already does the right thing here. **Since:** the watch list is deleted. The first is now `test_new_file_joins_the_outputs_built_from_it`, and the second is gone, covered by it and `test_new_file_of_a_target_in_only_builds`.
 
 **What is still not tested, and partly not decided:**
-1. A new file joins a target of the `notify` set. I expect `stale` with the file. It also changes the target, so does the rule that a build file "waits" apply to it?
-2. A new file that the glob takes in but the input's actions do not read, in a target with several outputs. It falls to the next set. Is that what the author expects?
-3. The server cannot tell what happened. `graph_changed` has no fields, and a hot-patching server needs to know that the patched crate gained a file, since some tools cannot patch that and must restart. This is another reason to name the sets and put the names in `graph_changed`.
+1. A new file joins a target of the `notify` set. I expect `stale` with the file. It also changes the target, so does the rule that a build file "waits" apply to it? **No longer applies.**
+2. A new file that the glob takes in but the input's actions do not read, in a target with several outputs. It falls to the next set. Is that what the author expects? **No longer applies:** nothing is exclusive, so there is no next set.
+3. The server cannot tell what happened. `graph_changed` has no fields, and a hot-patching server needs to know that the patched crate gained a file, since some tools cannot patch that and must restart. This is another reason to name the sets and put the names in `graph_changed`. **Partly done:** a file that a target of a scope gains is a change within that scope, so `stale` says so in `within`. `graph_changed` still has no fields.
 4. A rename, which is a removal and an addition at once.
 
 ## Will it extend?
 
 | Kind | Verdict | Status |
 |---|---|---|
-| Restart on change (air, nodemon, cargo-watch) | Works, but needs the side channel and crash tolerance to be clean | Both done |
+| Restart on change (air, nodemon, cargo-watch) | Works, but needs the side channel and crash tolerance to be clean | Done, and a target with only `RunInfo` works |
 | Static site with live reload | Works | |
 | Tools with their own watcher (Vite, webpack, Metro, `tsc --watch`) | Each server reimplements a sync to a stable directory (60 lines in the Vite example), because Buck replaces outputs wholesale | Partly: sidecars say which files changed, the server still copies them |
-| Hot patch | Works; it is what `notify` was built for | The example now uses `only` |
-| Mobile (simulator plus install) | Blocked on local resources and no link to `InstallInfo` | Open |
+| Hot patch | Works; it is what `notify` was built for | The example uses the `lib` scope and reads `within` |
+| Mobile (simulator plus install) | Blocked on local resources and no link to `InstallInfo` | Local resources done; no link to `InstallInfo` |
 | Multi-service (frontend, backend, database) | Blocked: one target, one server, no composition of `DevInfo`s | Open |
 | Test on save | Claimed in the doc, but there is no example and no link to `ExternalRunnerTestInfo`; I would drop the claim or prove it | Open: still claimed, still no example |
 | Check on save with diagnostics | Needs per-output results and structured errors | Per-output results done, errors are text |
