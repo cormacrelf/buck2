@@ -31,6 +31,11 @@
 //! file, so DICE keeps it while only source files change: a `Watch` or a `Build` then looks up
 //! the changed paths in it, and what that costs does not grow with the graph. Its value says
 //! which slot has which target, and lists no source files; see `DevClaims`.
+//!
+//! A dynamic output, which the server defines while it runs, is a call of a handler of
+//! `DevInfo.handlers`: a bxl function with arguments. Each has claims of its own, a
+//! `DevDynamicClaimsKey`, with one output slot. `buck2 dev` sends the dynamic outputs that it
+//! tracks with each `Watch`, and the session's file interest is the union of all the claims.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -77,6 +82,8 @@ use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
 use buck2_cli_proto::new_generic::DevBuiltSidecar;
 use buck2_cli_proto::new_generic::DevChange;
+use buck2_cli_proto::new_generic::DevDynamicCall;
+use buck2_cli_proto::new_generic::DevDynamicWatched;
 use buck2_cli_proto::new_generic::DevInterrupted;
 use buck2_cli_proto::new_generic::DevOutputChanges;
 use buck2_cli_proto::new_generic::DevRequest;
@@ -109,6 +116,7 @@ use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::package::PackageLabel;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
@@ -137,6 +145,7 @@ use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
 use buck2_server_ctx::ctx::FileChangeBatch;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::dev_interest::FileInterest;
+use buck2_server_ctx::dev_interest::add_interest;
 use buck2_server_ctx::dev_interest::clear_interest;
 use buck2_server_ctx::dev_interest::session_held;
 use buck2_server_ctx::dev_interest::session_held_if_any;
@@ -195,6 +204,10 @@ enum DevError {
     NoSession(String),
     #[error("`buck2 dev` takes at most {MAX_SLOTS} {0}, but the `DevInfo` has {1}")]
     TooManySlots(&'static str, usize),
+    #[error("{subject} has no handler named `{name}` in its `DevInfo`")]
+    UnknownHandler { subject: DevSubject, name: String },
+    #[error("`{0}` is an output of the `DevInfo`, so it cannot be the name of a dynamic output")]
+    DynamicNameTaken(String),
 }
 
 /// How many slots a `DevInfo` may have: a set of slots is the bits of a `u64`.
@@ -278,19 +291,11 @@ impl DevSubject {
         server_ctx: &dyn ServerCommandContextTrait,
         ctx: &DiceTransaction,
         req: &DevRequest,
+        global_cfg_options: &GlobalCfgOptions,
     ) -> buck2_error::Result<DevSubject> {
-        let global_cfg_options =
-            global_cfg_options_from_client_context(&req.target_cfg, server_ctx, &mut ctx.ctx())
-                .await?;
         if let Some(bxl_args) = &req.bxl_args {
-            let (key, file) = BXL_SERVER_COMMANDS
-                .get()?
-                .bxl_key(server_ctx, ctx, &req.target, bxl_args, &global_cfg_options)
-                .await?;
-            return Ok(DevSubject::Bxl {
-                key,
-                file: file.path().dupe(),
-            });
+            return DevSubject::bxl(server_ctx, ctx, &req.target, bxl_args, global_cfg_options)
+                .await;
         }
         let mut dice = ctx.ctx();
         let patterns = parse_patterns_from_cli_args::<ProvidersPatternExtra>(
@@ -304,9 +309,27 @@ impl DevSubject {
         };
         let label = pattern.clone().as_providers_label(&req.target)?;
         Ok(DevSubject::Target(
-            dice.get_configured_provider_label(&label, &global_cfg_options)
+            dice.get_configured_provider_label(&label, global_cfg_options)
                 .await?,
         ))
+    }
+
+    /// The bxl function `label`, `path.bxl:name`, called with the command line arguments `args`.
+    async fn bxl(
+        server_ctx: &dyn ServerCommandContextTrait,
+        ctx: &DiceTransaction,
+        label: &str,
+        args: &[String],
+        global_cfg_options: &GlobalCfgOptions,
+    ) -> buck2_error::Result<DevSubject> {
+        let (key, file) = BXL_SERVER_COMMANDS
+            .get()?
+            .bxl_key(server_ctx, ctx, label, args, global_cfg_options)
+            .await?;
+        Ok(DevSubject::Bxl {
+            key,
+            file: file.path().dupe(),
+        })
     }
 
     /// The providers of the target, or those that the bxl function returned.
@@ -413,6 +436,14 @@ impl<'a> DevView<'a> {
         match self {
             DevView::Dev(info) => info.interactive(),
             DevView::Run(_) => false,
+        }
+    }
+
+    /// `DevInfo.handlers`: each name with the label of its bxl function.
+    fn handlers(self) -> Vec<(String, String)> {
+        match self {
+            DevView::Dev(info) => info.handlers(),
+            DevView::Run(_) => Vec::new(),
         }
     }
 
@@ -595,7 +626,10 @@ async fn dev(
         }
         return Ok(DevResponse::Released);
     }
-    let subject = DevSubject::of_request(server_ctx, ctx, req).await?;
+    let global_cfg_options =
+        global_cfg_options_from_client_context(&req.target_cfg, server_ctx, &mut ctx.ctx())
+            .await?;
+    let subject = DevSubject::of_request(server_ctx, ctx, req, &global_cfg_options).await?;
     let providers = subject.providers(&mut ctx.ctx()).await?;
     // Held across awaits, so this needs the owned form.
     let info = DevProvider::of(&providers, &subject)?;
@@ -649,6 +683,12 @@ async fn dev(
                 digest,
                 outputs: outputs.keys().cloned().collect(),
                 scopes: info.view().scopes().into_keys().collect(),
+                handlers: info
+                    .view()
+                    .handlers()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect(),
                 interactive: info.view().interactive(),
                 env: resources.env,
                 resources: resources.running,
@@ -659,8 +699,124 @@ async fn dev(
         DevAction::Watch(request) => {
             let resources = dev_resources(&mut ctx.ctx(), &info).await?;
             let policy = dev_policy(info.view(), resource_inputs(&resources)?)?;
-            let mut watched =
-                watch_files(&mut ctx.ctx(), &subject, &policy, request, &req.session).await?;
+            let (mut watched, claims) =
+                watch_files(&mut ctx.ctx(), &subject, &policy, request).await?;
+            let mut interests = vec![claims.interest.dupe()];
+            // A handler that fails may be fixed by a change outside what anything is built
+            // from, such as to the file that it reads.
+            let mut all_known = true;
+            let handlers: Vec<buck2_error::Result<DevSubject>> = {
+                let mut handlers = Vec::with_capacity(request.dynamic.len());
+                for dynamic in &request.dynamic {
+                    handlers.push(
+                        dynamic_subject(
+                            server_ctx,
+                            ctx,
+                            &subject,
+                            &info,
+                            &global_cfg_options,
+                            &dynamic.call,
+                        )
+                        .await,
+                    );
+                }
+                handlers
+            };
+            let subject = &subject;
+            let scopes = &policy.scopes;
+            let results = ctx
+                .ctx()
+                .compute_join(
+                    request.dynamic.iter().zip(handlers),
+                    async |dice, (dynamic, handler)| {
+                        let result = async {
+                            let claims = dynamic_claims(dice, subject, handler?).await?;
+                            let policy = dynamic_policy(&dynamic.call.name, scopes.clone());
+                            let changes = claims_changes(
+                                dice,
+                                &claims,
+                                &policy,
+                                &request.paths,
+                                dynamic.previous.as_ref(),
+                                request.missed,
+                            )
+                            .await?;
+                            buck2_error::Ok((changes, claims))
+                        }
+                        .await;
+                        (dynamic, result)
+                    },
+                )
+                .await;
+            for (dynamic, result) in results {
+                let name = &dynamic.call.name;
+                match result {
+                    Ok((changes, claims)) => {
+                        interests.push(claims.interest.dupe());
+                        watched.outputs.outputs.extend(changes.changes.outputs);
+                        for message in &claims.incomplete {
+                            if !watched.incomplete.contains(message) {
+                                watched.incomplete.push(message.clone());
+                            }
+                        }
+                        watched.dynamic.insert(
+                            name.clone(),
+                            DevDynamicWatched {
+                                state: Some(changes.state),
+                                graph_changed: changes.graph_changed,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        // What the output is built from is not known, so any change may be to
+                        // it. The server hears why when it asks for it.
+                        all_known = false;
+                        let mut list: Vec<DevChange> = request
+                            .paths
+                            .iter()
+                            .map(|path| DevChange {
+                                path: Some(path.clone()),
+                                scopes: Vec::new(),
+                            })
+                            .collect();
+                        if request.missed {
+                            list.push(DevChange {
+                                path: Some(String::new()),
+                                scopes: Vec::new(),
+                            });
+                        }
+                        if list.is_empty() && dynamic.previous.is_some() {
+                            // It failed since the last answer, after a change that names no
+                            // file.
+                            list.push(DevChange {
+                                path: None,
+                                scopes: Vec::new(),
+                            });
+                        }
+                        if !list.is_empty() {
+                            watched.outputs.outputs.insert(name.clone(), list);
+                        }
+                        watched.dynamic.insert(
+                            name.clone(),
+                            DevDynamicWatched {
+                                state: None,
+                                graph_changed: true,
+                            },
+                        );
+                    }
+                }
+            }
+            // From here on the session's file change subscription drops the changes that cannot
+            // matter to these claims. `buck2 dev` asks again after every change that is let
+            // through, and so after every change to the claims.
+            if all_known {
+                set_interest(
+                    &req.session,
+                    Arc::new(FileInterest::union(interests.iter().map(|i| &**i))),
+                );
+            } else {
+                clear_interest(&req.session);
+            }
             // A local resource that exited is set up again by the analysis that the client runs
             // when the server may be new.
             if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
@@ -674,10 +830,41 @@ async fn dev(
         DevAction::Build {
             outputs: names,
             streaming,
+            dynamic,
         } => {
             let sidecars = info.view().sidecars()?;
             let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
+            // The dynamic outputs that cannot be built, with why: they fail on their own.
+            let mut unbuildable: BTreeMap<String, String> = BTreeMap::new();
+            // The handler of each dynamic output to build.
+            let mut handlers: Vec<(String, DevSubject)> = Vec::new();
             for name in names {
+                if let Some(call) = dynamic.iter().find(|call| call.name == *name) {
+                    match resolve_dynamic(
+                        server_ctx,
+                        ctx,
+                        &subject,
+                        &info,
+                        &outputs,
+                        &global_cfg_options,
+                        call,
+                    )
+                    .await
+                    {
+                        Ok((handler, output)) => {
+                            wanted.push(Wanted {
+                                name: name.clone(),
+                                output,
+                                sidecars: Vec::new(),
+                            });
+                            handlers.push((name.clone(), handler));
+                        }
+                        Err(e) => {
+                            unbuildable.insert(name.clone(), output_error(&e));
+                        }
+                    }
+                    continue;
+                }
                 let output = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
                     subject: subject.dupe(),
                     name: name.clone(),
@@ -687,6 +874,32 @@ async fn dev(
                     output: output.clone(),
                     sidecars: sidecars.get(name).cloned().unwrap_or_default(),
                 });
+            }
+            if wanted.is_empty() {
+                return Ok(DevResponse::Build(DevBuilt {
+                    outputs: BTreeMap::new(),
+                    failed: unbuildable,
+                    dynamic: BTreeMap::new(),
+                }));
+            }
+            // What each dynamic output is built from, which a `Watch` compares with next. The
+            // session's file change subscription lets through the changes to it from now on.
+            let subject = &subject;
+            let found = ctx
+                .ctx()
+                .compute_join(handlers, async |dice, (name, handler)| {
+                    (name, dynamic_claims(dice, subject, handler).await)
+                })
+                .await;
+            let mut states = BTreeMap::new();
+            let mut dynamic_builds: Vec<(String, Arc<DevClaims>, AtomicU64)> = Vec::new();
+            for (name, claims) in found {
+                // An output whose claims cannot be found does not stop the build.
+                if let Ok(claims) = claims {
+                    add_interest(&req.session, &claims.interest);
+                    states.insert(name.clone(), claims.state());
+                    dynamic_builds.push((name, claims, AtomicU64::new(slot_bit(1))));
+                }
             }
             let info = &info;
             let argv = move |name: &str, artifact_fs: &ArtifactFs, ensured: &Ensured| {
@@ -703,14 +916,21 @@ async fn dev(
             let builds = AtomicU64::new(
                 all.iter()
                     .enumerate()
-                    .filter(|(_, name)| names.contains(name))
+                    .filter(|(_, name)| {
+                        names.contains(name) && !dynamic.iter().any(|call| call.name == **name)
+                    })
                     .fold(0, |mask, (output, _)| mask | slot_bit(output + 1)),
             );
             let builds = &builds;
             let all = &all;
+            let dynamic_builds = &dynamic_builds;
             let emit = move |built: DevBuilt| -> buck2_error::Result<()> {
                 for name in built.outputs.keys().chain(built.failed.keys()) {
-                    if let Some(output) = all.iter().position(|n| n == name) {
+                    if let Some((_, _, building)) =
+                        dynamic_builds.iter().find(|(dynamic, _, _)| dynamic == name)
+                    {
+                        building.store(0, Ordering::SeqCst);
+                    } else if let Some(output) = all.iter().position(|n| n == name) {
                         builds.fetch_and(!slot_bit(output + 1), Ordering::SeqCst);
                     }
                 }
@@ -724,8 +944,24 @@ async fn dev(
                 Ok(())
             };
             let stream: Option<Stream> = streaming.then_some(&emit);
+            if let Some(stream) = stream {
+                // A streaming build sends each output that failed on its own.
+                for (name, error) in std::mem::take(&mut unbuildable) {
+                    stream(DevBuilt {
+                        outputs: BTreeMap::new(),
+                        failed: BTreeMap::from([(name, error)]),
+                        dynamic: BTreeMap::new(),
+                    })?;
+                }
+            }
+            let finish = |built: buck2_error::Result<DevBuilt>| {
+                let mut built = built?;
+                built.failed.extend(unbuildable);
+                built.dynamic = states;
+                buck2_error::Ok(DevResponse::Build(built))
+            };
             let Some(changes) = changes else {
-                return Ok(DevResponse::Build(
+                return finish(
                     build(
                         server_ctx.project_root(),
                         &mut ctx.ctx(),
@@ -733,10 +969,16 @@ async fn dev(
                         argv,
                         stream,
                     )
-                    .await?,
-                ));
+                    .await,
+                );
             };
-            let claims = dev_claims(&mut ctx.ctx(), &subject).await?;
+            let claims = dev_claims(&mut ctx.ctx(), subject).await?;
+            let mut watched: Vec<(&DevClaims, &AtomicU64)> = vec![(&*claims, builds)];
+            watched.extend(
+                dynamic_builds
+                    .iter()
+                    .map(|(_, claims, building)| (&**claims, building)),
+            );
             let io = ctx
                 .ctx()
                 .global_data()
@@ -748,7 +990,7 @@ async fn dev(
             let (built_tx, built_rx) = oneshot::channel::<()>();
             let (changed_tx, changed_rx) = oneshot::channel::<()>();
             let project_root = server_ctx.project_root();
-            let claims = &claims;
+            let watched = &watched;
             let mut dice = ctx.ctx();
             let (built, interrupted) = dice
                 .compute2(
@@ -764,7 +1006,7 @@ async fn dev(
                     },
                     async move |dice| {
                         tokio::select! {
-                            interrupted = changed_files(dice, changes, claims, builds, io) => {
+                            interrupted = changed_files(dice, changes, watched, io) => {
                                 let _ignored = changed_tx.send(());
                                 Some(interrupted)
                             }
@@ -774,7 +1016,7 @@ async fn dev(
                 )
                 .await;
             match (built, interrupted) {
-                (Some(built), _) => Ok(DevResponse::Build(built?)),
+                (Some(built), _) => finish(built),
                 (None, Some(interrupted)) => Ok(DevResponse::Interrupted(interrupted)),
                 (None, None) => Err(internal_error!(
                     "A `buck2 dev` build stopped without a file change"
@@ -834,12 +1076,12 @@ impl FileShape {
 
 /// Wait for a file that the build is built from to change from what this command saw, and say
 /// which did. A file saved without a change, and one that nothing builds from, are no change.
-/// `builds` has the slots of the outputs that the build has yet to finish.
+/// `claims` has the claims of the target, and of each dynamic output that the build builds, each
+/// with the slots of the outputs that the build has yet to finish.
 async fn changed_files(
     dice: &mut DiceComputations<'_>,
     mut changes: BoxStream<'static, FileChangeBatch>,
-    claims: &DevClaims,
-    builds: &AtomicU64,
+    claims: &[(&DevClaims, &AtomicU64)],
     io: Arc<dyn IoProvider>,
 ) -> DevInterrupted {
     while let Some(batch) = changes.next().await {
@@ -851,11 +1093,11 @@ async fn changed_files(
         }
         let mut changed = Vec::new();
         for path in batch.paths {
-            if !claims.may_claim(&path) {
+            if !claims.iter().any(|(claims, _)| claims.may_claim(&path)) {
                 continue;
             }
             // A path that cannot be looked at counts as changed.
-            if builds_from_changed(dice, claims, builds.load(Ordering::SeqCst), &io, &path)
+            if builds_from_changed(dice, claims, &io, &path)
                 .await
                 .unwrap_or(true)
             {
@@ -873,21 +1115,30 @@ async fn changed_files(
     futures::future::pending().await
 }
 
-/// Whether the build, of the slots `builds`, is built from `path`, and the file differs from
-/// what this command saw.
+/// Whether what the build has yet to finish, the slots of each of `claims`, is built from
+/// `path`, and the file differs from what this command saw.
 async fn builds_from_changed(
     dice: &mut DiceComputations<'_>,
-    claims: &DevClaims,
-    builds: u64,
+    claims: &[(&DevClaims, &AtomicU64)],
     io: &Arc<dyn IoProvider>,
     path: &ProjectRelativePath,
 ) -> buck2_error::Result<bool> {
     let cell_resolver = dice.get_cell_resolver().await?;
-    let relevant = match claims.classify(dice, cell_resolver, path).await? {
-        Claimed::Source { may, .. } => may & builds != 0,
-        Claimed::BuildFile | Claimed::Bzl => true,
-        Claimed::Nothing => false,
-    };
+    let mut relevant = false;
+    for (claims, builds) in claims {
+        let builds = builds.load(Ordering::SeqCst);
+        if builds == 0 || !claims.may_claim(path) {
+            continue;
+        }
+        relevant = match claims.classify(dice, cell_resolver, path).await? {
+            Claimed::Source { may, .. } => may & builds != 0,
+            Claimed::BuildFile | Claimed::Bzl => true,
+            Claimed::Nothing => false,
+        };
+        if relevant {
+            break;
+        }
+    }
     if !relevant {
         return Ok(false);
     }
@@ -1029,6 +1280,7 @@ async fn build(
                     let mut built = DevBuilt {
                         outputs: BTreeMap::new(),
                         failed: BTreeMap::new(),
+                        dynamic: BTreeMap::new(),
                     };
                     match result {
                         Ok(output) => {
@@ -1058,7 +1310,11 @@ async fn build(
             None => {}
         }
     }
-    Ok(DevBuilt { outputs, failed })
+    Ok(DevBuilt {
+        outputs,
+        failed,
+        dynamic: BTreeMap::new(),
+    })
 }
 
 /// What the server gets of an output that built, from its artifacts and those of its sidecars,
@@ -1235,16 +1491,16 @@ impl GraphClaims {
 /// dependencies.
 ///
 /// This reads the contents of no source file, so that a `DevClaims` made from it stays valid
-/// when one changes.
+/// when one changes. The target patterns of the scopes are relative to `cell`.
 async fn graph_claims(
     dice: &mut DiceComputations<'_>,
     subject: &DevSubject,
     policy: &Policy,
+    cell: CellName,
 ) -> buck2_error::Result<GraphClaims> {
     let slots = &policy.slots;
     let mut timer = Timer::new();
     let cell_resolver = dice.get_cell_resolver().await?;
-    let cell = subject.cell();
     let cell_alias_resolver = dice.get_cell_alias_resolver(cell).await?;
 
     let scope_patterns: Vec<Vec<ParsedPattern<TargetPatternExtra>>> = policy
@@ -2005,7 +2261,7 @@ impl Key for DevClaimsKey {
         _cancellations: &CancellationContext,
     ) -> Self::Value {
         let policy = dev_slots(ctx, &self.0).await?;
-        let claims = graph_claims(ctx, &self.0, &policy).await?;
+        let claims = graph_claims(ctx, &self.0, &policy, self.0.cell()).await?;
         Ok(Arc::new(DevClaims::new(ctx, claims).await?))
     }
 
@@ -2043,6 +2299,162 @@ async fn dev_slots(
     dev_policy(info.view(), resource_inputs(&resources)?)
 }
 
+/// The handler of a dynamic output, as a bxl function with the output's arguments.
+async fn dynamic_subject(
+    server_ctx: &dyn ServerCommandContextTrait,
+    ctx: &DiceTransaction,
+    subject: &DevSubject,
+    info: &DevProvider,
+    global_cfg_options: &GlobalCfgOptions,
+    call: &DevDynamicCall,
+) -> buck2_error::Result<DevSubject> {
+    let label = info
+        .view()
+        .handlers()
+        .into_iter()
+        .find(|(name, _)| *name == call.handler)
+        .map(|(_, label)| label)
+        .ok_or_else(|| DevError::UnknownHandler {
+            subject: subject.dupe(),
+            name: call.handler.clone(),
+        })?;
+    DevSubject::bxl(server_ctx, ctx, &label, &call.args, global_cfg_options)
+        .await
+        .with_buck_error_context(|| format!("For handler `{}`", call.handler))
+}
+
+/// The handler of a dynamic output, and what to build for it.
+async fn resolve_dynamic(
+    server_ctx: &dyn ServerCommandContextTrait,
+    ctx: &DiceTransaction,
+    subject: &DevSubject,
+    info: &DevProvider,
+    outputs: &BuckMutInsertionMap<String, DevOutputSpec>,
+    global_cfg_options: &GlobalCfgOptions,
+    call: &DevDynamicCall,
+) -> buck2_error::Result<(DevSubject, DevOutputSpec)> {
+    if outputs.contains_key(&call.name) {
+        return Err(DevError::DynamicNameTaken(call.name.clone()).into());
+    }
+    let handler =
+        dynamic_subject(server_ctx, ctx, subject, info, global_cfg_options, call).await?;
+    let output = handler_output(&mut ctx.ctx(), &handler).await?;
+    Ok((handler, output))
+}
+
+/// The output of a handler: the one default output of the providers that it returns.
+async fn handler_output(
+    dice: &mut DiceComputations<'_>,
+    handler: &DevSubject,
+) -> buck2_error::Result<DevOutputSpec> {
+    let providers = handler.providers(dice).await?;
+    let what = match handler {
+        DevSubject::Bxl { key, .. } => key.to_string(),
+        DevSubject::Target(label) => label.to_string(),
+    };
+    Ok(DevOutputSpec::Artifact(DevArtifact::of_default_info(
+        &providers, &what,
+    )?))
+}
+
+/// The `Policy` of a dynamic output `name`: an empty slot for the server, and one for the
+/// output. Only its names and scopes are used.
+fn dynamic_policy(name: &str, scopes: Vec<(String, Vec<String>)>) -> Policy {
+    Policy {
+        names: vec![name.to_owned()],
+        slots: vec![
+            Slot {
+                what: "`DevInfo.server`".to_owned(),
+                inputs: Vec::new(),
+            },
+            Slot {
+                what: format!("Dynamic output `{name}`"),
+                inputs: Vec::new(),
+            },
+        ],
+        scopes,
+    }
+}
+
+/// The `DevClaims` of a dynamic output: what the output of `handler`, a bxl function with its
+/// arguments, may be built from, with the scopes of the `DevInfo` of `main`. Its slot 1 is the
+/// output, and slot 0 claims nothing.
+///
+/// The key does not name the output: outputs that call the same handler with the same arguments
+/// share it.
+#[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[pagable_typetag(dice::DiceKeyDyn)]
+struct DevDynamicClaimsKey {
+    main: DevSubject,
+    handler: DevSubject,
+}
+
+impl std::fmt::Display for DevDynamicClaimsKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DevDynamicClaims({}, {})", self.main, self.handler)
+    }
+}
+
+#[async_trait]
+impl Key for DevDynamicClaimsKey {
+    type Value = buck2_error::Result<Arc<DevClaims>>;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellations: &CancellationContext,
+    ) -> Self::Value {
+        let providers = self.main.providers(ctx).await?;
+        let info = DevProvider::of(&providers, &self.main)?;
+        let scopes: Vec<(String, Vec<String>)> = info.view().scopes().into_iter().collect();
+        let output = handler_output(ctx, &self.handler).await?;
+        let policy = Policy {
+            names: vec![String::new()],
+            slots: vec![
+                Slot {
+                    what: "`DevInfo.server`".to_owned(),
+                    inputs: Vec::new(),
+                },
+                Slot {
+                    what: format!("The output of {}", self.handler),
+                    inputs: output.groups(),
+                },
+            ],
+            scopes,
+        };
+        let claims = graph_claims(ctx, &self.handler, &policy, self.main.cell()).await?;
+        Ok(Arc::new(DevClaims::new(ctx, claims).await?))
+    }
+
+    fn equality_behavior() -> EqualityBehavior<Self::Value> {
+        EqualityBehavior::Compare(|x, y| match (x, y) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        })
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        x.is_ok()
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        NoValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn dynamic_claims(
+    dice: &mut DiceComputations<'_>,
+    main: &DevSubject,
+    handler: DevSubject,
+) -> buck2_error::Result<Arc<DevClaims>> {
+    dice.compute(&DevDynamicClaimsKey {
+        main: main.dupe(),
+        handler,
+    })
+    .await?
+    .dupe()
+}
+
 /// Say what the requested paths are to the server and to the outputs, and whose targets
 /// changed since `request.previous`. Whether a file changed is not said here: a path that
 /// `buck2 dev` asks about did.
@@ -2051,17 +2463,49 @@ async fn watch_files(
     subject: &DevSubject,
     policy: &Policy,
     request: &DevWatchRequest,
-    session: &str,
-) -> buck2_error::Result<DevWatched> {
-    let mut outputs = OutputChanges::new(policy);
+) -> buck2_error::Result<(DevWatched, Arc<DevClaims>)> {
     let claims = dev_claims(dice, subject).await?;
-    // From here on the session's file change subscription drops the changes that cannot matter
-    // to these claims. `buck2 dev` asks again after every change that is let through, and so
-    // after every change to the claims.
-    set_interest(session, claims.interest.dupe());
+    let changes = claims_changes(
+        dice,
+        &claims,
+        policy,
+        &request.paths,
+        request.previous.as_ref(),
+        request.missed && request.previous.is_some(),
+    )
+    .await?;
+    let watched = DevWatched {
+        state: changes.state,
+        graph_changed: changes.graph_changed,
+        incomplete: claims.incomplete.clone(),
+        outputs: changes.changes,
+        dynamic: BTreeMap::new(),
+    };
+    Ok((watched, claims))
+}
+
+/// What changes are to the slots of some claims.
+struct ClaimsChanges {
+    changes: DevOutputChanges,
+    state: DevWatchState,
+    /// A build file or a `.bzl` file of the graph, or a target, changed since `previous`.
+    graph_changed: bool,
+}
+
+/// Say what `paths` are to the slots of `claims`, of which `policy` names the outputs, and whose
+/// targets changed since `previous`. With `missed`, anything may have changed.
+async fn claims_changes(
+    dice: &mut DiceComputations<'_>,
+    claims: &DevClaims,
+    policy: &Policy,
+    paths: &[String],
+    previous: Option<&DevWatchState>,
+    missed: bool,
+) -> buck2_error::Result<ClaimsChanges> {
+    let mut outputs = OutputChanges::new(policy);
     let cell_resolver = dice.get_cell_resolver().await?;
 
-    for path in &request.paths {
+    for path in paths {
         let Ok(rel) = ProjectRelativePath::new(path) else {
             continue;
         };
@@ -2073,7 +2517,7 @@ async fn watch_files(
 
     let state = claims.state();
     // The groups of targets that changed; see `GraphClaims::groups`.
-    let (changed_groups, every, graph_changed) = match &request.previous {
+    let (changed_groups, every, graph_changed) = match previous {
         None => (Vec::new(), false, false),
         Some(previous) => {
             // A `.bzl` file may change what any rule does, so it changes every group.
@@ -2106,14 +2550,19 @@ async fn watch_files(
         }
     };
 
-    if request.missed && request.previous.is_some() {
+    if missed {
         outputs.missed();
     }
-    Ok(DevWatched {
+    Ok(ClaimsChanges {
+        changes: outputs.finish(
+            &changed_groups,
+            every,
+            graph_changed,
+            previous.is_some(),
+            claims,
+        ),
         state,
         graph_changed,
-        incomplete: claims.incomplete.clone(),
-        outputs: outputs.finish(&changed_groups, every, graph_changed, &claims),
     })
 }
 
@@ -2177,26 +2626,41 @@ impl<'a> OutputChanges<'a> {
         }
     }
 
+    /// A change to the graph for `slot`, in the scopes `scopes`: the requested paths that are
+    /// build files or `.bzl` files of the graph.
+    fn add_graph(&mut self, slot: usize, scopes: u64, graph_paths: &[String]) {
+        if graph_paths.is_empty() {
+            // The targets changed, but no requested path says why, as after a change to a
+            // `.buckconfig` file.
+            self.add(slot, None, scopes);
+        }
+        for path in graph_paths {
+            self.add(slot, Some(path.clone()), scopes);
+        }
+    }
+
     /// The groups of targets `changed_groups` changed, each a slot and the scopes of its
-    /// targets. With `every`, a `.bzl` file changed, which is in no scope.
+    /// targets. With `every`, a `.bzl` file changed, which is in no scope, and which may change
+    /// every output, also one that no target builds. Without `previous_known`, there was no
+    /// earlier answer to compare with, and a build file or `.bzl` file of the graph among the
+    /// requested paths may have changed any output.
     fn finish(
         mut self,
         changed_groups: &[(usize, u64)],
         every: bool,
         graph_changed: bool,
+        previous_known: bool,
         claims: &DevClaims,
     ) -> DevOutputChanges {
         self.changes.server |= graph_changed;
         let graph_paths = std::mem::take(&mut self.graph_paths);
         for (slot, scopes) in changed_groups {
             let scopes = if every { 0 } else { *scopes };
-            if graph_paths.is_empty() {
-                // The targets changed, but no requested path says why, as after a change to a
-                // `.buckconfig` file.
-                self.add(*slot, None, scopes);
-            }
-            for path in &graph_paths {
-                self.add(*slot, Some(path.clone()), scopes);
+            self.add_graph(*slot, scopes, &graph_paths);
+        }
+        if every || (!previous_known && !graph_paths.is_empty()) {
+            for slot in 1..self.policy.slots.len() {
+                self.add_graph(slot, 0, &graph_paths);
             }
         }
         self.changes.targets = claims.claimed_targets;

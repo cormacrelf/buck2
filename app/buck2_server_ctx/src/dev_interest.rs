@@ -83,6 +83,22 @@ impl FileInterest {
         }
     }
 
+    /// What may matter to any of `interests`: the session's target, and the dynamic outputs
+    /// that its server defined, each with a graph of its own.
+    pub fn union<'a>(interests: impl IntoIterator<Item = &'a FileInterest>) -> FileInterest {
+        let mut union = FileInterest::default();
+        for interest in interests {
+            union.package_dirs.extend(&interest.package_dirs);
+            union.above.extend(&interest.above);
+            union.files.extend(&interest.files);
+        }
+        for hashes in [&mut union.package_dirs, &mut union.above, &mut union.files] {
+            hashes.sort_unstable();
+            hashes.dedup();
+        }
+        union
+    }
+
     /// Whether `dir` is the directory of a package of the graph.
     pub fn is_package_dir(&self, dir: &ProjectRelativePath) -> bool {
         self.package_dirs
@@ -278,6 +294,18 @@ pub fn set_interest(session: &str, interest: Arc<FileInterest>) {
     });
 }
 
+/// Add `interest` to the interest of `session`, if it has one: a build found what new dynamic
+/// outputs are built from, before the next request that leaves the whole interest.
+pub fn add_interest(session: &str, interest: &FileInterest) {
+    with_sessions(|sessions| {
+        if let Some(session) = sessions.get_mut(session) {
+            if let Some(old) = &session.interest {
+                session.interest = Some(Arc::new(FileInterest::union([&**old, interest])));
+            }
+        }
+    });
+}
+
 /// Forget the interest of `session`, so that its subscriptions send every change again: its
 /// target could not be analysed, and what fixes that may be outside what it was built from.
 pub fn clear_interest(session: &str) {
@@ -319,5 +347,18 @@ mod tests {
         assert!(interest.may_matter(path("PACKAGE")));
         assert!(interest.may_matter(path("other/.buckconfig")));
         assert!(interest.may_matter(path(".buckconfig.d/local")));
+    }
+
+    #[test]
+    fn test_union() {
+        let a = FileInterest::new([path("app")], [stable_hash("defs.bzl")]);
+        let b = FileInterest::new([path("libs/a")], [stable_hash("dev.bxl")]);
+        let union = FileInterest::union([&a, &b]);
+        assert!(union.may_claim(path("app/main.txt")));
+        assert!(union.may_claim(path("libs/a/lib.txt")));
+        assert!(union.may_claim(path("defs.bzl")));
+        assert!(union.may_claim(path("dev.bxl")));
+        assert!(union.may_matter(path("libs")));
+        assert!(!union.may_matter(path("other/main.txt")));
     }
 }

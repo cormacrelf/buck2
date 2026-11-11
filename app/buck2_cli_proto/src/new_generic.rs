@@ -169,7 +169,8 @@ pub enum DevAction {
     /// to the server and to each output. Finding what they may be built from, when the graph
     /// changed, may build what dynamic actions need to say what they do.
     Watch(DevWatchRequest),
-    /// Build the named `DevInfo.outputs`, which the server asked for. The build stops if a file
+    /// Build the named outputs, which the server asked for: `DevInfo.outputs`, and dynamic
+    /// outputs. The build stops if a file
     /// that it builds from changes. With `streaming`, the result of each output but the last to
     /// finish is a `NewGenericPartialResult::Dev` as soon as it is known, and the response has
     /// the last; a change to a file of an output that is done no longer stops the build.
@@ -177,6 +178,9 @@ pub enum DevAction {
         outputs: Vec<String>,
         #[serde(default)]
         streaming: bool,
+        /// The calls of the dynamic outputs among `outputs`. The others are `DevInfo.outputs`.
+        #[serde(default)]
+        dynamic: Vec<DevDynamicCall>,
     },
     /// Release the local resources that the daemon holds for the session, and wait until they
     /// are gone. `buck2 dev` sends it after it has stopped the server.
@@ -216,6 +220,9 @@ pub struct DevServer {
     pub outputs: Vec<String>,
     /// The names of `DevInfo.scopes`.
     pub scopes: Vec<String>,
+    /// The names of `DevInfo.handlers`.
+    #[serde(default)]
+    pub handlers: Vec<String>,
     /// `DevInfo.interactive`: the server gets the terminal.
     pub interactive: bool,
     /// The environment variables that the local resources give the server.
@@ -238,6 +245,40 @@ pub struct DevWatchRequest {
     pub previous: Option<DevWatchState>,
     /// The file watcher missed changes since `previous`, so anything may have changed.
     pub missed: bool,
+    /// The dynamic outputs that the server tracks, each with the `state` of its last answer.
+    #[serde(default)]
+    pub dynamic: Vec<DevDynamicWatch>,
+}
+
+/// An output that the server defined at run time: a call of a handler of `DevInfo.handlers`, a
+/// bxl function, with arguments.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct DevDynamicCall {
+    /// The name that the server gave the output.
+    pub name: String,
+    /// The name of the handler in `DevInfo.handlers`.
+    pub handler: String,
+    /// The command line arguments of the bxl function.
+    pub args: Vec<String>,
+}
+
+/// A dynamic output, to say what changes are to it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DevDynamicWatch {
+    pub call: DevDynamicCall,
+    /// The `state` of the last answer about it, or of the build that last built it. `None` if
+    /// there was none, or the handler failed then.
+    pub previous: Option<DevWatchState>,
+}
+
+/// What a `Watch` says of a dynamic output, besides its changes, which are in
+/// `DevOutputChanges.outputs` under its name.
+#[derive(Serialize, Deserialize)]
+pub struct DevDynamicWatched {
+    /// `None` if the handler, or finding what the output is built from, failed.
+    pub state: Option<DevWatchState>,
+    /// A build file or a `.bzl` file of its graph, or a target, changed since `previous`.
+    pub graph_changed: bool,
 }
 
 /// Digests that say whether the targets of the server and the outputs, or the graph, changed.
@@ -276,8 +317,11 @@ pub struct DevWatched {
     /// Empty when everything was found.
     pub incomplete: Vec<String>,
     /// What the requested paths, and the changes since `previous`, are to the server and to
-    /// each output.
+    /// each output, dynamic outputs too.
     pub outputs: DevOutputChanges,
+    /// Each of the requested dynamic outputs, by name.
+    #[serde(default)]
+    pub dynamic: BTreeMap<String, DevDynamicWatched>,
 }
 
 /// What changes are to the server and to the outputs. Nothing here is exclusive: one path may be
@@ -312,6 +356,10 @@ pub struct DevBuilt {
     /// The outputs that failed to build, with their errors.
     #[serde(default)]
     pub failed: BTreeMap<String, String>,
+    /// For the dynamic outputs of the build, in the response only: the state that a `Watch`
+    /// compares with, as the build found it.
+    #[serde(default)]
+    pub dynamic: BTreeMap<String, DevWatchState>,
 }
 
 #[derive(Serialize, Deserialize)]

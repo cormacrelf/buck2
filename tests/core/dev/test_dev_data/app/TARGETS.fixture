@@ -297,3 +297,17 @@ dev_app(
     server = "server.py",
     server_args = ["--all-outputs"],
 )
+
+# A server that defines outputs while it runs, with the handlers of `dev.bxl`. Nothing in its
+# graph is in `lib`.
+dev_app(
+    name = "handlers",
+    mode = "outputs",
+    srcs = ["main.txt"],
+    scopes = {"lib": ["//lib:lib"]},
+    handlers = {
+        "broken": "root//dev.bxl:broken_handler",
+        "owner": "root//dev.bxl:owner",
+    },
+    server = "server.py",
+)

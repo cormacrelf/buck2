@@ -15,6 +15,7 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api_derive::internal_provider;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_error::BuckErrorContext;
+use buck2_error::BuckErrorOptionContext;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use dupe::Dupe;
@@ -57,6 +58,7 @@ use crate::interpreter::rule_defs::provider::builtin::dev_output::target_to_patt
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::check_all;
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::iter_local_resources;
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::unwrap_all;
+use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
@@ -73,6 +75,14 @@ enum DevInfoError {
     EmptyCommand,
     #[error("Expected a dictionary with string keys, but got key `{0}`")]
     ExpectedStringKey(String),
+    #[error(
+        "A `DevInfo` handler is a bxl function, `cell//path/to/file.bxl:name`, but handler `{name}` is `{label}`"
+    )]
+    NotABxlFunction { name: String, label: String },
+    #[error(
+        "A `buck2 dev` handler returns a `DefaultInfo` with one default output, but `{0}` returned {1} default outputs"
+    )]
+    NotOneDefaultOutput(String, usize),
 }
 
 /// An artifact of a `DevInfo`, an output or a sidecar, with the artifacts associated with it
@@ -85,6 +95,22 @@ pub struct DevArtifact {
 }
 
 impl DevArtifact {
+    /// The output of a `buck2 dev` handler, `what`: the one artifact in
+    /// `DefaultInfo.default_outputs` of the providers that it returned.
+    pub fn of_default_info(
+        providers: &FrozenProviderCollectionValue,
+        what: &str,
+    ) -> buck2_error::Result<DevArtifact> {
+        let info = providers.provider_collection().default_info()?;
+        let outputs = ListRef::from_value(info.default_outputs_raw())
+            .internal_error("`DefaultInfo.default_outputs` is a list")?;
+        let [output] = outputs.content() else {
+            return Err(DevInfoError::NotOneDefaultOutput(what.to_owned(), outputs.len()).into());
+        };
+        let artifact = ValueAsInputArtifactLike::unpack_value_err(*output)?;
+        DevArtifact::new(&artifact)
+    }
+
     fn new(artifact: &ValueAsInputArtifactLike<'_>) -> buck2_error::Result<DevArtifact> {
         Ok(DevArtifact {
             artifact: artifact.0.get_bound_artifact()?,
@@ -179,6 +205,9 @@ pub struct DevInfo<'v> {
     /// `ExternalRunnerTestInfo.local_resources`. A name without a label is ignored.
     local_resources:
         ValueOfUnchecked<'v, DictType<String, Option<StarlarkConfiguredProvidersLabel>>>,
+    /// Bxl functions, by name, that build outputs that the server defines while it runs: a
+    /// name for each, with the label of the function, `cell//path/to/file.bxl:name`.
+    handlers: ValueOfUnchecked<'v, DictType<String, String>>,
 }
 
 #[starlark_module]
@@ -212,6 +241,11 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
     ///   `LocalResourceInfo` maps. A resource keeps running while the server restarts, and is
     ///   set up again when its setup command is new or it exited. The daemon releases them when
     ///   `buck2 dev` exits.
+    /// * `handlers`: bxl functions that build outputs that the server defines while it runs, by
+    ///   name: a dictionary from a name to the label of a function, `cell//path/to/file.bxl:name`.
+    ///   The server asks for a build of a new output with the name of a handler and the
+    ///   function's arguments. The function returns a list of providers, as a rule does, with a
+    ///   `DefaultInfo` whose one default output is the output.
     #[starlark(as_type = DevInfo<'static>)]
     fn DevInfo<'v>(
         #[starlark(require = named)] server: Value<'v>,
@@ -221,6 +255,8 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
         scopes: UnpackDictEntries<&'v str, UnpackListOrTuple<Value<'v>>>,
         #[starlark(require = named, default = false)] interactive: bool,
         #[starlark(require = named, default = NoneType)] local_resources: Value<'v>,
+        #[starlark(require = named, default = UnpackDictEntries::default())]
+        handlers: UnpackDictEntries<&'v str, &'v str>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<DevInfo<'v>> {
         let heap = eval.heap();
@@ -259,6 +295,15 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
                 Ok((name, heap.alloc(AllocList(patterns))))
             })
             .collect::<buck2_error::Result<Vec<_>>>()?;
+        for (name, label) in &handlers.entries {
+            if !label.contains(".bxl:") {
+                return Err(buck2_error::Error::from(DevInfoError::NotABxlFunction {
+                    name: (*name).to_owned(),
+                    label: (*label).to_owned(),
+                })
+                .into());
+            }
+        }
         let info = DevInfo {
             server: ValueOfUnchecked::new(heap.alloc(server)),
             outputs: ValueOfUnchecked::new(heap.alloc(AllocDict(artifacts))),
@@ -266,6 +311,7 @@ fn dev_info_creator(globals: &mut GlobalsBuilder) {
             sidecars: ValueOfUnchecked::new(heap.alloc(AllocDict(sidecars))),
             interactive: heap.alloc_typed_unchecked(interactive).cast(),
             local_resources: ValueOfUnchecked::new(local_resources),
+            handlers: ValueOfUnchecked::new(heap.alloc(AllocDict(handlers.entries))),
         };
         validate_dev_info(&info)?;
         Ok(info)
@@ -392,6 +438,25 @@ impl<'v> DevInfo<'v> {
     pub fn local_resources(&self) -> Vec<(&'v str, &'v ConfiguredProvidersLabel)> {
         unwrap_all(iter_local_resources(self.local_resources.get()))
             .filter_map(|(name, label)| Some((name, label?)))
+            .collect()
+    }
+
+    /// The handlers, each with the label of its bxl function, in the order that they were given.
+    pub fn handlers(&self) -> Vec<(String, String)> {
+        DictRef::from_value(self.handlers.get())
+            .expect("Value is a Dict")
+            .iter()
+            .map(|(name, label)| {
+                (
+                    name.unpack_str()
+                        .expect("validated at construction")
+                        .to_owned(),
+                    label
+                        .unpack_str()
+                        .expect("validated at construction")
+                        .to_owned(),
+                )
+            })
             .collect()
     }
 

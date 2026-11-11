@@ -177,6 +177,7 @@ def _dev_app(ctx):
             outputs = outputs,
             # `self` stands for the label of this target.
             scopes = {name: [ctx.label if target == "self" else target for target in targets] for name, targets in ctx.attrs.scopes.items()},
+            handlers = ctx.attrs.handlers,
         ),
     ]
 
@@ -188,6 +189,8 @@ dev_app = rule(
         # Whether to return `DevInfo`.
         "dev_info": attrs.bool(default = True),
         "extra_outputs": attrs.dict(attrs.string(), attrs.list(attrs.source()), default = {}),
+        # `DevInfo.handlers`.
+        "handlers": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "mode": attrs.string(),
         "scopes": attrs.dict(attrs.string(), attrs.list(attrs.string()), default = {}),
         "server": attrs.source(),

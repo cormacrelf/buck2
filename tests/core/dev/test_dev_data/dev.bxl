@@ -6,7 +6,8 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# Bxl functions that `buck2 dev` runs in place of a target. See `test_dev_bxl`.
+# Bxl functions that `buck2 dev` runs in place of a target, see `test_dev_bxl`, and handlers of
+# `DevInfo.handlers`, see `test_dev_handlers`.
 
 def _app(ctx):
     """`app/server.py`, with `site`, the default output of `--target`, and `shout`, which an
@@ -43,3 +44,24 @@ def _no_default_info(ctx):
     return [DevInfo(server = cmd_args("python3", ctx.fs.source("app/server.py")))]
 
 no_default_info = bxl_main(impl = _no_default_info, cli_args = {})
+
+def _owner(ctx):
+    """A `buck2 dev` handler: the default output of the target that owns the source file
+    `--path`."""
+    owner = ctx.uquery().owner(ctx.cli_args.path)
+    if len(owner) != 1:
+        fail("{} has {} owners".format(ctx.cli_args.path, len(owner)))
+    target = ctx.configured_targets(owner[0].label)
+    out = ctx.analysis(target).providers()[DefaultInfo].default_outputs[0]
+    return [DefaultInfo(default_output = out)]
+
+owner = bxl_main(
+    impl = _owner,
+    cli_args = {"path": cli_args.string()},
+)
+
+def _broken_handler(_ctx):
+    """A handler whose output is not one artifact."""
+    return [DefaultInfo()]
+
+broken_handler = bxl_main(impl = _broken_handler, cli_args = {})

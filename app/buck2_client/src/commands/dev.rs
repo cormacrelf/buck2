@@ -36,6 +36,8 @@ use buck2_cli_proto::new_generic::DevAction;
 use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
 use buck2_cli_proto::new_generic::DevChange;
+use buck2_cli_proto::new_generic::DevDynamicCall;
+use buck2_cli_proto::new_generic::DevDynamicWatch;
 use buck2_cli_proto::new_generic::DevRequest;
 use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::DevServer;
@@ -530,7 +532,7 @@ enum Request {
         version: u64,
     },
     Build {
-        outputs: Vec<String>,
+        outputs: BuildOutputs,
         /// Send the result of each output as soon as it is known, rather than all of them at
         /// the end.
         #[serde(default)]
@@ -544,6 +546,10 @@ enum Request {
         r#gen: u64,
         outputs: Vec<String>,
     },
+    /// Stop tracking `outputs`. Dynamic outputs among them are no longer defined.
+    Forget {
+        outputs: Vec<String>,
+    },
     Restart,
     /// For tests only, and only with `BUCK2_DEV_TEST_SYNC` set: answered with
     /// `{"type": "_synced", "id": id}` once `buck2 dev` has handled the requests before it and
@@ -553,6 +559,31 @@ enum Request {
     Sync {
         id: u64,
     },
+}
+
+/// The outputs of a `build` request: names, or names each with `null` for an output that is
+/// known, or a call of a handler, which defines a dynamic output of that name.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum BuildOutputs {
+    Names(Vec<String>),
+    Calls(BTreeMap<String, Option<HandlerCall>>),
+}
+
+/// A call of a handler of `DevInfo.handlers`, as the server gives it.
+#[derive(serde::Deserialize)]
+struct HandlerCall {
+    handler: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+/// A dynamic output that the server defined.
+struct Dynamic {
+    call: DevDynamicCall,
+    /// What the daemon last said of its targets, to send back with the next `Watch`. `None`
+    /// before that, or if its handler failed then.
+    state: Option<DevWatchState>,
 }
 
 /// Whether the server may send `_sync`. See `Request::Sync`.
@@ -833,6 +864,7 @@ impl ServerLink {
                             "version": version,
                             "outputs": info.outputs,
                             "scopes": info.scopes,
+                            "handlers": info.handlers,
                         }));
                         if let Some(stale) = stale {
                             server.send(stale);
@@ -1029,6 +1061,8 @@ struct Session<'a> {
     delivered: Delivered,
     /// The outputs that the running server asked for, by name.
     tracked: BTreeMap<String, Tracked>,
+    /// The dynamic outputs that the running server defined, by name. Each is tracked too.
+    dynamic: BTreeMap<String, Dynamic>,
     /// The outputs of builds that the daemon stopped since `buck2 dev` last asked it about
     /// changes, each with the paths that stopped them. The empty path stands for the project.
     /// The next answer makes each of them stale, even if it says nothing of them.
@@ -1063,8 +1097,8 @@ struct Building {
     /// The outputs whose results the server was sent. If another command preempted the build,
     /// the daemon builds them again, but the server gets each once.
     sent: BTreeSet<String>,
-    /// How many outputs the server got, and how many failed.
-    built: usize,
+    /// The outputs that the server got, and how many failed.
+    built: BTreeSet<String>,
     failed: usize,
 }
 
@@ -1149,6 +1183,7 @@ fn send_built(
     let DevBuilt {
         mut outputs,
         mut failed,
+        dynamic: _,
     } = built;
     outputs.retain(|name, _| !building.sent.contains(name));
     failed.retain(|name, _| !building.sent.contains(name));
@@ -1157,7 +1192,7 @@ fn send_built(
     }
     building.sent.extend(outputs.keys().cloned());
     building.sent.extend(failed.keys().cloned());
-    building.built += outputs.len();
+    building.built.extend(outputs.keys().cloned());
     building.failed += failed.len();
     let names: Vec<String> = outputs.keys().cloned().collect();
     let mut message = json!({
@@ -1260,6 +1295,7 @@ impl<'a> Session<'a> {
             building: None,
             delivered: Delivered::default(),
             tracked: BTreeMap::new(),
+            dynamic: BTreeMap::new(),
             stopped: BTreeMap::new(),
             unacted: BTreeSet::new(),
             resolve_due: false,
@@ -1287,6 +1323,7 @@ impl<'a> Session<'a> {
             paths: Vec::new(),
             previous: None,
             missed: false,
+            dynamic: Vec::new(),
         };
         match self.request(|| DevAction::Watch(request.clone())).await? {
             Outcome::Done(DevResponse::Watch(watched)) => {
@@ -1448,9 +1485,12 @@ impl<'a> Session<'a> {
                 streaming,
                 stale_until_ack,
             } => {
+                let (outputs, invalid) = self.define(outputs);
                 // From now on, the server hears when these are stale.
                 for name in &outputs {
-                    self.tracked.entry(name.clone()).or_default();
+                    if !invalid.iter().any(|call| call.name == *name) {
+                        self.tracked.entry(name.clone()).or_default();
+                    }
                 }
                 // The graph changed, or the analysis or the server's build failed, since the
                 // server was last built. This build uses the files as they are, so the server has
@@ -1467,12 +1507,18 @@ impl<'a> Session<'a> {
                         return Ok(());
                     }
                 }
-                self.build(outputs, streaming, stale_until_ack).await?;
+                self.build(outputs, invalid, streaming, stale_until_ack)
+                    .await?;
             }
             Request::Ack {
                 r#gen: generation,
                 outputs,
             } => self.ack(generation, outputs)?,
+            Request::Forget { outputs } => {
+                for name in outputs {
+                    self.forget(&name);
+                }
+            }
             Request::Restart => self.restart().await?,
             // Answered as soon as it arrives.
             Request::Hello { .. } => {}
@@ -1480,6 +1526,57 @@ impl<'a> Session<'a> {
             Request::Sync { .. } => {}
         }
         Ok(())
+    }
+
+    /// Take the outputs of a `build` request: define the dynamic outputs that it calls handlers
+    /// for. Returns the names of the outputs to build, and the calls that define no output, for
+    /// the daemon to say why they fail: those of an unknown handler, or with the name of an
+    /// output of the `DevInfo`.
+    fn define(&mut self, outputs: BuildOutputs) -> (Vec<String>, Vec<DevDynamicCall>) {
+        let calls = match outputs {
+            BuildOutputs::Names(names) => return (names, Vec::new()),
+            BuildOutputs::Calls(calls) => calls,
+        };
+        let mut names = Vec::with_capacity(calls.len());
+        let mut invalid = Vec::new();
+        for (name, call) in calls {
+            names.push(name.clone());
+            let Some(HandlerCall { handler, args }) = call else {
+                continue;
+            };
+            let call = DevDynamicCall {
+                name: name.clone(),
+                handler,
+                args,
+            };
+            if self.server_info.outputs.contains(&name) {
+                invalid.push(call);
+                continue;
+            }
+            if self
+                .dynamic
+                .get(&name)
+                .is_some_and(|dynamic| dynamic.call == call)
+            {
+                continue;
+            }
+            // Another call is another output, which the server does not have.
+            self.forget(&name);
+            if !self.server_info.handlers.contains(&call.handler) {
+                invalid.push(call);
+                continue;
+            }
+            self.dynamic.insert(name, Dynamic { call, state: None });
+        }
+        (names, invalid)
+    }
+
+    /// Stop tracking output `name`. A dynamic output is no longer defined.
+    fn forget(&mut self, name: &str) {
+        self.tracked.remove(name);
+        self.dynamic.remove(name);
+        self.stopped.remove(name);
+        self.delivered.fresh.remove(name);
     }
 
     /// Ask the daemon what changed, and act on it. The server's command is built again if it may
@@ -1495,6 +1592,14 @@ impl<'a> Session<'a> {
             paths: self.unacted.iter().cloned().collect(),
             previous: self.watched.state.clone(),
             missed,
+            dynamic: self
+                .dynamic
+                .values()
+                .map(|dynamic| DevDynamicWatch {
+                    call: dynamic.call.clone(),
+                    previous: dynamic.state.clone(),
+                })
+                .collect(),
         };
         let watched = match self.request(|| DevAction::Watch(request.clone())).await? {
             Outcome::Done(DevResponse::Watch(watched)) => watched,
@@ -1523,7 +1628,18 @@ impl<'a> Session<'a> {
             graph_changed,
             incomplete,
             outputs: changes,
+            dynamic,
         } = watched;
+        // The dynamic outputs whose graph changed.
+        let mut dynamic_graph_changed = BTreeSet::new();
+        for (name, watched) in dynamic {
+            if let Some(dynamic) = self.dynamic.get_mut(&name) {
+                dynamic.state = watched.state;
+                if watched.graph_changed {
+                    dynamic_graph_changed.insert(name);
+                }
+            }
+        }
         // Without a state there is nothing to compare with: the session started without an
         // answer.
         let graph_changed = self.watched.state.is_none() || graph_changed;
@@ -1571,7 +1687,9 @@ impl<'a> Session<'a> {
             // A build since the changes were read has used them already. Not a change to the
             // graph, though: a new file that a target takes in does not stop a build that is
             // running.
-            let fresh = fresh.get(&name).filter(|_| !graph_changed);
+            let fresh = fresh
+                .get(&name)
+                .filter(|_| !graph_changed && !dynamic_graph_changed.contains(&name));
             for change in list {
                 let used = match (fresh, &change.path) {
                     (Some(fresh), Some(path)) => fresh.contains(path),
@@ -1716,9 +1834,11 @@ impl<'a> Session<'a> {
     /// it. With `streaming`, the server gets each output as soon as it is built. The daemon
     /// stops the build if a file that an output that is not built yet builds from changes;
     /// other changes during the build are handled after it.
+    /// `invalid` are calls that define no dynamic output, for the daemon to say why.
     async fn build(
         &mut self,
         outputs: Vec<String>,
+        invalid: Vec<DevDynamicCall>,
         streaming: bool,
         stale_until_ack: bool,
     ) -> buck2_error::Result<()> {
@@ -1726,6 +1846,16 @@ impl<'a> Session<'a> {
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect();
+        let dynamic: Vec<DevDynamicCall> = outputs
+            .iter()
+            .filter_map(|name| {
+                invalid
+                    .iter()
+                    .find(|call| call.name == *name)
+                    .or_else(|| self.dynamic.get(name).map(|dynamic| &dynamic.call))
+                    .cloned()
+            })
             .collect();
         // The changes since the server last got each output.
         let root = &self.server_info.project_root;
@@ -1751,13 +1881,14 @@ impl<'a> Session<'a> {
             generation,
             stale_until_ack,
             sent: BTreeSet::new(),
-            built: 0,
+            built: BTreeSet::new(),
             failed: 0,
         });
         let outcome = self
             .request(|| DevAction::Build {
                 outputs: outputs.clone(),
                 streaming,
+                dynamic: dynamic.clone(),
             })
             .await;
         let mut building = self
@@ -1781,8 +1912,9 @@ impl<'a> Session<'a> {
                 );
                 self.last_build = Some(("failed", started.elapsed()));
             }
-            Outcome::Done(DevResponse::Build(built)) => {
+            Outcome::Done(DevResponse::Build(mut built)) => {
                 let known: BTreeSet<String> = self.queued.union(&self.unacted).cloned().collect();
+                let states = std::mem::take(&mut built.dynamic);
                 send_built(
                     &mut self.link,
                     &mut self.tracked,
@@ -1792,7 +1924,16 @@ impl<'a> Session<'a> {
                     &known,
                     true,
                 );
-                let result = match (building.built, building.failed) {
+                // What a dynamic output that built is built from, as the build found it. The
+                // next `Watch` says what changed since.
+                for (name, state) in states {
+                    if let Some(dynamic) = self.dynamic.get_mut(&name) {
+                        if building.built.contains(&name) {
+                            dynamic.state = Some(state);
+                        }
+                    }
+                }
+                let result = match (building.built.len(), building.failed) {
                     (_, 0) => "succeeded",
                     (0, _) => "failed",
                     _ => "partly failed",
@@ -1851,7 +1992,7 @@ impl<'a> Session<'a> {
             ));
         }
         for name in outputs {
-            if !self.server_info.outputs.contains(&name) {
+            if !self.server_info.outputs.contains(&name) && !self.dynamic.contains_key(&name) {
                 self.link.console.message(format!(
                     "`buck2 dev` ignored an `ack` from the server for `{name}`, which is not an output"
                 ))?;
@@ -2012,8 +2153,9 @@ impl<'a> Session<'a> {
         // The new server asks for what it needs.
         self.link.requests.clear();
         self.delivered = Delivered::default();
-        // The new server has asked for nothing yet.
+        // The new server has asked for nothing yet, and defined no output.
         self.tracked.clear();
+        self.dynamic.clear();
         self.stopped.clear();
         if let Err(e) = self.spawn().await {
             self.link.console.message(format!(

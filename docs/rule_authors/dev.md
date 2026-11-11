@@ -20,6 +20,8 @@ function can return them in place of a target (see
 - `outputs`: the artifacts that `buck2 dev` can build, by name. It builds one
   only when the server asks for it, and tells the server when one that it asked
   for is stale. See [Stale outputs](#stale-outputs).
+- `handlers`: bxl functions that build outputs that the server defines while
+  it runs. See [Handlers](#handlers).
 - `scopes`: named sets of targets, which say where a change was. See
   [Scopes](#scopes).
 - `interactive`: whether the server gets the terminal. See
@@ -548,6 +550,93 @@ be a `DevOutput` with `sidecars`. What its artifacts are built from counts as
 what the output may be built from. Only an artifact by itself is an artifact
 output: `cmd_args(exe)` is a command line, whose `argv` is the path of `exe`.
 
+## Handlers
+
+`DevInfo.outputs` is fixed when the target is analysed. Some servers only know
+what they need while they run, and it can be thousands of things. A dev server
+for ES modules learns that a page needs `/src/components/Button.tsx` when the
+browser asks for it, and only then. Such a server defines outputs itself, with
+handlers.
+
+A handler is a bxl function. `DevInfo(handlers = ...)` names them: a dictionary
+from a name to the label of a function, `cell//path/to/file.bxl:name`, as
+`buck2 bxl` takes it. It works in a `DevInfo` of a rule, and in one that a bxl
+function returns. `ready` names the handlers.
+
+```python
+DevInfo(
+    server = server,
+    outputs = {"index": index},
+    handlers = {"module": "root//tools/dev.bxl:module"},
+)
+```
+
+The function returns a list of providers, as a rule does. Its output is the
+one artifact in `DefaultInfo.default_outputs`:
+
+```python
+def _module(ctx):
+    owner = ctx.uquery().owner(ctx.cli_args.path)[0]
+    modules = ctx.analysis(ctx.configured_targets(owner.label)).providers()[JsModules]
+    return [DefaultInfo(default_output = modules.js[ctx.cli_args.path])]
+
+module = bxl_main(impl = _module, cli_args = {"path": cli_args.string()})
+```
+
+The server defines an output in `build`, with a name that it picks, the name of
+a handler, and the function's arguments. `outputs` is then an object, from each
+name to `null` for an output that is already known, or to a call of a handler:
+
+```json
+{"type": "build", "outputs": {
+  "index": null,
+  "src/main.tsx": {"handler": "module", "args": ["--path", "src/main.tsx"]}}}
+```
+
+An output defined like this is a _dynamic output_. From then on it works as an
+output of `DevInfo` does: the server can ask for it by name, and it is in
+`building`, `built`, `stale` and `ack` under its name, with `streaming` and
+`stale_until_ack` as for any output. Defining it again with the same call
+changes nothing. Defining it with another call replaces it, and the server has
+not got the new one.
+
+- A dynamic output fails, in `built.failed`, if the handler is not in
+  `DevInfo.handlers`, if the function fails, or if it returns anything but one
+  artifact in `DefaultInfo.default_outputs`. The other outputs of the build go
+  on.
+- A dynamic output cannot have the name of an output of `DevInfo`. Such a
+  definition fails, and the output of `DevInfo` stays as it was.
+- A dynamic output with an unknown handler, or with the name of an output of
+  `DevInfo`, is not defined, and not tracked.
+- A server that starts, or starts again, has defined no output.
+
+`buck2 dev` evaluates each call with the files as they are at each build, and
+whenever it says what changes are. The daemon keeps the results, so a call is
+evaluated again only after a change to what it used. What a dynamic output may
+be built from is found as for the outputs of a bxl function (see
+[A bxl function in place of a target](#a-bxl-function-in-place-of-a-target)):
+the targets that the walk from the artifact reaches, and their dependencies.
+The handler's file, and the `.bzl` files that it loads, count as `.bzl` files
+for it: a change to them makes its dynamic outputs stale, in no scope. `within`
+uses the scopes of `DevInfo`.
+
+If the function fails, `buck2 dev` does not know what the output is built from.
+Every change then makes it stale, until it builds.
+
+`forget` stops tracking outputs, dynamic or not:
+
+```json
+{"type": "forget", "outputs": ["src/main.tsx"]}
+```
+
+They are not in `stale` again until the server asks for them. A dynamic output
+that is forgotten is no longer defined: to ask for it again, the server defines
+it again. A server that defines many outputs should forget those that it no
+longer needs, such as the modules of a page that is closed.
+
+[`examples/dev_modules`](https://github.com/facebook/buck2/tree/main/examples/dev_modules)
+has a dev server that builds each ES module when the browser asks for it.
+
 ## The server protocol
 
 `buck2 dev` starts the server in the project root, with the environment
@@ -647,7 +736,7 @@ console, and prints only errors and that the server exited or restarts.
 
 | `type`          | Fields                                                    | Sent when                                                                                                    |
 | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ready`         | `version`: as in `hello`, `outputs`: the names in `DevInfo.outputs`, `scopes`: the names in `DevInfo.scopes` | The server sent `hello` with a version that `buck2 dev` speaks.          |
+| `ready`         | `version`: as in `hello`, `outputs`: the names in `DevInfo.outputs`, `scopes`: the names in `DevInfo.scopes`, `handlers`: the names in `DevInfo.handlers` | The server sent `hello` with a version that `buck2 dev` speaks.          |
 | `unsupported`   | `versions`: the versions that `buck2 dev` speaks          | The server sent `hello` with another version.                                                                |
 | `building`      | `gen`, `outputs`: names, `files`: the changes of these outputs since the server got them | The server asked for a build, and it starts.                                     |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), `failed`: name to error if some outputs failed, and `last_of_generation` | A build of at least one output succeeded, or, for a streaming build, an output finished. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. `last_of_generation` is true on the last `built` of the build. |
@@ -698,8 +787,9 @@ are not sent again. Once the analysis works again, the server gets
 | `type`    | Fields                    | Effect                                                                                          |
 | --------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
 | `hello`   | `version`: 1              | Start talking to `buck2 dev`. It answers with `ready`, or `unsupported`. Send it before anything else. |
-| `build`   | `outputs`: a list of names, and optionally `streaming` and `stale_until_ack`, both false by default | Build these outputs now, with all changes, and track them from now on. If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. With `streaming`, each output comes in its own `built` as soon as it is done. With `stale_until_ack`, the outputs stay stale until the server sends `ack`. |
+| `build`   | `outputs`: a list of names, or an object from names to `null` or to `{handler, args}`, and optionally `streaming` and `stale_until_ack`, both false by default | Build these outputs now, with all changes, and track them from now on. A name with `{handler, args}` defines a dynamic output (see [Handlers](#handlers)). If the last analysis failed, `buck2 dev` analyses the target first, and if the server's command is new, restarts the server instead. With `streaming`, each output comes in its own `built` as soon as it is done. With `stale_until_ack`, the outputs stay stale until the server sends `ack`. |
 | `ack`     | `gen`, `outputs`: a list of names | The server is up to date with these outputs as build `gen` left them. See [Saying when the server has an output](#saying-when-the-server-has-an-output). |
+| `forget`  | `outputs`: a list of names | Stop tracking these outputs. A dynamic output among them is no longer defined. No answer. |
 | `restart` |                           | Build the server again and restart it. The new server has asked for nothing. If the build fails, the old server keeps running until the next analysis restarts it. |
 
 `buck2 dev` reads the connection all the time, also while it builds, so a
@@ -753,6 +843,9 @@ the project, and starting it again to carry on building would undo that.
 - When a target, a build file or a `.bzl` file of the graph changes, the daemon
   walks the graph of the target again to find what the server and the outputs
   are built from.
+- Each dynamic output has a graph of its own, and each change is looked up in
+  each of them. So what a change costs grows with the number of dynamic
+  outputs: a few hundred are fine.
 - A file that a `.buckconfig` includes under another name is not reported, so
   a change to it is only seen with the next change that is.
 - A `.buckconfig` change is not a change to what the server or an output is
