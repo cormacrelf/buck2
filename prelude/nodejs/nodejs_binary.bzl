@@ -193,11 +193,10 @@ def stage_nodejs_entries(
             )
         staged[node_name] = node_dist
         name = "__standalone__/" + ctx.label.name
-    transitive_outputs = get_transitive_outputs(ctx.actions, deps = dep_infos)
-
     # Fails on duplicate or nested package directories in the closure.
-    collect_packages(transitive_outputs)
-    packages = {p.dir_name: p for p in direct_packages(dep_infos)}
+    collect_packages(get_transitive_outputs(ctx.actions, deps = dep_infos))
+    direct = direct_packages(dep_infos)
+    packages = {p.dir_name: p for p in direct}
     if "package.json" not in staged:
         # Tools that find the project root beside `node_modules`, such as `module-alias/register`, read it.
         staged["package.json"] = ctx.actions.write_json("app.json", {"name": nodejs_manifest_name(ctx.label.name), "private": True, "version": "0.0.0"})
@@ -214,7 +213,7 @@ def stage_nodejs_entries(
     runtime = staged_dir if dep_infos or data_deps or tree_infos or links or bundled_node or stage or isinstance(ctx.attrs.resources, dict) else None
 
     # What the composed `node_modules` links to.
-    hidden = closure_inputs(transitive_outputs, links)
+    hidden = closure_inputs(ctx.actions, direct, links)
     if lib_info != None:
         entries = [
             NodejsEntry(
@@ -226,7 +225,7 @@ def stage_nodejs_entries(
         entries = [NodejsEntry(name = path, path = cmd_args(runtime, format = "{}/" + path)) for path in mains_by_path]
     else:
         entries = [NodejsEntry(name = path, path = main) for path, main in mains_by_path.items()]
-        hidden = hidden + (list(srcs.values()) if isinstance(srcs, dict) else srcs)
+        hidden = cmd_args(hidden, list(srcs.values()) if isinstance(srcs, dict) else srcs)
 
     return struct(
         dir = staged_dir,

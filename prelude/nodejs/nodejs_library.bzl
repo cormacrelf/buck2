@@ -22,6 +22,7 @@ load(
     "get_transitive_outputs",
     "get_transitive_trees",
     "get_trees",
+    "package_inputs",
     "split_node_modules",
     "strip_type_declarations",
 )
@@ -386,19 +387,18 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
         )
 
     runtime_dir = strip_type_declarations(ctx.actions, package_tree_tool, package_dir, "runtime_dir")
-    closure = {}
-    for link in links:
-        for artifact in link.closure:
-            closure[artifact] = True
+    entry = package_entry(ctx.actions, "entry", ctx.label, dir_name, runtime_dir, direct, links, types = False)
+    types_entry = package_entry(ctx.actions, "types_entry", ctx.label, dir_name, package_dir, direct, links, types = True)
     own_package = NodejsLibraryPackage(
         label = ctx.label,
         package_dir = package_dir,
         package_name = package_name,
         runtime_dir = runtime_dir,
         dir_name = dir_name,
-        entry = package_entry(ctx.actions, "entry", ctx.label, dir_name, runtime_dir, direct, links, types = False),
-        types_entry = package_entry(ctx.actions, "types_entry", ctx.label, dir_name, package_dir, direct, links, types = True),
-        closure = list(closure.keys()),
+        entry = entry,
+        types_entry = types_entry,
+        inputs = package_inputs(ctx.actions, entry, direct, links),
+        types_inputs = package_inputs(ctx.actions, types_entry, direct, links, types = True),
     )
     transitive_outputs = get_transitive_outputs(ctx.actions, value = own_package, deps = dep_infos)
     node_modules = build_node_modules(ctx.actions, "node_modules", transitive_outputs, own_package = own_package)

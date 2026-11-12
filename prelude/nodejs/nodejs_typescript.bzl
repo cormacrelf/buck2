@@ -81,11 +81,10 @@ def compile_typescript(
     stage["package.json"] = package_json
     hidden = []
     if dep_infos or trees or links:
-        transitive_outputs = get_transitive_outputs(actions, deps = dep_infos)
-
         # Fails on duplicate or nested package directories in the closure.
-        collect_packages(transitive_outputs)
-        packages = {p.dir_name: p for p in direct_packages(dep_infos)}
+        collect_packages(get_transitive_outputs(actions, deps = dep_infos))
+        direct = direct_packages(dep_infos)
+        packages = {p.dir_name: p for p in direct}
 
         # Under a real `node_modules` path segment: resolvers realpath-resolve into
         # the tree and then walk ancestor `node_modules` directories.
@@ -97,7 +96,7 @@ def compile_typescript(
             trees,
             links = links,
         ).project("node_modules")
-        hidden = closure_inputs(transitive_outputs, links, types = True)
+        hidden = closure_inputs(actions, direct, links, types = True)
     src_dir = actions.symlinked_dir("ts/s", stage)
 
     out_dir = actions.declare_output("ts/o", dir = True)

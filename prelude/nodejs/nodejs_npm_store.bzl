@@ -7,7 +7,7 @@
 # above-listed licenses.
 
 load("@prelude//:prelude_rule.bzl", "prelude_rule")
-load(":nodejs_providers.bzl", "NodejsLinkedPackage", "NodejsLinksInfo")
+load(":nodejs_providers.bzl", "NodejsInputsTSet", "NodejsLinkedPackage", "NodejsLinksInfo")
 
 NodejsNpmStoreInfo = provider(
     doc = "The entries of a `nodejs_npm_store`, by snapshot key, such as `react-dom@19.1.1(react@19.1.1)`.",
@@ -16,8 +16,8 @@ NodejsNpmStoreInfo = provider(
         "entries": provider_field(dict[str, Artifact]),
         # Each snapshot's package name.
         "names": provider_field(dict[str, str]),
-        # Each snapshot's dependencies, by snapshot key.
-        "deps": provider_field(dict[str, list[str]]),
+        # Each snapshot's entry and those its symlinks lead to, transitively.
+        "closures": provider_field(dict[str, NodejsInputsTSet]),
     },
 )
 
@@ -36,6 +36,75 @@ def _link_target(alias: str, dep: str, dep_name: str) -> str:
     # package directory in its own entry, a sibling of this one under `store/`.
     up = "../../../" if alias.startswith("@") else "../../"
     return up + npm_store_name(dep) + "/node_modules/" + dep_name
+
+def strongly_connected_components(nodes: list[str], edges: dict[str, list[str]]) -> list[list[str]]:
+    """The strongly connected components of a graph, each listed after every component it
+    reaches (Tarjan's algorithm, iterative: Starlark has no recursion)."""
+    index = {}
+    low = {}
+    on_stack = {}
+    stack = []
+    components = []
+    steps = len(nodes) + 1
+    for n in nodes:
+        steps += len(edges.get(n, []))
+    for root in nodes:
+        if root in index:
+            continue
+        index[root] = len(index)
+        low[root] = index[root]
+        stack.append(root)
+        on_stack[root] = True
+        work = [(root, 0)]
+        for _ in range(steps):
+            if not work:
+                break
+            node, i = work[-1]
+            successors = edges.get(node, [])
+            if i < len(successors):
+                work[-1] = (node, i + 1)
+                succ = successors[i]
+                if succ not in index:
+                    index[succ] = len(index)
+                    low[succ] = index[succ]
+                    stack.append(succ)
+                    on_stack[succ] = True
+                    work.append((succ, 0))
+                elif on_stack.get(succ):
+                    low[node] = min(low[node], index[succ])
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                component = []
+                for _ in range(len(stack)):
+                    member = stack.pop()
+                    on_stack[member] = False
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(component)
+    return components
+
+def _closures(actions: AnalysisActions, entries: dict[str, Artifact], deps: dict[str, list[str]]) -> dict[str, NodejsInputsTSet]:
+    """Each entry's closure: one tset node per strongly connected component of the
+    dependency graph, holding its entries, with the components it depends on as children."""
+    tsets = []
+    component_of = {}
+    for component in strongly_connected_components(list(entries.keys()), deps):
+        children = {}
+        for s in component:
+            for dep in deps[s]:
+                if dep not in component:
+                    children[component_of[dep]] = True
+        kwargs = {"children": [tsets[c] for c in children]} if children else {}
+        tsets.append(actions.tset(NodejsInputsTSet, value = [entries[s] for s in sorted(component)], **kwargs))
+        for s in component:
+            component_of[s] = len(tsets) - 1
+    closures = {s: tsets[c] for s, c in component_of.items()}
+    return closures
 
 def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
     excluded = {p: True for p in ctx.attrs.exclude}
@@ -104,7 +173,7 @@ def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
 
     return [
         DefaultInfo(sub_targets = sub_targets),
-        NodejsNpmStoreInfo(entries = entries, names = names, deps = deps),
+        NodejsNpmStoreInfo(entries = entries, names = names, closures = _closures(ctx.actions, entries, deps)),
     ]
 
 nodejs_npm_store = prelude_rule(
@@ -147,21 +216,6 @@ nodejs_npm_store = prelude_rule(
     ),
 )
 
-def _closure(store: NodejsNpmStoreInfo, snapshot: str) -> list[Artifact]:
-    seen = {snapshot: True}
-    queue = [snapshot]
-    for _ in range(len(store.entries) + 1):
-        if not queue:
-            break
-        next = []
-        for s in queue:
-            for dep in store.deps[s]:
-                if dep not in seen:
-                    seen[dep] = True
-                    next.append(dep)
-        queue = next
-    return [store.entries[s] for s in seen]
-
 def _nodejs_npm_links_impl(ctx: AnalysisContext) -> list[Provider]:
     store = ctx.attrs.store[NodejsNpmStoreInfo]
     links = []
@@ -174,7 +228,7 @@ def _nodejs_npm_links_impl(ctx: AnalysisContext) -> list[Provider]:
         links.append(NodejsLinkedPackage(
             name = alias,
             dir = store.entries[snapshot].project("node_modules/" + name),
-            closure = _closure(store, snapshot),
+            closure = store.closures[snapshot],
             owner = ctx.label,
         ))
     return [

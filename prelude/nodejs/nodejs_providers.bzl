@@ -6,16 +6,26 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+def _project_inputs(value: list[Artifact]) -> list[Artifact]:
+    return value
+
+# Each value is a list of directories that symlinks elsewhere lead into: npm store entries
+# (one strongly connected component of the store's dependency graph per node, since npm
+# allows cycles and a tset cannot have them) and first-party package entries. A target that
+# runs or compiles against a composed `node_modules` takes the `"inputs"` projection of the
+# tset under it as hidden inputs, so Starlark never walks the closure.
+NodejsInputsTSet = transitive_set(args_projections = {"inputs": _project_inputs})
+
 # A third-party package linked out of an npm store (`nodejs_npm_store`). `dir` is
 # the package directory inside its store entry, whose siblings are the package's
-# own dependencies, so Node resolves them from `dir`'s real path. `closure` are
+# own dependencies, so Node resolves them from `dir`'s real path. `closure` holds
 # the store entries those siblings lead to, `dir`'s own entry included: the store
 # links entries to each other by relative path, so a target that runs or
 # compiles against `dir` needs all of them.
 NodejsLinkedPackage = record(
     name = field(str),
     dir = field(Artifact),
-    closure = field(list[Artifact]),
+    closure = field(NodejsInputsTSet),
     owner = field(Label),
 )
 
@@ -38,8 +48,11 @@ NodejsLibraryPackage = record(
     entry = field(Artifact | None, default = None),
     # The same with `package_dir`, for `tsc`, which needs the declarations.
     types_entry = field(Artifact | None, default = None),
-    # The npm store entries this package's links need.
-    closure = field(list[Artifact], default = []),
+    # `entry` and everything its symlinks lead to: the entries of the packages it
+    # depends on, theirs in turn, and the npm store entries of its links.
+    inputs = field(NodejsInputsTSet | None, default = None),
+    # The same for `types_entry`.
+    types_inputs = field(NodejsInputsTSet | None, default = None),
 )
 
 NodejsLibraryTSet = transitive_set()
@@ -232,21 +245,29 @@ def forwarded_links(dep_infos: list[NodejsLibraryInfo]) -> list[NodejsLinkedPack
         links.extend(info.links)
     return links
 
-def closure_inputs(transitive_outputs: NodejsLibraryTSet | None, links: list[NodejsLinkedPackage], types: bool = False) -> list[Artifact]:
-    """Everything the symlinks of a composed `node_modules` lead to: every package entry of the
-    closure and every npm store entry, which the store links to each other by relative path."""
-    inputs = {}
-    if transitive_outputs != None:
-        for pkg in transitive_outputs.traverse():
-            entry = pkg.types_entry if types else pkg.entry
-            if entry != None:
-                inputs[entry] = True
-            for artifact in pkg.closure:
-                inputs[artifact] = True
-    for link in links:
-        for artifact in link.closure:
-            inputs[artifact] = True
-    return list(inputs.keys())
+def package_inputs(
+        actions: AnalysisActions,
+        entry: Artifact | None,
+        packages: list[NodejsLibraryPackage],
+        links: list[NodejsLinkedPackage],
+        types: bool = False) -> NodejsInputsTSet:
+    """`entry`, if any, and everything that symlinks to the entries of `packages` (`types_entry`
+    if `types`, else `entry`) and to the npm store packages of `links` lead to."""
+    children = [(p.types_inputs if types else p.inputs) for p in packages]
+    children = [c for c in children if c != None] + [link.closure for link in links]
+    kwargs = {"children": children} if children else {}
+    if entry != None:
+        kwargs["value"] = [entry]
+    return actions.tset(NodejsInputsTSet, **kwargs)
+
+def closure_inputs(
+        actions: AnalysisActions,
+        packages: list[NodejsLibraryPackage],
+        links: list[NodejsLinkedPackage],
+        types: bool = False) -> cmd_args:
+    """Everything the symlinks of a composed `node_modules` that links `packages` and `links`
+    lead to, as hidden inputs."""
+    return cmd_args(package_inputs(actions, None, packages, links, types).project_as_args("inputs"))
 
 def get_transitive_outputs(actions: AnalysisActions, value: NodejsLibraryPackage | None = None, deps: list[NodejsLibraryInfo] = []) -> NodejsLibraryTSet:
     kwargs = {}

@@ -21,7 +21,7 @@ def localize_tree(
     actions: AnalysisActions,
     package_tree_tool: RunInfo,
     staged: Artifact,
-    hidden: list[Artifact],
+    hidden: cmd_args | list[Artifact],
     identifier: str,
 ) -> Artifact:
     """A copy of `staged` with every symlink that leads outside it (to package entries and npm
