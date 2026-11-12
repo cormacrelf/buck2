@@ -27,6 +27,10 @@ NodejsLinkedPackage = record(
     dir = field(Artifact),
     closure = field(NodejsInputsTSet),
     owner = field(Label),
+    # The snapshot key in the store, such as `react-dom@19.1.1(react@19.1.1)`. Two links to
+    # the same snapshot are the same package, which tools that must load one copy of a package
+    # (a browser bundler, say) key on.
+    snapshot = field(str | None, default = None),
 )
 
 NodejsLinksInfo = provider(

@@ -341,6 +341,7 @@ def _nodejs_npm_links_impl(ctx: AnalysisContext) -> list[Provider]:
             dir = store.entries[snapshot].project("node_modules/" + name),
             closure = store.closures[snapshot],
             owner = ctx.label,
+            snapshot = snapshot,
         ))
     bins = npm_bins_dir(
         ctx.actions,
