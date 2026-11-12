@@ -38,6 +38,10 @@ const root = process.cwd();
 // The React refresh runtime of @vitejs/plugin-react, beside its `dist/index.js`.
 const refreshRuntime = fs.readFileSync(new URL("refresh-runtime.js", import.meta.resolve("@vitejs/plugin-react")), "utf8");
 const JS_EXTS = [".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs"];
+const IMAGE_TYPES = {
+  avif: "image/avif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+  gif: "image/gif", tiff: "image/tiff",
+};
 const log = (...a) => process.env.BUCK2_VITE_DEBUG && console.error(`[buck ${performance.now().toFixed(0)}]`, ...a);
 
 // --- buck2 dev ----------------------------------------------------------------------------
@@ -264,6 +268,25 @@ window.$RefreshSig$ = () => (type) => type;`,
       }];
     },
     configureServer(s) {
+      // The images that image modules name, `/@image/<path>/<width>w[-q<quality>].<version>.<format>`
+      // (see `imageUrl` in vite/tools/transform.mjs), each built when the browser first asks
+      // for it. The version is the source's digest: it makes a new image a new URL, and the
+      // output is always built from the source as it is.
+      s.middlewares.use(async (req, res, next) => {
+        const m = /^\/@image\/(.+)\/(\d+)w(?:-q(\d+))?\.[0-9a-f]+\.(\w+)$/.exec(req.url.split("?")[0]);
+        if (!m) return next();
+        const [, p, width, quality, format] = m;
+        const file = decodeURIComponent(p);
+        const args = ["--path", file, "--width", width, "--format", format, ...(quality ? ["--quality", quality] : [])];
+        try {
+          const out = await readOutput([`img:${file}/${width}w${quality ? "-q" + quality : ""}.${format}`, { handler: "image", args }]);
+          res.setHeader("Content-Type", IMAGE_TYPES[format] ?? "application/octet-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          fs.createReadStream(out).pipe(res);
+        } catch (e) {
+          next(e);
+        }
+      });
       // Files of npm packages that stylesheets name, such as fonts.
       s.middlewares.use(async (req, res, next) => {
         const url = req.url.split("?")[0];

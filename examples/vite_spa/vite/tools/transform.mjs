@@ -1,13 +1,14 @@
 // Compiles one module of a `vite_library` into the ES module that the browser loads, with every
 // import already resolved to the URL the dev server serves it at.
 //
-//   transform.mjs --ctx CTX --path PATH [--query QUERY] --src SRC --out OUT
-//                 [--assets DIR] [--plugins-dir DIR --plugin FILE:EXPORT[:JSON]...]
+//   transform.mjs --ctx CTX --path PATH [--query QUERY] --src SRC --out OUT [--encode]
+//                 [--plugins-dir DIR --plugin FILE:EXPORT[:JSON]...]
 //
 // PATH is the source's path in the project, SRC the file to read (the same file, or a generated
 // one placed at PATH), and QUERY a Vite-style import query such as `raw`, `url`, `inline`,
-// `worker`, or `w=400;800&format=webp&as=srcset`. Files that the module makes besides itself,
-// such as resized images, go into DIR, which the dev server serves at `/DIR`.
+// `worker`, or `w=400;800&format=webp&as=srcset`. An image query gives a module that names its
+// images by URL (see `imageUrl`). With `--encode`, OUT is one of those images instead of a
+// module, and QUERY has its one width and format: `w=800&format=webp`.
 //
 // CTX is the library's configuration and resolution context, written by `vite_library`:
 //
@@ -31,6 +32,7 @@
 // module, as Vite would, before compiling what they return as JavaScript. FILE is relative to
 // the plugins directory, a staged package with the plugins' npm dependencies beside it.
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -125,14 +127,13 @@ export async function transform(argv) {
       query: { type: "string", default: "" },
       src: { type: "string" },
       out: { type: "string" },
-      assets: { type: "string" },
+      encode: { type: "boolean", default: false },
       "plugins-dir": { type: "string" },
       plugin: { type: "string", multiple: true, default: [] },
     },
   });
   const job = new Module(args);
-  // The action declares the assets directory whether or not the module makes any.
-  if (args.assets) fs.mkdirSync(args.assets, { recursive: true });
+  if (args.encode) return job.encodeImage();
   const code = await job.compile();
   fs.mkdirSync(path.dirname(args.out), { recursive: true });
   fs.writeFileSync(args.out, code);
@@ -472,13 +473,13 @@ function __variableDynamicImport(glob, path) {
     ].join("\n") + "\n";
   }
 
-  // What vite-imagetools does for `?w=400;800&format=avif;webp&as=picture`: resize and convert
-  // with sharp, write the images to the assets directory, and export their URLs.
+  // What vite-imagetools does in dev for `?w=400;800&format=avif;webp&as=picture`: the module
+  // only names the images, with the sizes that they will have, and encodes none of them. Each
+  // image is built when the browser asks for its URL, by the handler `image` in dev.bxl with
+  // `encodeImage`, so the module takes milliseconds and the page encodes only the images that
+  // the browser picks.
   async compileImage(params) {
-    if (!this.args.assets) this.fail("an image query needs --assets");
-    const preset = params.get("preset");
-    const directives = { ...(preset ? this.ctx.imagePresets?.[preset] ?? this.fail(`no image preset "${preset}"`) : {}) };
-    for (const [k, v] of params) if (k !== "preset") directives[k] = v;
+    const directives = this.imageDirectives(params);
     const { default: sharp } = await import("sharp");
     const meta = await sharp(this.args.src).metadata();
     const list = (v) => (v ? String(v).split(";").filter(Boolean) : []);
@@ -487,20 +488,16 @@ function __variableDynamicImport(glob, path) {
     const formats = list(directives.format);
     if (!formats.length) formats.push(meta.format === "jpeg" ? "jpg" : meta.format);
     const quality = directives.quality ? Number(directives.quality) : undefined;
-    const base = path.basename(this.path, this.ext);
-    fs.mkdirSync(this.args.assets, { recursive: true });
+    // The source's digest is in each URL, so that a new image is a new URL.
+    const version = createHash("sha256").update(fs.readFileSync(this.args.src)).digest("hex").slice(0, 8);
     const images = {};
     for (const format of formats) {
-      images[format] = [];
-      for (const w of widths) {
+      images[format] = widths.map((w) => {
+        // As sharp resizes to a width: never larger, and the height in proportion.
         const width = Math.min(w, meta.width);
-        const name = `${base}-${width}.${format}`;
-        const info = await sharp(this.args.src)
-          .resize({ width })
-          .toFormat(format === "jpg" ? "jpeg" : format, quality ? { quality } : {})
-          .toFile(path.join(this.args.assets, name));
-        images[format].push({ src: "/" + path.posix.join(this.args.assets, name), w: info.width, h: info.height });
-      }
+        const height = Math.round((meta.height * width) / meta.width);
+        return { src: imageUrl(this.path, width, format, quality, version), w: width, h: height };
+      });
     }
     const srcset = (imgs) => imgs.map((i) => `${i.src} ${i.w}w`).join(", ");
     let value;
@@ -524,6 +521,35 @@ function __variableDynamicImport(glob, path) {
     }
     return `export default ${JSON.stringify(value)};\n`;
   }
+
+  imageDirectives(params) {
+    const preset = params.get("preset");
+    const directives = { ...(preset ? this.ctx.imagePresets?.[preset] ?? this.fail(`no image preset "${preset}"`) : {}) };
+    for (const [k, v] of params) if (k !== "preset") directives[k] = v;
+    return directives;
+  }
+
+  // One image that an image module names: the source resized to the query's one width, `w`,
+  // and converted to its one `format`, at `quality` if it says.
+  async encodeImage() {
+    const params = new URLSearchParams(this.query);
+    const width = Number(params.get("w"));
+    const format = params.get("format");
+    const quality = params.get("quality");
+    if (!width || !format) this.fail("an image to encode needs `w` and `format`");
+    const { default: sharp } = await import("sharp");
+    fs.mkdirSync(path.dirname(this.args.out), { recursive: true });
+    await sharp(this.args.src)
+      .resize({ width })
+      .toFormat(format === "jpg" ? "jpeg" : format, quality ? { quality: Number(quality) } : {})
+      .toFile(this.args.out);
+  }
+}
+
+// The URL that the dev server serves an image of an image module at, and builds it for:
+// `/@image/<path>/<width>w[-q<quality>].<version>.<format>`.
+export function imageUrl(path, width, format, quality, version) {
+  return `/@image/${path}/${width}w${quality ? "-q" + quality : ""}.${version}.${format}`;
 }
 
 function hookMatches(hook, id) {

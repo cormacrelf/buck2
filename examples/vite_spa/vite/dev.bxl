@@ -27,6 +27,7 @@ def _dev(ctx):
             server = cmd_args(server, args),
             outputs = {"index": info.html},
             handlers = {
+                "image": "root//vite/dev.bxl:image",
                 "module": "root//vite/dev.bxl:module",
                 "npm": "root//vite/dev.bxl:npm",
             },
@@ -50,31 +51,33 @@ def _package_of(ctx, path):
             return d
     fail("no package above `{}`".format(path))
 
+def _libraries(ctx, path):
+    """The `ViteModulesInfo` of each `vite_library` in the package of `path`."""
+    pkg = _package_of(ctx, path)
+    return [
+        ctx.analysis(ctx.configured_targets(target.label)).providers()[ViteModulesInfo]
+        for target in ctx.uquery().eval("kind(vite_library, '//{}:')".format(pkg))
+    ]
+
 def _module(ctx):
     """A `buck2 dev` handler: the compiled module of `--key`, a source's path in the project with
     `~<query>` for a query, from the `vite_library` of its package."""
     key = ctx.cli_args.key
     path, _, query = key.partition("~")
-    pkg = _package_of(ctx, path)
-    for target in ctx.uquery().eval("kind(vite_library, '//{}:')".format(pkg)):
-        info = ctx.analysis(ctx.configured_targets(target.label)).providers()[ViteModulesInfo]
+    for info in _libraries(ctx, path):
         if key in info.modules:
             return [DefaultInfo(default_output = info.modules[key])]
         if path in info.srcs:
             return [DefaultInfo(default_output = _compile(ctx, info, path, query))]
-    fail("no `vite_library` in //{} has the module `{}`".format(pkg, key))
+    fail("no `vite_library` in //{} has the module `{}`".format(_package_of(ctx, path), key))
 
 def _compile(ctx, info, path, query):
     """A module that the library does not declare, because only its importer knows it: an
     image with resize directives (`?w=400;800&format=webp`), or a query that a plugin answers
-    (`?photo`, `?meta`). The handler declares the action that compiles it, and the files it
-    makes besides the module, such as the images, come with it."""
+    (`?photo`, `?meta`). The handler declares the action that compiles it. An image module only
+    names its images: each is built by the handler `image` when the browser asks for it."""
     actions = ctx.bxl_actions().actions
-    name = "vite/q/{}~{}".format(path, hash(query) & 0xffffffff)
-    out = actions.declare_output(name + ".js")
-    # The module names its assets by their paths in the project, so they must not move with
-    # their contents.
-    assets = actions.declare_output(name + ".assets", dir = True, has_content_based_path = False)
+    out = actions.declare_output("vite/q/{}~{}.js".format(path, hash(query) & 0xffffffff))
     actions.run(
         cmd_args(
             info.transform,
@@ -86,16 +89,56 @@ def _compile(ctx, info, path, query):
             info.srcs[path],
             "--out",
             out.as_output(),
-            "--assets",
-            assets.as_output(),
             hidden = info.styles,
         ),
         category = "vite_transform",
         identifier = path + "?" + query,
     )
-    return out.with_associated_artifacts([assets])
+    return out
 
 module = bxl_main(impl = _module, cli_args = {"key": cli_args.string()})
+
+def _image(ctx):
+    """A `buck2 dev` handler: one image that an image module names, the source at `--path`
+    resized to `--width` and converted to `--format`. The dev server defines it when the
+    browser asks for its URL, so only the images that a page shows are encoded."""
+    path = ctx.cli_args.path
+    query = "w={}&format={}".format(ctx.cli_args.width, ctx.cli_args.format)
+    name = "{}w".format(ctx.cli_args.width)
+    if ctx.cli_args.quality:
+        query += "&quality={}".format(ctx.cli_args.quality)
+        name += "-q{}".format(ctx.cli_args.quality)
+    for info in _libraries(ctx, path):
+        if path in info.srcs:
+            actions = ctx.bxl_actions().actions
+            out = actions.declare_output("vite/img/{}/{}.{}".format(path, name, ctx.cli_args.format))
+            actions.run(
+                cmd_args(
+                    info.transform,
+                    "--path",
+                    path,
+                    "--query=" + query,
+                    "--src",
+                    info.srcs[path],
+                    "--out",
+                    out.as_output(),
+                    "--encode",
+                ),
+                category = "vite_image",
+                identifier = "{}/{}.{}".format(path, name, ctx.cli_args.format),
+            )
+            return [DefaultInfo(default_output = out)]
+    fail("no `vite_library` in //{} has the source `{}`".format(_package_of(ctx, path), path))
+
+image = bxl_main(
+    impl = _image,
+    cli_args = {
+        "format": cli_args.string(),
+        "path": cli_args.string(),
+        "quality": cli_args.string(default = ""),
+        "width": cli_args.string(),
+    },
+)
 
 def _npm(ctx):
     """A `buck2 dev` handler: the pre-bundled ES modules of the npm store entry `--entry`."""

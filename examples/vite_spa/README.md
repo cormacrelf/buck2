@@ -142,9 +142,12 @@ after that:
 - **`import.meta.glob`** and `import(\`./messages/${locale}.json\`)` are expanded against
   the package's sources, which BUCK globs. A new note changes the glob, and the module that
   globs it is built again.
-- **Images**: `?w=…&format=…&as=picture` and `?preset=card` resize with sharp in an action
-  per image and query. The bxl handler declares that action when the query is first asked
-  for, since only the importer knows it.
+- **Images**: `?w=…&format=…&as=picture` and `?preset=card` are modules that only name their
+  images, at `/@image/…` URLs, with the sizes that sharp will give them. The bxl handler
+  declares the module's action when the query is first asked for, since only the importer
+  knows it. Each image is resized and encoded with sharp in an action of its own when the
+  browser asks for its URL, as vite-imagetools does in dev, so only the images a page shows
+  are encoded, and not before the page's modules are built.
 - **npm packages**: `vite_npm` pre-bundles each store entry with esbuild, one action per
   package, with its dependencies left as imports of their own bundles. Vite's optimizer
   bundles every dependency together, and does it again when one is added. Stylesheets in npm
