@@ -1,0 +1,13 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_package")
+
+pnpm_package(
+    package_name = "@example/cli",
+    srcs = ["main.js"],
+    main = "main.js",
+    type = "module",
+)
+
+nodejs_binary(
+    name = "main",
+    library = ":cli",
+)

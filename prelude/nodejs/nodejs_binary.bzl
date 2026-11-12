@@ -14,20 +14,23 @@ load("@prelude//os_lookup:defs.bzl", "OsLookup")
 load("@prelude//utils:arglike.bzl", "ArgLike")  # @unused: Used as a type
 load("@prelude//zip_file:zip_file_toolchain.bzl", "ZipFileToolchainInfo")
 load(":nodejs_closure.bzl", "compose_node_modules")
-load(":nodejs_package.bzl", "get_bundled_node", "package_standalone")
+load(":nodejs_package.bzl", "get_bundled_node", "localize_tree", "package_standalone")
 load(
     ":nodejs_providers.bzl",
     "NodejsLibraryInfo",
     "NodejsTreeInfo",
     "check_relative_path",
+    "closure_inputs",
     "collect_packages",
+    "direct_packages",
+    "forwarded_links",
     "get_nodejs_data_deps",
     "get_nodejs_dep_infos",
     "get_nodejs_library_info",
-    "get_nodejs_tree_info",
     "get_transitive_outputs",
     "get_transitive_trees",
     "get_trees",
+    "split_node_modules",
 )
 load(":nodejs_toolchain.bzl", "NodejsToolchainInfo")
 
@@ -51,7 +54,12 @@ def nodejs_tree_infos(ctx: AnalysisContext, dep_infos: list[NodejsLibraryInfo]) 
     """The third-party trees a target runs with: its `node_modules`, or else those of `dep_infos`."""
     if ctx.attrs.node_modules == None:
         return get_trees(get_transitive_trees(ctx.actions, deps = dep_infos))
-    return [get_nodejs_tree_info(dep, consumer_label = ctx.label) for dep in ctx.attrs.node_modules]
+    return split_node_modules(ctx.attrs.node_modules, consumer_label = ctx.label)[0]
+
+def nodejs_links(ctx: AnalysisContext, dep_infos: list[NodejsLibraryInfo]) -> list:
+    """The npm store links at the top of a target's `node_modules`: those in its `node_modules`, and those its aggregate `dep_infos` pass on."""
+    own = split_node_modules(ctx.attrs.node_modules, consumer_label = ctx.label)[1] if ctx.attrs.node_modules != None else []
+    return own + forwarded_links(dep_infos)
 
 def nodejs_manifest_name(name: str) -> str:
     chars = []
@@ -154,6 +162,7 @@ def stage_nodejs_entries(
     dep_infos = ([lib_info] if lib_info != None else []) + get_nodejs_dep_infos(ctx.attrs.deps, consumer_label = ctx.label, allow_data = True)
     data_deps = get_nodejs_data_deps(ctx.attrs.deps, consumer_label = ctx.label)
     tree_infos = nodejs_tree_infos(ctx, dep_infos)
+    links = nodejs_links(ctx, dep_infos)
     staged = {}
     if lib_info == None:
         staged.update(mains_by_path)
@@ -184,22 +193,28 @@ def stage_nodejs_entries(
             )
         staged[node_name] = node_dist
         name = "__standalone__/" + ctx.label.name
-    packages = collect_packages(get_transitive_outputs(ctx.actions, deps = dep_infos))
+    transitive_outputs = get_transitive_outputs(ctx.actions, deps = dep_infos)
+
+    # Fails on duplicate or nested package directories in the closure.
+    collect_packages(transitive_outputs)
+    packages = {p.dir_name: p for p in direct_packages(dep_infos)}
     if "package.json" not in staged:
         # Tools that find the project root beside `node_modules`, such as `module-alias/register`, read it.
         staged["package.json"] = ctx.actions.write_json("app.json", {"name": nodejs_manifest_name(ctx.label.name), "private": True, "version": "0.0.0"})
     staged_dir = compose_node_modules(
         ctx.actions,
         name,
-        {n: p.runtime_dir for n, p in packages.items()},
+        {n: p.entry.project("node_modules/" + n) for n, p in packages.items()},
         {n: p.label for n, p in packages.items()},
         tree_infos,
         root_files = staged,
         root_file_desc = "{}: {}/`resources` entry '{{artifact}}' at '{{path}}'".format(ctx.label, staged_attrs),
+        links = links,
     )
-    runtime = staged_dir if dep_infos or data_deps or tree_infos or bundled_node or stage or isinstance(ctx.attrs.resources, dict) else None
+    runtime = staged_dir if dep_infos or data_deps or tree_infos or links or bundled_node or stage or isinstance(ctx.attrs.resources, dict) else None
 
-    hidden = []
+    # What the composed `node_modules` links to.
+    hidden = closure_inputs(transitive_outputs, links)
     if lib_info != None:
         entries = [
             NodejsEntry(
@@ -211,7 +226,7 @@ def stage_nodejs_entries(
         entries = [NodejsEntry(name = path, path = cmd_args(runtime, format = "{}/" + path)) for path in mains_by_path]
     else:
         entries = [NodejsEntry(name = path, path = main) for path, main in mains_by_path.items()]
-        hidden = list(srcs.values()) if isinstance(srcs, dict) else srcs
+        hidden = hidden + (list(srcs.values()) if isinstance(srcs, dict) else srcs)
 
     return struct(
         dir = staged_dir,
@@ -238,7 +253,7 @@ def build_nodejs_command(ctx: AnalysisContext, bundled_node: (str, Artifact) | N
     """Runs `main`, or the `library`'s entry, with `node_args` and `args`."""
     staged = stage_nodejs_entries(ctx, [ctx.attrs.main] if ctx.attrs.main != None else [], bundled_node = bundled_node, directory_main = True)
     args = cmd_args(ctx.attrs.node_args, staged.entries[0].path, ctx.attrs.args, hidden = staged.hidden)
-    return struct(dir = staged.dir, merged = staged.runtime, output = nodejs_command(ctx, args, staged.env), env = staged.env, resources = staged.resources)
+    return struct(dir = staged.dir, merged = staged.runtime, hidden = staged.hidden, output = nodejs_command(ctx, args, staged.env), env = staged.env, resources = staged.resources)
 
 def _dir_sub_targets(command: struct) -> dict[str, list[Provider]]:
     return {"dir": [DefaultInfo(default_output = command.dir)]} if command.dir != None else {}
@@ -258,7 +273,7 @@ def nodejs_binary_impl(ctx: AnalysisContext) -> list[Provider]:
             default_output = package_standalone(
                 ctx.actions,
                 ctx.attrs._zip_file_toolchain[ZipFileToolchainInfo].create_zip,
-                command.merged,
+                localize_tree(ctx.actions, ctx.attrs._package_tree_tool[RunInfo], command.merged, command.hidden, "__localized__/" + ctx.label.name),
                 ctx.label.name,
             ),
             other_outputs = providers[0].other_outputs,
@@ -272,8 +287,11 @@ nodejs_binary = prelude_rule(
     docs = """A runnable Node.js script, executed with the toolchain's
     Node runtime and no custom loaders. The `[dir]` sub-target, present
     unless `main` is a directory run with `entry_point` (below), is one
-    directory holding a `node_modules` composed from the transitive
-    `nodejs_library` packages and the packages of the third-party trees,
+    directory holding a `node_modules` that links the packages of
+    `library` and `deps` (each in its `nodejs_library` entry, where it sees
+    only its own dependencies, so the staged files see only these) and the
+    npm store packages of `node_modules`, and holds the packages of the
+    third-party trees,
     `main` and `srcs` beside it at their short paths (distinct files
     staging to the same path fail, as does one under `node_modules` when
     any package is composed), and
@@ -329,7 +347,11 @@ nodejs_binary = prelude_rule(
     data dep's or a staged `main`, `srcs` or `resources` entry's path.
     `node_modules`, when unset, takes the third-party trees of `library`
     and `deps` (see `nodejs_library`'s `node_modules`); a list of
-    `nodejs_node_modules` targets replaces them, and `[]` means none.
+    `nodejs_node_modules` targets replaces them, and `[]` means none. The
+    list may also hold `nodejs_npm_links` targets, whose packages are
+    linked at the top of `node_modules`. `package_style = "standalone"`
+    copies every linked entry into the zip, under
+    `node_modules/.localized`, so it runs without buck-out.
     Third-party packages are composed one by one as installed (they keep
     their `.d.ts` files; dot entries such as `.bin` are dropped): a
     package that two sources provide fails the build and names both, and
@@ -371,6 +393,7 @@ nodejs_binary = prelude_rule(
             "node_modules": attrs.option(attrs.list(attrs.dep()), default = None),
             "package_style": attrs.enum(["inplace", "standalone"], default = "inplace"),
             "_nodejs_toolchain": toolchains_common.nodejs(),
+            "_package_tree_tool": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//nodejs/tools:package_tree")),
             "_target_os_type": buck.target_os_type_arg(),
             "_zip_file_toolchain": toolchains_common.zip_file(),
         }

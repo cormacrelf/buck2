@@ -17,6 +17,24 @@ def get_bundled_node(label: Label, node_dist: Artifact | None, target_os_type: D
     is_windows = target_os_type[OsLookup].os == Os("windows")
     return ("node.exe" if is_windows else "node", node_dist)
 
+def localize_tree(
+    actions: AnalysisActions,
+    package_tree_tool: RunInfo,
+    staged: Artifact,
+    hidden: list[Artifact],
+    identifier: str,
+) -> Artifact:
+    """A copy of `staged` with every symlink that leads outside it (to package entries and npm
+    store entries in other outputs) replaced by a copy inside it, under `node_modules/.localized`,
+    so the tree runs on a machine without buck-out. `hidden` are the entries those symlinks lead to.
+    """
+    out = actions.declare_output(identifier, dir = True)
+    actions.run(
+        cmd_args(package_tree_tool, "localize", "--src", staged, "--out", out.as_output(), hidden = hidden),
+        category = "localize_tree",
+    )
+    return out
+
 def package_standalone(
     actions: AnalysisActions,
     create_zip,

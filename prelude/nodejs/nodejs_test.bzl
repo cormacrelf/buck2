@@ -13,7 +13,7 @@ load("@prelude//decls:test_common.bzl", "test_common")
 load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//test:inject_test_run_info.bzl", "inject_test_run_info")
 load("@prelude//tests:re_utils.bzl", "get_re_executors_from_props")
-load(":nodejs_binary.bzl", "build_nodejs_command", "launcher_providers", "nodejs_command", "nodejs_manifest_name", "nodejs_tree_infos", "stage_nodejs_entries")
+load(":nodejs_binary.bzl", "build_nodejs_command", "launcher_providers", "nodejs_command", "nodejs_links", "nodejs_manifest_name", "nodejs_tree_infos", "stage_nodejs_entries")
 load(":nodejs_providers.bzl", "get_nodejs_dep_infos", "get_nodejs_tree_info")
 load(":nodejs_toolchain.bzl", "NodejsToolchainInfo")
 load(":nodejs_typescript.bzl", "compile_typescript")
@@ -89,6 +89,7 @@ def _staged_srcs(ctx: AnalysisContext) -> (dict[str, Artifact], dict[str, str]):
         identifier = ctx.attrs.name,
         trees = nodejs_tree_infos(ctx, dep_infos),
         rule = "nodejs_test",
+        links = nodejs_links(ctx, dep_infos),
     )
     staged = {}
     origins = {}
@@ -188,7 +189,7 @@ def _framework_command(ctx: AnalysisContext) -> struct:
             args.add("--arg", arg)
     for entry in staged.entries:
         args.add("--test-file", sources.get(entry.name, entry.name), entry.path)
-    return struct(dir = staged.dir, merged = staged.runtime, output = nodejs_command(ctx, args, staged.env), env = staged.env, resources = staged.resources)
+    return struct(dir = staged.dir, merged = staged.runtime, hidden = staged.hidden, output = nodejs_command(ctx, args, staged.env), env = staged.env, resources = staged.resources)
 
 def nodejs_test_impl(ctx: AnalysisContext) -> list[Provider]:
     if ctx.attrs.framework not in ("jest", "vitest"):

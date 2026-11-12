@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,8 +23,10 @@ from unittest import mock
 
 from package_tree import (
     assemble_package,
+    localize,
     main,
     manifest,
+    npm_entry,
     strip_types,
     validate_package,
     write_validation_result,
@@ -1159,3 +1162,100 @@ class TestValidatePackage(unittest.TestCase):
             json.loads(out.read_text()),
             {"version": 1, "data": {"status": "failure", "message": "a\nb"}},
         )
+
+
+def _tarball(path: Path, files: dict[str, tuple[str, int]]) -> None:
+    with tarfile.open(path, "w:gz") as tar:
+        for name, (text, mode) in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(data))
+
+
+class TestNpmEntry(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.tarball = self.root / "pkg.tgz"
+        self.out = self.root / "store" / "a@1.0.0"
+
+    def test_extracts_under_name_and_links_siblings(self) -> None:
+        _tarball(
+            self.tarball,
+            {
+                "package/package.json": ("{}", 0o644),
+                "package/bin/cli.js": ("#!/usr/bin/env node", 0o775),
+            },
+        )
+        npm_entry(
+            self.tarball,
+            "@s/a",
+            [["b", "../../b@2.0.0/node_modules/b"], ["@s/c", "../../../c@3.0.0/node_modules/@s/c"]],
+            self.out,
+        )
+        package = self.out / "node_modules" / "@s" / "a"
+        self.assertEqual(_files(package), ["bin/cli.js", "package.json"])
+        self.assertEqual(stat.S_IMODE((package / "bin" / "cli.js").stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((package / "package.json").stat().st_mode), 0o644)
+        self.assertEqual(os.readlink(self.out / "node_modules" / "b"), "../../b@2.0.0/node_modules/b")
+        self.assertEqual(os.readlink(self.out / "node_modules" / "@s" / "c"), "../../../c@3.0.0/node_modules/@s/c")
+
+    def test_top_level_directory_name_does_not_matter(self) -> None:
+        _tarball(self.tarball, {"node/index.js": ("x", 0o644)})
+        npm_entry(self.tarball, "a", [], self.out)
+        self.assertEqual(_files(self.out), ["node_modules/a/index.js"])
+
+    def test_rejects_entries_leaving_the_package(self) -> None:
+        _tarball(self.tarball, {"package/../../evil": ("x", 0o644)})
+        with self.assertRaises(ValueError):
+            npm_entry(self.tarball, "a", [], self.out)
+
+
+class TestLocalize(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def _entry(self, name: str, links: dict[str, str]) -> Path:
+        """A store entry `store/<name>` holding package `<name>` and sibling links."""
+        entry = self.root / "store" / name
+        _write(entry / "node_modules" / name / "index.js", name)
+        for alias, target in links.items():
+            os.symlink(target, entry / "node_modules" / alias)
+        return entry
+
+    def test_copies_entries_once_and_ends_cycles(self) -> None:
+        # a and b depend on each other, as npm packages may.
+        self._entry("a", {"b": "../../b/node_modules/b"})
+        self._entry("b", {"a": "../../a/node_modules/a"})
+        src = self.root / "staged"
+        _write(src / "main.js", "main")
+        (src / "node_modules").mkdir()
+        os.symlink(self.root / "store" / "a" / "node_modules" / "a", src / "node_modules" / "a")
+        out = self.root / "out"
+        localize(src, out)
+
+        # Every symlink stays inside `out`.
+        for path in out.rglob("*"):
+            if path.is_symlink():
+                self.assertFalse(os.path.isabs(os.readlink(path)))
+                self.assertTrue(Path(os.path.realpath(path)).is_relative_to(out.resolve()), path)
+        a = Path(os.path.realpath(out / "node_modules" / "a"))
+        self.assertEqual((a / "index.js").read_text(), "a")
+        b = Path(os.path.realpath(a.parent / "b"))
+        self.assertEqual((b / "index.js").read_text(), "b")
+        self.assertEqual(Path(os.path.realpath(b.parent / "a")), a)
+        self.assertEqual(len(list((out / "node_modules" / ".localized").iterdir())), 2)
+
+    def test_keeps_symlinks_inside_src(self) -> None:
+        src = self.root / "staged"
+        _write(src / "lib" / "x.js", "x")
+        os.symlink("lib", src / "alias")
+        out = self.root / "out"
+        localize(src, out)
+        self.assertEqual(os.readlink(out / "alias"), "lib")
+        self.assertFalse((out / "node_modules").exists())

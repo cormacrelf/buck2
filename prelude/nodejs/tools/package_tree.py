@@ -15,6 +15,8 @@ package_tree.py archive --src DIR --format FORMAT --out FILE [--root ROOT] [--ex
 package_tree.py compress --src FILE --out OUT [--sha256 FILE] --zstd ZSTD...
 package_tree.py manifest --tree DIR --out FILE
 package_tree.py strip-types --src DIR --out DIR
+package_tree.py npm-entry --tarball FILE --name NAME --links FILE --out DIR
+package_tree.py localize --src DIR --out DIR
 package_tree.py validate-package --package DIR --name NAME [--dir-name NAME] [--main PATH] [--bin NAME:PATH]... [--type TYPE] [--version VERSION]
     [--module DIR [--module-src-root PATH]] --out FILE
 
@@ -1399,6 +1401,119 @@ def _run_compress(args: argparse.Namespace) -> int:
     return 0
 
 
+def npm_entry(tarball: Path, name: str, links: list[list[str]], out: Path) -> None:
+    """Extracts an npm package tarball to `out/node_modules/<name>`, and makes each `[alias,
+    target]` of `links` a symlink `out/node_modules/<alias>` to `target`.
+
+    npm tarballs hold one top-level directory, usually `package/`, which is dropped. Only files
+    and directories are extracted, as npm does; files keep only their execute bits.
+    """
+    package = out.joinpath("node_modules", *name.split("/"))
+    package.mkdir(parents=True)
+    with tarfile.open(tarball, "r:*") as tar:
+        for member in tar:
+            parts = [p for p in member.name.replace("\\", "/").split("/")[1:] if p not in ("", ".")]
+            if not parts:
+                continue
+            if ".." in parts:
+                raise ValueError(f"{tarball}: entry {member.name} leaves the package")
+            dest = package.joinpath(*parts)
+            if member.isdir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            data = tar.extractfile(member)
+            assert data is not None
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(data, f)
+            os.chmod(dest, 0o755 if member.mode & 0o111 else 0o644)
+    for alias, target in links:
+        link = out.joinpath("node_modules", *alias.split("/"))
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _entry_root(real: Path) -> tuple[Path, Path]:
+    """Splits a package directory's real path at its last `node_modules` into the entry that
+    holds it and the path inside that entry."""
+    parts = real.parts
+    indexes = [i for i, part in enumerate(parts) if part == "node_modules"]
+    if not indexes:
+        return real, Path(".")
+    return Path(*parts[: indexes[-1]]), Path(*parts[indexes[-1] :])
+
+
+def localize(src: Path, out: Path) -> None:
+    """Copies `src` to `out`, replacing every symlink that leads outside `src` by a relative
+    symlink to a copy inside `out`.
+
+    A symlink outside leads to a package directory in some entry (a first-party package entry or
+    an npm store entry): `<entry>/node_modules/<name>`, whose siblings are its dependencies. Each
+    such entry is copied once, to `node_modules/.localized/<n>`, and its own symlinks are
+    rewritten the same way, so dependency cycles between entries end.
+    """
+    src_real = Path(os.path.realpath(src))
+    slots: dict[Path, Path] = {}
+    queue: list[Path] = []
+
+    def local_path(real: Path) -> Path:
+        try:
+            return out / real.relative_to(src_real)
+        except ValueError:
+            pass
+        root, rest = _entry_root(real)
+        if root not in slots:
+            slots[root] = Path("node_modules", ".localized", str(len(slots)))
+            queue.append(root)
+        return out / slots[root] / rest
+
+    def copy(from_dir: Path, to_dir: Path, root: Path) -> None:
+        to_dir.mkdir(parents=True, exist_ok=True)
+        for entry in sorted(os.scandir(from_dir), key=lambda e: e.name):
+            dest = to_dir / entry.name
+            if entry.is_symlink():
+                real = Path(os.path.realpath(entry.path))
+                if not real.exists():
+                    raise ValueError(f"symlink {entry.path} does not resolve")
+                try:
+                    real.relative_to(root)
+                    inside = True
+                except ValueError:
+                    inside = False
+                if inside and not os.path.isabs(os.readlink(entry.path)):
+                    os.symlink(os.readlink(entry.path), dest)
+                else:
+                    os.symlink(os.path.relpath(local_path(real), dest.parent), dest)
+            elif entry.is_dir():
+                copy(Path(entry.path), dest, root)
+            else:
+                shutil.copy2(entry.path, dest)
+
+    copy(src, out, src_real)
+    while queue:
+        root = queue.pop()
+        target = out / slots[root]
+        if root.is_dir():
+            copy(root, target, root)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root, target)
+
+
+def _run_npm_entry(args: argparse.Namespace) -> int:
+    with open(args.links) as f:
+        links = json.load(f)
+    npm_entry(args.tarball, args.name, links, args.out)
+    return 0
+
+
+def _run_localize(args: argparse.Namespace) -> int:
+    localize(args.src, args.out)
+    return 0
+
+
 def _run_strip_types(args: argparse.Namespace) -> int:
     strip_types(args.src, args.out)
     return 0
@@ -1453,6 +1568,16 @@ def _parser() -> argparse.ArgumentParser:
         run=_run_compress,
         errors=(ValueError, OSError, subprocess.CalledProcessError),
     )
+    entry = commands.add_parser("npm-entry")
+    entry.add_argument("--tarball", type=_path, required=True)
+    entry.add_argument("--name", required=True)
+    entry.add_argument("--links", type=_path, required=True)
+    entry.add_argument("--out", type=_path, required=True)
+    entry.set_defaults(run=_run_npm_entry, errors=(ValueError, OSError, tarfile.TarError))
+    localized = commands.add_parser("localize")
+    localized.add_argument("--src", type=_path, required=True)
+    localized.add_argument("--out", type=_path, required=True)
+    localized.set_defaults(run=_run_localize, errors=(ValueError, OSError))
     strip = commands.add_parser("strip-types")
     strip.add_argument("--src", type=_path, required=True)
     strip.add_argument("--out", type=_path, required=True)

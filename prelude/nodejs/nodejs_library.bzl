@@ -16,13 +16,16 @@ load(
     "NodejsTreeInfo",
     "build_node_modules",
     "check_relative_path",
+    "direct_packages",
+    "forwarded_links",
     "get_nodejs_dep_infos",
-    "get_nodejs_tree_info",
     "get_transitive_outputs",
     "get_transitive_trees",
     "get_trees",
+    "split_node_modules",
     "strip_type_declarations",
 )
+load(":nodejs_closure.bzl", "package_entry")
 load(":nodejs_toolchain.bzl", "NodejsToolchainInfo")
 load(":nodejs_typescript.bzl", "compile_module_typescript", "compile_typescript")
 
@@ -217,11 +220,16 @@ def _validate_package(
     return ValidationInfo(validations = [ValidationSpec(name = "package_json", validation_result = result)])
 
 def _tree_infos(ctx: AnalysisContext) -> list[NodejsTreeInfo]:
-    return [get_nodejs_tree_info(tree, consumer_label = ctx.label) for tree in ctx.attrs.node_modules]
+    return split_node_modules(ctx.attrs.node_modules, consumer_label = ctx.label)[0]
+
+def _links(ctx: AnalysisContext, dep_infos: list[NodejsLibraryInfo]) -> list:
+    """The npm store links of this library: its own `node_modules` ones and those its aggregate `deps` pass on."""
+    return split_node_modules(ctx.attrs.node_modules, consumer_label = ctx.label)[1] + forwarded_links(dep_infos)
 
 def _aggregator_impl(ctx: AnalysisContext, dep_infos: list[NodejsLibraryInfo]) -> list[Provider]:
     trees = _tree_infos(ctx)
-    if not dep_infos and not trees:
+    links = _links(ctx, dep_infos)
+    if not dep_infos and not trees and not links:
         fail(
             "nodejs_library {}: has no package content (`srcs`, `resources`, `tsconfig`, `module`, `prebuilt` or `package_json`), no `deps` and no `node_modules`".format(
                 ctx.label
@@ -244,6 +252,8 @@ def _aggregator_impl(ctx: AnalysisContext, dep_infos: list[NodejsLibraryInfo]) -
             },
         ),
         NodejsLibraryInfo(
+            direct = direct_packages(dep_infos),
+            links = links,
             transitive_outputs = transitive_outputs,
             transitive_trees = get_transitive_trees(ctx.actions, trees, dep_infos),
         ),
@@ -326,6 +336,8 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 )
 
     transitive_trees = get_transitive_trees(ctx.actions, _tree_infos(ctx), dep_infos)
+    links = _links(ctx, dep_infos)
+    direct = direct_packages(dep_infos)
 
     emit = None
     module_dir = None
@@ -354,6 +366,7 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
             dep_infos = dep_infos,
             identifier = ctx.attrs.name,
             trees = get_trees(transitive_trees),
+            links = links,
         )
     package_tree_tool = ctx.attrs._package_tree_tool[RunInfo]
     files = {path: entry.artifact for path, entry in staged.items()}
@@ -373,12 +386,19 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
         )
 
     runtime_dir = strip_type_declarations(ctx.actions, package_tree_tool, package_dir, "runtime_dir")
+    closure = {}
+    for link in links:
+        for artifact in link.closure:
+            closure[artifact] = True
     own_package = NodejsLibraryPackage(
         label = ctx.label,
         package_dir = package_dir,
         package_name = package_name,
         runtime_dir = runtime_dir,
         dir_name = dir_name,
+        entry = package_entry(ctx.actions, "entry", ctx.label, dir_name, runtime_dir, direct, links, types = False),
+        types_entry = package_entry(ctx.actions, "types_entry", ctx.label, dir_name, package_dir, direct, links, types = True),
+        closure = list(closure.keys()),
     )
     transitive_outputs = get_transitive_outputs(ctx.actions, value = own_package, deps = dep_infos)
     node_modules = build_node_modules(ctx.actions, "node_modules", transitive_outputs, own_package = own_package)
@@ -401,6 +421,7 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
     elif source_files:
         sources = ctx.actions.copied_dir("sources", source_files)
     sub_targets = {
+        "entry": [DefaultInfo(default_output = own_package.entry)],
         "node_modules": [DefaultInfo(default_output = node_modules)],
         "runtime": [DefaultInfo(default_output = runtime_dir)],
     }
@@ -414,6 +435,7 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
         ),
         NodejsLibraryInfo(
             bins = bins,
+            direct = [own_package],
             dir_name = dir_name,
             main = main,
             package_dir = package_dir,
@@ -503,7 +525,15 @@ nodejs_library = prelude_rule(
     must be `nodejs_library` targets; use `resources` for non-code
     artifacts.
     Staging copies files so the package runs under Node without
-    `--preserve-symlinks`. `package_json`, when supplied, is staged
+    `--preserve-symlinks`. The library's `[entry]` sub-target is
+    `node_modules/<dir>`, a copy of its package, beside symlinks to the
+    entries of the packages in its `deps` and to the npm store packages in
+    its `node_modules`, as in pnpm's `node_modules/.pnpm`: Node resolves a
+    package from its real path, so the package's code finds exactly its
+    declared dependencies, and a target that depends on the library links
+    only the library itself. A library with only `deps` or `node_modules`
+    passes its `deps` and npm store links on to the target that depends on
+    it, as if listed there. `package_json`, when supplied, is staged
     verbatim at the package root as `package.json`, replacing a
     `package.json` the compile emits there. Without it or `prebuilt`, the
     package gets a synthesized `package.json` with `name` (the
@@ -529,7 +559,10 @@ nodejs_library = prelude_rule(
     not start with `.` or `_`. The unscoped names `node_modules` and
     `favicon.ico` are reserved and rejected, as is `@scope/node_modules`;
     either may be used as the scope.
-    `node_modules` lists third-party trees (`nodejs_node_modules` targets,
+    `node_modules` lists `nodejs_npm_links` targets, whose npm store
+    packages are linked beside this package in its entry (see
+    `nodejs_npm_store`, and `pnpm.bzl` for a pnpm workspace), and
+    third-party trees (`nodejs_node_modules` targets,
     e.g. over a yarn install output), for packages with no `nodejs_library`
     target. A library's trees are those it lists plus those of its
     transitive `deps`; listing a tree a dep already brings is allowed. They
@@ -537,8 +570,8 @@ nodejs_library = prelude_rule(
     one, whatever its content (a `nodejs_binary` or `nodejs_test` that
     sets its own `node_modules` runs with those instead). The `tsc`
     compile of `srcs` composes them
-    with the packages of the transitive `deps` into its staged
-    `node_modules`, package by package. A package name two of those
+    with links to the packages of its `deps` (in their entries, with
+    declarations) into its staged `node_modules`, package by package. A package name two of those
     sources provide fails the build and names both; `nodejs_node_modules`
     describes the other packages that fail it and how `exclude` drops them.
     `module`, when set, compiles a whole project directory (a target whose

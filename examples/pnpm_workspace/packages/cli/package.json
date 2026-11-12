@@ -1,0 +1,10 @@
+{
+  "name": "@example/cli",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "main.js",
+  "dependencies": {
+    "@example/greet": "workspace:^",
+    "@example/render": "workspace:^"
+  }
+}

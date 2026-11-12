@@ -1,0 +1,7 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_package")
+
+pnpm_package(
+    srcs = ["index.js"],
+    main = "index.js",
+    type = "module",
+)

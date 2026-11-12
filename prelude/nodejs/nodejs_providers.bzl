@@ -6,12 +6,40 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+# A third-party package linked out of an npm store (`nodejs_npm_store`). `dir` is
+# the package directory inside its store entry, whose siblings are the package's
+# own dependencies, so Node resolves them from `dir`'s real path. `closure` are
+# the store entries those siblings lead to, `dir`'s own entry included: the store
+# links entries to each other by relative path, so a target that runs or
+# compiles against `dir` needs all of them.
+NodejsLinkedPackage = record(
+    name = field(str),
+    dir = field(Artifact),
+    closure = field(list[Artifact]),
+    owner = field(Label),
+)
+
+NodejsLinksInfo = provider(
+    doc = "Third-party packages from an npm store, linked under `node_modules` by name: next to the package of the `nodejs_library` that lists them in `node_modules`, or at the top of a binary's or test's `node_modules`.",
+    fields = {
+        "links": provider_field(list[NodejsLinkedPackage]),
+    },
+)
+
 NodejsLibraryPackage = record(
     label = field(Label),
     package_dir = field(Artifact),
     package_name = field(str),
     runtime_dir = field(Artifact),
     dir_name = field(str),
+    # `node_modules/<dir_name>`, a copy of `runtime_dir`, beside links to the
+    # entries of the packages the library depends on. Node resolves a package
+    # from its real path, so the library sees exactly its declared dependencies.
+    entry = field(Artifact | None, default = None),
+    # The same with `package_dir`, for `tsc`, which needs the declarations.
+    types_entry = field(Artifact | None, default = None),
+    # The npm store entries this package's links need.
+    closure = field(list[Artifact], default = []),
 )
 
 NodejsLibraryTSet = transitive_set()
@@ -23,6 +51,12 @@ NodejsLibraryInfo = provider(
     doc = "A Node.js library: its own package and the packages of its transitive closure. A library with only `deps` or `node_modules` stages no package, so its `dir_name`, `package_dir`, `package_name` and `runtime_dir` are `None`. `bins`, `main`, `type` and `version` are the library's attributes; `type` and `version` get the defaults of a synthesized `package.json` only when the rule synthesizes it.",
     fields = {
         "bins": provider_field(dict[str, str], default = {}),
+        # The packages a target that depends on this one sees in its `node_modules`: the
+        # library's own, or, for a library with only `deps` or `node_modules`, those of its `deps`.
+        "direct": provider_field(list[NodejsLibraryPackage], default = []),
+        # npm store links a library with only `deps` or `node_modules` passes on to the
+        # target that depends on it. A library with a package links its own next to it instead.
+        "links": provider_field(list[NodejsLinkedPackage], default = []),
         "dir_name": provider_field(str | None, default = None),
         "main": provider_field(str | None, default = None),
         "package_dir": provider_field(Artifact | None, default = None),
@@ -165,6 +199,54 @@ def get_nodejs_tree_info(node_modules: Dependency, consumer_label, attr: str = "
             )
         )
     return node_modules[NodejsTreeInfo]
+
+def split_node_modules(node_modules: list[Dependency], consumer_label, attr: str = "node_modules") -> (list[NodejsTreeInfo], list[NodejsLinkedPackage]):
+    """The third-party trees and the npm store links listed in a `node_modules` attribute."""
+    trees = []
+    links = []
+    for dep in node_modules:
+        if NodejsLinksInfo in dep:
+            links.extend(dep[NodejsLinksInfo].links)
+        elif NodejsTreeInfo in dep:
+            trees.append(dep[NodejsTreeInfo])
+        else:
+            fail(
+                "target {} has `{}` `{}` which provides neither `NodejsTreeInfo` nor `NodejsLinksInfo`; `{}` must be `nodejs_node_modules` or npm store link targets".format(
+                    consumer_label, attr, dep.label, attr
+                )
+            )
+    return trees, links
+
+def direct_packages(dep_infos: list[NodejsLibraryInfo]) -> list[NodejsLibraryPackage]:
+    """The packages a target depending on `dep_infos` links by name: each library's own, and those an aggregate passes on."""
+    packages = {}
+    for info in dep_infos:
+        for pkg in info.direct:
+            packages.setdefault(pkg.label, pkg)
+    return list(packages.values())
+
+def forwarded_links(dep_infos: list[NodejsLibraryInfo]) -> list[NodejsLinkedPackage]:
+    """The npm store links that aggregates among `dep_infos` pass on."""
+    links = []
+    for info in dep_infos:
+        links.extend(info.links)
+    return links
+
+def closure_inputs(transitive_outputs: NodejsLibraryTSet | None, links: list[NodejsLinkedPackage], types: bool = False) -> list[Artifact]:
+    """Everything the symlinks of a composed `node_modules` lead to: every package entry of the
+    closure and every npm store entry, which the store links to each other by relative path."""
+    inputs = {}
+    if transitive_outputs != None:
+        for pkg in transitive_outputs.traverse():
+            entry = pkg.types_entry if types else pkg.entry
+            if entry != None:
+                inputs[entry] = True
+            for artifact in pkg.closure:
+                inputs[artifact] = True
+    for link in links:
+        for artifact in link.closure:
+            inputs[artifact] = True
+    return list(inputs.keys())
 
 def get_transitive_outputs(actions: AnalysisActions, value: NodejsLibraryPackage | None = None, deps: list[NodejsLibraryInfo] = []) -> NodejsLibraryTSet:
     kwargs = {}

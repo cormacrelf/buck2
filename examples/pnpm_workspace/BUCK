@@ -1,0 +1,4 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_workspace")
+load(":pnpm-lock.yaml", lock = "value")
+
+pnpm_workspace(lock)
