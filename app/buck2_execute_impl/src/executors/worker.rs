@@ -234,8 +234,18 @@ async fn spawn_worker(
     dispatcher: EventDispatcher,
     graceful_shutdown_timeout_s: Option<u32>,
 ) -> Result<WorkerHandle, WorkerInitError> {
-    // Use fixed length path at /tmp to avoid 108 character limit for unix domain sockets
-    let dir_name = format!("{}-{}", dispatcher.trace_id(), worker_id);
+    // Use fixed length path at /tmp to avoid 108 character limit for unix domain sockets.
+    //
+    // Each command has its own worker pool, so the same worker can be spawned again under the
+    // same trace id: `buck2 dev` sends many commands with its session's trace id, and the
+    // directory of the first spawn is still there. The spawn number keeps them apart.
+    static SPAWNS: AtomicU64 = AtomicU64::new(0);
+    let dir_name = format!(
+        "{}-{}-{}",
+        dispatcher.trace_id(),
+        worker_id,
+        SPAWNS.fetch_add(1, Ordering::Relaxed)
+    );
     let worker_dir = AbsNormPathBuf::from("/tmp/buck2_worker".to_owned())
         .map_err(WorkerInitError::InternalError)?
         .join(FileName::unchecked_new(&dir_name));
