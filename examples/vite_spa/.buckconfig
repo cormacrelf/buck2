@@ -24,3 +24,6 @@ execution_platforms = root//platforms:local
 # The module transforms run in a persistent worker, which `buck2 dev` keeps for its session.
 # `false` starts `node` for each one instead.
 persistent_worker = true
+
+[buck2]
+file_watcher = watchman
