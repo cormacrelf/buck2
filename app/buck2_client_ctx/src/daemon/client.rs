@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use buck2_cli_proto::daemon_api_client::*;
+use buck2_cli_proto::new_generic::DevSessionRequest;
 use buck2_cli_proto::new_generic::NewGenericPartialResult;
 use buck2_cli_proto::new_generic::NewGenericRequest;
 use buck2_cli_proto::new_generic::NewGenericResponse;
@@ -478,7 +479,7 @@ macro_rules! bidirectional_stream_method {
             let res = self
                 .inner
                 .stream(
-                    |d, r| Box::pin(DaemonApiClient::$method(d, r)),
+                    |d, r| Box::pin(DaemonApiClient::$grpc_method(d, r)),
                     req,
                     &mut events_ctx,
                     handler,
@@ -663,6 +664,42 @@ impl FlushingBuckdClient<'_> {
         SubscriptionCommandResponse,
         SubscriptionResponseWrapper
     );
+    bidirectional_stream_method!(
+        dev_session_impl,
+        dev_session,
+        DevSessionMessage,
+        NewGenericResponseMessage,
+        NewGenericPartialResultMessage
+    );
+
+    /// A `buck2 dev` session: one daemon command that runs as long as `requests` does not end.
+    /// Its partial results go to `on_partial_result` as they arrive.
+    pub async fn dev_session(
+        &mut self,
+        context: buck2_cli_proto::ClientContext,
+        requests: impl Stream<Item = DevSessionRequest> + Send + Sync + 'static,
+        events_ctx: &mut EventsCtx,
+        on_partial_result: &mut (
+                 dyn FnMut(NewGenericPartialResult) -> buck2_error::Result<()> + Send
+             ),
+    ) -> buck2_error::Result<CommandOutcome<()>> {
+        let requests = requests.map(|request| DevSessionMessage {
+            // A request that does not serialize is a bug, and the daemon reports it.
+            dev_session_request: serde_json::to_string(&request).unwrap_or_default(),
+        });
+        let outcome = self
+            .dev_session_impl(
+                context,
+                requests,
+                events_ctx,
+                &mut NewGenericPartialResultHandler(on_partial_result),
+            )
+            .await?;
+        Ok(match outcome {
+            CommandOutcome::Success(_) => CommandOutcome::Success(()),
+            CommandOutcome::Failure(result) => CommandOutcome::Failure(result),
+        })
+    }
 
     oneshot_method!(flush_dep_files, FlushDepFilesRequest, GenericResponse);
     stream_method!(

@@ -25,7 +25,6 @@ pub enum NewGenericRequest {
     ExpandExternalCells(ExpandExternalCellsRequest),
     Complete(CompleteRequest),
     Docs(DocsRequest),
-    Dev(DevRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,14 +35,13 @@ pub enum NewGenericResponse {
     ExpandExternalCells(ExpandExternalCellsResponse),
     Complete(CompleteResponse),
     Docs(DocsResponse),
-    Dev(DevResponse),
 }
 
-/// What a `NewGenericRequest` sends before its response.
+/// What a command sends before its response.
 #[derive(Serialize, Deserialize)]
 pub enum NewGenericPartialResult {
-    /// The result of one output of a streaming `DevAction::Build`.
-    Dev(DevBuilt),
+    /// What happened in a `buck2 dev` session.
+    DevSession(DevSessionEvent),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,18 +141,37 @@ pub enum DocsResponse {
     Json(String),
 }
 
-/// A request from `buck2 dev`. Each one is a separate, short daemon command, so `buck2 dev` holds
-/// no daemon state between them.
+/// A request of a `buck2 dev` session. A session is one daemon command, which lasts as long as
+/// `buck2 dev` does. The first request is `Start`.
 #[derive(Serialize, Deserialize)]
-pub struct DevRequest {
+pub enum DevSessionRequest {
+    Start(DevSessionStart),
+    /// Define these dynamic outputs, or define them anew. `Build` then names them.
+    Define(Vec<DevDynamicCall>),
+    /// These dynamic outputs are no longer defined.
+    Undefine(Vec<String>),
+    /// Run `action`. The events about it carry `id`.
+    ///
+    /// `epoch` says which files the action must see. Actions of one epoch run against the same
+    /// files, side by side. One of a later epoch waits until those of earlier epochs are done,
+    /// and sees the files as they are when it starts. `buck2 dev` starts a new epoch once the
+    /// file watcher has reported a change.
+    Run {
+        id: u64,
+        epoch: u64,
+        action: DevAction,
+    },
+}
+
+/// What a `buck2 dev` session runs.
+#[derive(Serialize, Deserialize)]
+pub struct DevSessionStart {
     /// The target whose `DevInfo` to use, or, with `bxl_args`, a bxl function, `path.bxl:name`,
     /// whose returned providers to use in its place.
     pub target: String,
     /// When `target` is a bxl function, its command line arguments.
-    #[serde(default)]
     pub bxl_args: Option<Vec<String>>,
     pub target_cfg: TargetCfg,
-    pub action: DevAction,
     /// The name of the session, as it gave it when it subscribed to file changes. The daemon
     /// leaves what the target is built from under this name, for the subscription to drop the
     /// changes that cannot matter.
@@ -169,21 +186,12 @@ pub enum DevAction {
     /// to the server and to each output. Finding what they may be built from, when the graph
     /// changed, may build what dynamic actions need to say what they do.
     Watch(DevWatchRequest),
-    /// Build the named outputs, which the server asked for: `DevInfo.outputs`, and dynamic
-    /// outputs. The build stops if a file
-    /// that it builds from changes. With `streaming`, the result of each output but the last to
-    /// finish is a `NewGenericPartialResult::Dev` as soon as it is known, and the response has
-    /// the last; a change to a file of an output that is done no longer stops the build.
-    Build {
-        outputs: Vec<String>,
-        #[serde(default)]
-        streaming: bool,
-        /// The calls of the dynamic outputs among `outputs`. The others are `DevInfo.outputs`.
-        #[serde(default)]
-        dynamic: Vec<DevDynamicCall>,
-    },
-    /// Release the local resources that the daemon holds for the session, and wait until they
-    /// are gone. `buck2 dev` sends it after it has stopped the server.
+    /// Build these outputs: names in `DevInfo.outputs`, and defined dynamic outputs. Each output
+    /// is built on its own, and gets a `DevSessionEvent::Built` as soon as it is done. A build
+    /// stops when a file that it is built from changes.
+    Build { outputs: Vec<String> },
+    /// Stop every build, release the local resources that the daemon holds for the session, and
+    /// wait until they are gone. `buck2 dev` sends it after it has stopped the server.
     Release,
 }
 
@@ -191,22 +199,52 @@ pub enum DevAction {
 pub enum DevResponse {
     Server(DevServer),
     Watch(DevWatched),
-    Build(DevBuilt),
-    /// The build stopped.
-    Interrupted(DevInterrupted),
     Released,
 }
 
-/// Why a `Build` stopped.
+/// What happened in a `buck2 dev` session.
 #[derive(Serialize, Deserialize)]
-pub struct DevInterrupted {
-    /// Project-relative paths of the files that changed.
-    pub paths: Vec<String>,
-    /// The file watcher missed changes, so anything may have changed.
-    pub missed: bool,
+pub enum DevSessionEvent {
+    /// The answer to a `Server`, `Watch` or `Release` request.
+    Response { id: u64, response: DevResponse },
+    /// A `Server` or `Watch` request failed, with these errors.
+    Failed { id: u64, errors: Vec<String> },
+    /// Output `name` of build `id` is done.
+    Built {
+        id: u64,
+        name: String,
+        result: Result<DevBuiltOutput, DevOutputError>,
+    },
+    /// What dynamic output `name` of build `id` may be built from, as the build found it: the
+    /// state that the next `Watch` compares with. It comes after the output's `Built`, or not at
+    /// all if it could not be found.
+    Found {
+        id: u64,
+        name: String,
+        state: DevWatchState,
+    },
+    /// Files that output `name` of build `id` may be built from changed after the build saw the
+    /// files: `paths`, or anything if `missed`. With `stopped`, the build had not finished, so it
+    /// stopped, and no `Built` follows. Otherwise the build was done, and used the files as
+    /// they were before.
+    Changed {
+        id: u64,
+        name: String,
+        paths: Vec<String>,
+        missed: bool,
+        stopped: bool,
+    },
 }
 
-#[derive(Serialize, Deserialize)]
+/// Why an output did not build.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DevOutputError {
+    pub error: String,
+    /// An action failed, which the console has shown.
+    pub action: bool,
+}
+
+#[derive(Default, Serialize, Deserialize)]
 pub struct DevServer {
     /// Absolute path of the project root. The server runs in this directory.
     pub project_root: String,
@@ -246,7 +284,6 @@ pub struct DevWatchRequest {
     /// The file watcher missed changes since `previous`, so anything may have changed.
     pub missed: bool,
     /// The dynamic outputs that the server tracks, each with the `state` of its last answer.
-    #[serde(default)]
     pub dynamic: Vec<DevDynamicWatch>,
 }
 
@@ -262,10 +299,10 @@ pub struct DevDynamicCall {
     pub args: Vec<String>,
 }
 
-/// A dynamic output, to say what changes are to it.
+/// A defined dynamic output, to say what changes are to it.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DevDynamicWatch {
-    pub call: DevDynamicCall,
+    pub name: String,
     /// The `state` of the last answer about it, or of the build that last built it. `None` if
     /// there was none, or the handler failed then.
     pub previous: Option<DevWatchState>,
@@ -348,18 +385,6 @@ pub struct DevChange {
     pub path: Option<String>,
     /// The names of the scopes that the change is in.
     pub scopes: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct DevBuilt {
-    pub outputs: BTreeMap<String, DevBuiltOutput>,
-    /// The outputs that failed to build, with their errors.
-    #[serde(default)]
-    pub failed: BTreeMap<String, String>,
-    /// For the dynamic outputs of the build, in the response only: the state that a `Watch`
-    /// compares with, as the build found it.
-    #[serde(default)]
-    pub dynamic: BTreeMap<String, DevWatchState>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

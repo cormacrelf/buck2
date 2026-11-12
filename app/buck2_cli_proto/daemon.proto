@@ -742,6 +742,14 @@ message NewGenericPartialResultMessage {
   string new_generic_partial_result = 1;
 }
 
+// A request of a `buck2 dev` session, after the client context. The session
+// sends `NewGenericPartialResultMessage`s, and ends with a
+// `NewGenericResponseMessage`.
+message DevSessionMessage {
+  // `DevSessionRequest` serialized to JSON.
+  string dev_session_request = 1;
+}
+
 message UnstableCrashRequest {
   enum CrashType {
     PANIC = 0;
@@ -841,6 +849,7 @@ message StreamingRequest {
     LspRequest lsp = 2;
     SubscriptionRequestWrapper subscription = 3;
     DapRequest dap = 4;
+    DevSessionMessage dev_session = 5;
   }
 }
 
@@ -1176,6 +1185,9 @@ service DaemonApi {
 
   // Starts a starlark DAP server.
   rpc Dap(stream StreamingRequest) returns (stream MultiCommandProgress);
+
+  // Runs a `buck2 dev` session: one command for all the builds of a session.
+  rpc DevSession(stream StreamingRequest) returns (stream MultiCommandProgress);
 
   // Update the daemon's log filter.
   rpc SetLogFilter(SetLogFilterRequest) returns (SetLogFilterResponse);

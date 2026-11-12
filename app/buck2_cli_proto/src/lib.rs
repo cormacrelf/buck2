@@ -119,6 +119,25 @@ impl From<DapRequest> for StreamingRequest {
     }
 }
 
+impl TryFrom<StreamingRequest> for DevSessionMessage {
+    type Error = buck2_error::Error;
+
+    fn try_from(value: StreamingRequest) -> Result<Self, Self::Error> {
+        match value.request {
+            Some(streaming_request::Request::DevSession(req)) => Ok(req),
+            _ => Err(wrong_request_type("DevSessionMessage")),
+        }
+    }
+}
+
+impl From<DevSessionMessage> for StreamingRequest {
+    fn from(request: DevSessionMessage) -> Self {
+        Self {
+            request: Some(streaming_request::Request::DevSession(request)),
+        }
+    }
+}
+
 /// Trait for requests that have CommonBuildOptions.
 pub trait HasBuildOptions {
     fn build_options(&self) -> Option<&CommonBuildOptions>;

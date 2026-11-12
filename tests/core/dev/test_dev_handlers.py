@@ -11,9 +11,10 @@
 # Outputs that the server defines while it runs, with the handlers of `DevInfo.handlers`. They
 # use the fixture of `test_dev`: `//app:handlers` has `site`, built from `app/main.txt`, the
 # scope `lib`, and the handlers `owner`, which builds the default output of the target that owns
-# the file `--path`, and `broken`, whose output is no artifact. Both are in `dev.bxl`.
+# the file `--path`, and `broken`, whose output is no artifact. Both are in `dev.bxl`. The tests
+# send `define` and `build` themselves.
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from buck2.tests.core.common.dev.dev_util import (
     contents,
@@ -24,6 +25,7 @@ from buck2.tests.core.common.dev.dev_util import (
     LIB,
     read,
     start_dev,
+    summary,
     write,
 )
 from buck2.tests.e2e_util.api.buck import Buck
@@ -42,7 +44,11 @@ def owner(path: str) -> Dict[str, Any]:
     return {"handler": "owner", "args": ["--path", path]}
 
 
-def build(dev: DevSession, outputs: Dict[str, Optional[Dict[str, Any]]]) -> None:
+def define(dev: DevSession, outputs: Dict[str, Dict[str, Any]]) -> None:
+    dev.request({"type": "define", "outputs": outputs})
+
+
+def build(dev: DevSession, outputs: List[str]) -> None:
     dev.request({"type": "build", "outputs": outputs})
 
 
@@ -60,14 +66,16 @@ class DevHandlersTest(BuckTestCase):
         the scopes of the `DevInfo`. A change to another file makes nothing stale."""
         dev = await start_dev(buck, "//app:handlers", "none", "--", "--manual")
         try:
-            _, ready, _, _ = await dev.expect("started", "ready", "building", "built")
+            _, ready, _, _ = await dev.expect("started", "ready", "build", "built")
             assert ready["outputs"] == ["site"]
             assert ready["handlers"] == ["broken", "owner"]
 
-            build(dev, {"lib": owner("lib/lib.txt"), "part": owner("app/part.txt")})
-            building, built = await dev.expect("building", "built")
-            assert building["outputs"] == ["lib", "part"]
-            assert contents(built) == {"lib": "lib v1\n", "part": "part v1\n"}
+            define(dev, {"lib": owner("lib/lib.txt"), "part": owner("app/part.txt")})
+            build(dev, ["lib", "part"])
+            (message,) = await dev.expect("build")
+            assert message["outputs"] == ["lib", "part"]
+            results = await dev.results(2)
+            assert contents(results) == {"lib": "lib v1\n", "part": "part v1\n"}
 
             # Nothing in the graph of `//app:handlers` is in `lib/`: the change gets through
             # because `lib` is built from it.
@@ -76,12 +84,10 @@ class DevHandlersTest(BuckTestCase):
             assert stale(buck, message) == {"lib": (["lib"], ["lib/lib.txt"])}
             await dev.quiet()
 
-            # Asked for by name, as an output of the `DevInfo` is.
-            build(dev, {"lib": None})
-            building, built = await dev.expect("building", "built")
-            assert files(buck, building) == ["lib/lib.txt"]
+            build(dev, ["lib"])
+            _, built = await dev.expect("build", "built")
             assert contents(built) == {"lib": "lib v2\n"}
-            assert built["outputs"]["lib"]["changed"]
+            assert built["changed"]
 
             write(buck, "app/part.txt", "part v2\n")
             (message,) = await dev.expect("stale")
@@ -92,10 +98,10 @@ class DevHandlersTest(BuckTestCase):
             write(buck, "app/extra.txt", "extra v2\n")
             await dev.quiet()
 
-            # The same name with another call is another output.
-            build(dev, {"part": owner("app/other.txt")})
-            building, built = await dev.expect("building", "built")
-            assert files(buck, building) == []
+            # The same name with another call is another output, which the server has not got.
+            define(dev, {"part": owner("app/other.txt")})
+            build(dev, ["part"])
+            _, built = await dev.expect("build", "built")
             assert contents(built) == {"part": "other v1\n"}
             write(buck, "app/part.txt", "part v3\n")
             await dev.quiet()
@@ -110,8 +116,9 @@ class DevHandlersTest(BuckTestCase):
         """An output that the server forgot is never stale."""
         dev, _ = await start_manual(buck)
         try:
-            build(dev, {"lib": owner("lib/lib.txt")})
-            await dev.expect("building", "built")
+            define(dev, {"lib": owner("lib/lib.txt")})
+            build(dev, ["lib"])
+            await dev.expect("build", "built")
             dev.request({"type": "forget", "outputs": ["lib", "site"]})
             # `buck2 dev` has handled the request.
             assert await dev.sync(30)
@@ -123,11 +130,11 @@ class DevHandlersTest(BuckTestCase):
 
     @dev_test()
     async def test_output_that_cannot_be_defined(self, buck: Buck) -> None:
-        """An unknown handler, or the name of an output of the `DevInfo`, fails that output, and
-        not the others."""
+        """An unknown handler, or the name of an output of the `DevInfo`, fails that definition
+        at once, and not the others."""
         dev, _ = await start_manual(buck)
         try:
-            build(
+            define(
                 dev,
                 {
                     "lib": owner("lib/lib.txt"),
@@ -135,11 +142,18 @@ class DevHandlersTest(BuckTestCase):
                     "site": owner("app/part.txt"),
                 },
             )
-            _, built = await dev.expect("building", "built")
+            failed = await dev.results(2)
+            assert sorted(failed) == ["nope", "site"]
+            assert all(m["type"] == "failed" for m in failed.values()), summary(
+                list(failed.values())
+            )
+            assert "no handler named `nope`" in failed["nope"]["error"]
+            assert "is an output of the `DevInfo`" in failed["site"]["error"]
+            await dev.quiet()
+
+            build(dev, ["lib"])
+            _, built = await dev.expect("build", "built")
             assert contents(built) == {"lib": "lib v1\n"}
-            assert sorted(built["failed"]) == ["nope", "site"]
-            assert "no handler named `nope`" in built["failed"]["nope"]
-            assert "is an output of the `DevInfo`" in built["failed"]["site"]
 
             # Neither is tracked, and `site` is as it was.
             write(buck, "lib/lib.txt", "lib v2\n")
@@ -156,18 +170,32 @@ class DevHandlersTest(BuckTestCase):
 
     @dev_test()
     async def test_handler_that_fails(self, buck: Buck) -> None:
-        """A handler whose output is no single artifact fails that output. What it is built
-        from is not known, so every change makes it stale."""
+        """A handler whose output is no single artifact fails that output, and not the others.
+        The output stays defined. What it is built from is not known, so every change makes it
+        stale."""
         dev, _ = await start_manual(buck)
         try:
-            build(dev, {"empty": {"handler": "broken"}, "lib": owner("lib/lib.txt")})
-            _, built = await dev.expect("building", "built")
-            assert contents(built) == {"lib": "lib v1\n"}
-            assert "returned 0 default outputs" in built["failed"]["empty"]
+            define(
+                dev,
+                {"empty": {"handler": "broken", "args": []}, "lib": owner("lib/lib.txt")},
+            )
+            build(dev, ["empty", "lib"])
+            await dev.expect("build")
+            results = await dev.results(2)
+            assert results["lib"]["type"] == "built", summary(list(results.values()))
+            assert contents(results["lib"]) == {"lib": "lib v1\n"}
+            assert results["empty"]["type"] == "failed", summary(list(results.values()))
+            error = results["empty"]["error"]
+            assert "returned 0 default outputs" in error, error
 
             write(buck, "app/extra.txt", "extra v2\n")
             (message,) = await dev.expect("stale")
             assert stale(buck, message) == {"empty": ([], ["app/extra.txt"])}
+
+            # Still defined: asked for again by name, it fails again.
+            build(dev, ["empty"])
+            _, failed = await dev.expect("build", "failed")
+            assert "returned 0 default outputs" in failed["error"], failed["error"]
         finally:
             await dev.stop()
 
@@ -177,17 +205,18 @@ class DevHandlersTest(BuckTestCase):
         does not load it, so it is not analysed again."""
         dev, _ = await start_manual(buck)
         try:
-            build(dev, {"lib": owner("lib/lib.txt")})
-            await dev.expect("building", "built")
+            define(dev, {"lib": owner("lib/lib.txt")})
+            build(dev, ["lib"])
+            await dev.expect("build", "built")
             write(buck, "dev.bxl", read(buck, "dev.bxl") + "# changed\n")
             (message,) = await dev.expect("stale")
             assert stale(buck, message) == {"lib": ([], ["dev.bxl"])}
             await dev.quiet()
 
-            build(dev, {"lib": None})
-            _, built = await dev.expect("building", "built")
+            build(dev, ["lib"])
+            _, built = await dev.expect("build", "built")
             assert contents(built) == {"lib": "lib v1\n"}
-            assert not built["outputs"]["lib"]["changed"]
+            assert not built["changed"]
         finally:
             await dev.stop()
 
@@ -198,8 +227,9 @@ class DevHandlersTest(BuckTestCase):
         does not hear `graph_changed`."""
         dev, _ = await start_manual(buck)
         try:
-            build(dev, {"lib": owner("lib/lib.txt")})
-            await dev.expect("building", "built")
+            define(dev, {"lib": owner("lib/lib.txt")})
+            build(dev, ["lib"])
+            await dev.expect("build", "built")
             # A file that no target has yet.
             write(buck, "lib/more.txt", "more v1\n")
             await dev.quiet()
@@ -208,8 +238,8 @@ class DevHandlersTest(BuckTestCase):
             assert stale(buck, message) == {"lib": (["lib"], [LIB])}
             await dev.quiet()
 
-            build(dev, {"lib": None})
-            _, built = await dev.expect("building", "built")
+            build(dev, ["lib"])
+            _, built = await dev.expect("build", "built")
             assert contents(built) == {"lib": "lib v1\nmore v1\n"}
             write(buck, "lib/more.txt", "more v2\n")
             (message,) = await dev.expect("stale")
@@ -222,11 +252,12 @@ class DevHandlersTest(BuckTestCase):
         """A server that starts again has defined no output."""
         dev, first = await start_manual(buck)
         try:
-            build(dev, {"lib": owner("lib/lib.txt")})
-            await dev.expect("building", "built")
+            define(dev, {"lib": owner("lib/lib.txt")})
+            build(dev, ["lib"])
+            await dev.expect("build", "built")
             dev.request({"type": "restart"})
             shutdown, _, _, _, built = await dev.expect(
-                "shutdown", "started", "ready", "building", "built"
+                "shutdown", "started", "ready", "build", "built"
             )
             assert shutdown["pid"] == first["pid"]
             assert contents(built) == {"site": "app v1\n"}

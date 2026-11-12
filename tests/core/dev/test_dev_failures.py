@@ -8,10 +8,10 @@
 
 # pyre-strict
 
-# What `buck2 dev` does when builds fail while it runs: the outputs, the server's own build, and
-# the server's requests. The fixture's `concat` actions fail when a line of what they
-# concatenate starts with `FAIL`. Each test states the behaviour it requires. Some fail against
-# the current `buck2 dev`: they describe behaviour it should have. They use the fixture of
+# What `buck2 dev` does when builds fail while it runs: the outputs, the analysis of the target, the
+# server's own build, and the server's requests. The fixture's `concat` actions fail when a line of
+# what they concatenate starts with `FAIL`. Each test states the behaviour it requires. Some fail
+# against the current `buck2 dev`: they describe behaviour it should have. They use the fixture of
 # `test_dev`.
 
 import os
@@ -49,7 +49,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            await dev.expect("failed")
+            await dev.expect("error")
             await dev.quiet()
 
             write(buck, "app/unrelated.txt", "unrelated\n")
@@ -60,15 +60,16 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_failed_build_keeps_the_server(self, buck: Buck) -> None:
-        """An edit that makes the output's action fail: `building` and `failed` with the same
-        `gen`, and the server keeps running."""
+        """An edit that makes the output's action fail: `stale`, the server asks for the output
+        again and gets `failed` for it, and the server keeps running."""
         dev = await start_dev(buck, "//app:all", "simple")
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            _, building, failed = await dev.expect("stale", "building", "failed")
-            assert files(buck, building) == ["app/main.txt"]
-            assert failed["gen"] == building["gen"]
+            stale, build, failed = await dev.expect("stale", "build", "failed")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
+            assert build["outputs"] == ["site"]
+            assert failed["output"] == "site"
             await dev.quiet()
             assert_kept(dev, first)
         finally:
@@ -84,7 +85,7 @@ class DevFailuresTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            _, _, failed = await dev.expect("stale", "building", "failed")
+            _, _, failed = await dev.expect("stale", "build", "failed")
             assert "an input says FAIL" in failed["error"], (
                 f"`error` of `failed` is {failed['error']!r}"
             )
@@ -98,10 +99,10 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("stale", "building", "failed")
+            await dev.expect("stale", "build", "failed")
             write(buck, "app/main.txt", "app v3\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
+            stale, _, built = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
             assert site(built) == "app v3\n"
             assert changed(built) == {"site": True}
             assert built["pid"] == first["pid"]
@@ -117,9 +118,9 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("stale", "building", "failed")
+            await dev.expect("stale", "build", "failed")
             write(buck, "app/main.txt", "app v1\n")
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "app v1\n"
             assert changed(built) == {"site": False}
             assert built["pid"] == first["pid"]
@@ -135,17 +136,23 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/pages/a.txt", "FAIL a\n")
-            await dev.expect("stale", "building", "failed")
+            await dev.expect("stale", "build", "failed")
 
             write(buck, "app/pages/b.txt", "page b\n")
-            _, _, building, _ = await dev.expect(
-                "graph_changed", "stale", "building", "failed"
+            _, stale, _, _ = await dev.expect(
+                "graph_changed", "stale", "build", "failed"
             )
-            assert files(buck, building) == ["app/pages/a.txt", "app/pages/b.txt"]
+            assert files(buck, stale["outputs"]["site"]) == [
+                "app/pages/a.txt",
+                "app/pages/b.txt",
+            ]
 
             write(buck, "app/pages/a.txt", "page a2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/pages/a.txt", "app/pages/b.txt"]
+            stale, _, built = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == [
+                "app/pages/a.txt",
+                "app/pages/b.txt",
+            ]
             assert site(built) == "page a2\npage b\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -161,14 +168,14 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("stale", "building", "failed")
+            await dev.expect("stale", "build", "failed")
             write(buck, "app/other.txt", "other v2\n")
             await dev.quiet()
 
             os.utime(buck.cwd / "app/main.txt")
-            _, building, failed = await dev.expect("stale", "building", "failed")
-            assert files(buck, building) == ["app/main.txt"]
-            assert failed["gen"] == building["gen"]
+            stale, _, failed = await dev.expect("stale", "build", "failed")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
+            assert failed["output"] == "site"
             await dev.quiet()
             assert_kept(dev, first)
         finally:
@@ -182,13 +189,12 @@ class DevFailuresTest(BuckTestCase):
         try:
             first = await dev.start()
             write(buck, "app/main.txt", "FAIL v2\n")
-            await dev.expect("stale", "building", "failed")
+            await dev.expect("stale", "build", "failed")
             dev.request({"type": "build", "outputs": ["site"]})
-            building, failed = await dev.expect("building", "failed")
-            # The site is still stale with the change that broke it.
-            assert files(buck, building) == ["app/main.txt"]
-            assert building["outputs"] == ["site"]
-            assert failed["gen"] == building["gen"]
+            build, failed = await dev.expect("build", "failed")
+            assert build["outputs"] == ["site"]
+            assert failed["output"] == "site"
+            assert "an input says FAIL" in failed["error"], failed["error"]
             await dev.quiet()
             assert_kept(dev, first)
         finally:
@@ -200,22 +206,27 @@ class DevFailuresTest(BuckTestCase):
         builds."""
         dev = await start_dev(buck, "//app:multi")
         try:
-            first = await dev.start()
+            first = await dev.start(outputs=2)
             assert contents(first) == {"site": "app v1\n", "extra": "extra v1\n"}
 
             write(buck, "app/extra.txt", "FAIL extra\n")
-            _, building, _ = await dev.expect("stale", "building", "failed")
-            assert building["outputs"] == ["extra"]
-            assert files(buck, building) == ["app/extra.txt"]
+            stale, build, failed = await dev.expect("stale", "build", "failed")
+            assert build["outputs"] == ["extra"]
+            assert failed["output"] == "extra"
+            assert files(buck, stale["outputs"]["extra"]) == ["app/extra.txt"]
 
             write(buck, "app/main.txt", "app v2\n")
-            stale, building, built = await dev.expect("stale", "building", "built")
+            stale, build = await dev.expect("stale", "build")
             assert sorted(stale["outputs"]) == ["extra", "site"]
-            assert building["outputs"] == ["extra", "site"]
-            assert contents(built) == {"site": "app v2\n"}
-            assert list(built["failed"]) == ["extra"]
+            assert build["outputs"] == ["extra", "site"]
+            results = await dev.results(2)
+            assert results["site"]["type"] == "built", summary(list(results.values()))
+            assert site(results["site"]) == "app v2\n"
+            assert results["extra"]["type"] == "failed", summary(
+                list(results.values())
+            )
             await dev.quiet()
-            assert_kept(dev, first)
+            assert_kept(dev, first["site"])
         finally:
             await dev.stop()
 
@@ -223,34 +234,38 @@ class DevFailuresTest(BuckTestCase):
     async def test_request_for_several_outputs_with_one_broken(
         self, buck: Buck
     ) -> None:
-        """The server asks for two outputs, one broken: it still gets a `built` with the one that
-        built."""
+        """The server asks for two outputs, one broken: it gets `built` for the one that builds,
+        and `failed` for the other."""
         dev = await start_dev(buck, "//app:multi")
         try:
-            first = await dev.start()
+            first = await dev.start(outputs=2)
             write(buck, "app/extra.txt", "FAIL extra\n")
-            await dev.expect("stale", "building", "failed")
+            await dev.expect("stale", "build", "failed")
 
             dev.request({"type": "build", "outputs": ["site", "extra"]})
-            building, built = await dev.expect(
-                "building", "built", timeout=EXPECTED_WITHIN
+            (build,) = await dev.expect("build", timeout=EXPECTED_WITHIN)
+            assert build["outputs"] == ["extra", "site"]
+            results = await dev.results(2, timeout=EXPECTED_WITHIN)
+            assert results["site"]["type"] == "built", summary(list(results.values()))
+            assert site(results["site"]) == "app v1\n"
+            assert results["extra"]["type"] == "failed", summary(
+                list(results.values())
             )
-            assert building["outputs"] == ["extra", "site"]
-            assert contents(built).get("site") == "app v1\n", summary([built])
-            assert_kept(dev, first)
+            await dev.quiet()
+            assert_kept(dev, first["site"])
         finally:
             await dev.stop()
 
     @dev_test()
     async def test_server_build_fails_on_restart(self, buck: Buck) -> None:
-        """The server's own build fails when a change to its script would restart it: `failed`,
+        """The server's own build fails when a change to its script would restart it: `error`,
         and the old server keeps running, until a fix restarts it."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            (failed,) = await dev.expect("failed")
-            assert "Failed to build the `buck2 dev` server" in failed["error"], failed[
+            (error,) = await dev.expect("error")
+            assert "Failed to build the `buck2 dev` server" in error["error"], error[
                 "error"
             ]
             await dev.quiet()
@@ -264,7 +279,7 @@ class DevFailuresTest(BuckTestCase):
 
             write(buck, "app/check.txt", "ok\n")
             shutdown, started, _, _, built = await dev.expect(
-                "shutdown", "started", "ready", "building", "built"
+                "shutdown", "started", "ready", "build", "built"
             )
             assert shutdown["pid"] == first["pid"]
             assert started["pid"] != first["pid"]
@@ -277,18 +292,18 @@ class DevFailuresTest(BuckTestCase):
     async def test_change_while_server_build_broken_fails_once(
         self, buck: Buck
     ) -> None:
-        """While the server's build is broken, a change to the server's script sends one
-        `failed`."""
+        """While the server's build is broken, a change to the server's script builds it again,
+        which fails again: one more `error`."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            await dev.expect("failed")
+            await dev.expect("error")
             await dev.quiet()
 
             server = read(buck, "app/server.py")
             write(buck, "app/server.py", server + "# changed\n")
-            await dev.expect("failed")
+            await dev.expect("error")
             await dev.quiet()
             assert_kept(dev, first)
         finally:
@@ -296,18 +311,18 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_server_build_fails_while_the_output_builds(self, buck: Buck) -> None:
-        """The server's own build broken: each change builds the server again, which fails, and
-        the old server keeps running. The output is still stale after a change, and builds when
-        the server asks for it."""
+        """The server's own build broken: each change to an output builds the server again,
+        which fails, so the server gets `error` again, and the old server keeps running. The
+        output is still stale after a change, and builds when the server asks for it."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            (failed,) = await dev.expect("failed")
-            assert "Failed to build the `buck2 dev` server" in failed["error"]
+            (error,) = await dev.expect("error")
+            assert "Failed to build the `buck2 dev` server" in error["error"]
 
             write(buck, "app/main.txt", "app v2\n")
-            _, _, _, built = await dev.expect("failed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("error", "stale", "build", "built")
             assert site(built) == "app v2\n"
 
             # A change to the target does the same.
@@ -318,7 +333,7 @@ class DevFailuresTest(BuckTestCase):
                 'srcs = ["main.txt"],',
                 'srcs = ["main.txt", "other.txt"],',
             )
-            _, _, _, built = await dev.expect("failed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("error", "stale", "build", "built")
             assert site(built) == "app v2\nother v1\n"
             await dev.quiet()
             assert_kept(dev, first)
@@ -346,7 +361,7 @@ class DevFailuresTest(BuckTestCase):
             assert not alive(first["pid"])
 
             write(buck, APP, targets)
-            _, _, _, built = await dev.expect("started", "ready", "building", "built")
+            _, _, _, built = await dev.expect("started", "ready", "build", "built")
             assert site(built) == "app v1\n"
             await dev.quiet()
         finally:
@@ -369,7 +384,7 @@ class DevFailuresTest(BuckTestCase):
             assert dev.running()
 
             write(buck, "app/server.py", server)
-            _, _, _, built = await dev.expect("started", "ready", "building", "built")
+            _, _, _, built = await dev.expect("started", "ready", "build", "built")
             assert site(built) == "app v1\n"
             await dev.quiet()
         finally:
@@ -379,17 +394,17 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_restart_request_while_server_build_broken(self, buck: Buck) -> None:
-        """The server asks for a restart while its own build is broken: `failed`, the old server
+        """The server asks for a restart while its own build is broken: `error`, the old server
         keeps running, and the fix restarts it."""
         dev = await start_dev(buck, "//app:built_server")
         try:
             first = await dev.start()
             write(buck, "app/check.txt", "broken\n")
-            await dev.expect("failed")
+            await dev.expect("error")
 
             dev.request({"type": "restart"})
-            (failed,) = await dev.expect("failed")
-            assert "Failed to build the `buck2 dev` server" in failed["error"]
+            (error,) = await dev.expect("error")
+            assert "Failed to build the `buck2 dev` server" in error["error"]
             await dev.quiet()
             assert_kept(dev, first)
 
@@ -399,28 +414,29 @@ class DevFailuresTest(BuckTestCase):
             # The new server gets `ready`, asks for `site`, and gets it.
             rest = await dev.collect()
             assert rest[0]["type"] == "ready", summary(rest)
-            assert [e["type"] for e in rest[-2:]] == ["building", "built"], summary(
-                rest
-            )
-            assert rest[-2]["gen"] == rest[-1]["gen"]
+            assert [e["type"] for e in rest[-2:]] == ["build", "built"], summary(rest)
+            assert rest[-1]["output"] == "site"
             assert all(e["pid"] == started["pid"] for e in rest)
         finally:
             await dev.stop()
 
     @dev_test()
     async def test_build_request_while_analysis_broken(self, buck: Buck) -> None:
-        """The server asks for a build while the analysis of the target fails: one `building`
-        and one `failed`."""
+        """The server asks for a build while the analysis of the target fails: the failed
+        analysis sends `error`, and the build that the server asks for gets one `failed` for its
+        output, with the analysis error, and no second `error`."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             edit_target(buck, APP, "all", 'mode = "outputs"', 'mode = "bogus"')
-            await dev.expect("failed")
+            (error,) = await dev.expect("error")
+            assert "unknown mode bogus" in error["error"], error["error"]
 
             await dev.quiet()
             dev.request({"type": "build", "outputs": ["site"]})
-            building, failed = await dev.expect("building", "failed")
-            assert building["gen"] == failed["gen"]
+            _, failed = await dev.expect("build", "failed")
+            assert failed["output"] == "site"
+            assert "unknown mode bogus" in failed["error"], failed["error"]
             await dev.quiet()
             assert_kept(dev, first)
         finally:
@@ -428,14 +444,14 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_build_request_for_unknown_output(self, buck: Buck) -> None:
-        """The server asks for an output that `DevInfo` does not have: `building` and `failed`,
-        and the server keeps running."""
+        """The server asks for an output that `DevInfo` does not have: `failed` for it, and the
+        server keeps running."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             dev.request({"type": "build", "outputs": ["nope"]})
-            building, failed = await dev.expect("building", "failed")
-            assert building["outputs"] == ["nope"]
+            _, failed = await dev.expect("build", "failed")
+            assert failed["output"] == "nope"
             assert "no output named `nope`" in failed["error"], failed["error"]
             await dev.quiet()
             assert_kept(dev, first)
@@ -444,14 +460,13 @@ class DevFailuresTest(BuckTestCase):
 
     @dev_test()
     async def test_build_request_for_no_outputs(self, buck: Buck) -> None:
-        """The server asks for a build of no outputs: `building` and an empty `built`."""
+        """The server asks for a build of no outputs: there is nothing to answer, so nothing
+        comes back, and the server keeps running."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             dev.request({"type": "build", "outputs": []})
-            building, built = await dev.expect("building", "built")
-            assert building["outputs"] == []
-            assert built["outputs"] == {}
+            await dev.expect("build")
             await dev.quiet()
             assert_kept(dev, first)
         finally:

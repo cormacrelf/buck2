@@ -9,8 +9,9 @@
 # A `buck2 dev` server for the tests. It connects to `BUCK2_DEV_SOCKET`, and appends each
 # message it receives, with its process ID and the content of each built output and sidecar, to
 # `buck-out/dev_events.jsonl`, where the file watcher does not see it. It also logs some events of
-# its own, whose types do not clash with `buck2 dev` messages. With `--log-in-project`, it also
-# appends each to `server.log` in the project root, as a server that logs to the project would.
+# its own, whose types do not clash with `buck2 dev` messages: among them each `build` request
+# that it sends, just before it sends it. With `--log-in-project`, it also appends each to
+# `server.log` in the project root, as a server that logs to the project would.
 #
 # On `ready` it asks for the `site` output, and on `stale` for every output that `stale` lists.
 # With `--manual`, it does not answer `stale`: the tests ask for builds themselves. With
@@ -20,7 +21,8 @@
 # unknown type on `ready`. With `--no-connect`, it never connects, and only logs `started`. With
 # `--crash-once`, the first server to get `built` exits with an error. With `--exit-after-built`,
 # every server exits successfully after `built`. With `--flood-on-second-build`, it sends one
-# long request when the second build starts, and logs `flooded` once `buck2 dev` has read it.
+# long request after it asks for its second build, and logs `flooded` once `buck2 dev` has read
+# it.
 # With `--too-long`, it sends a line longer than `buck2 dev` accepts on `ready`. With
 # `--all-outputs`, it asks for every output that `ready` names instead of `site`. With
 # `--slow-shutdown`, it takes 3 seconds to exit after `shutdown`.
@@ -42,8 +44,8 @@ import time
 def log(message):
     message["pid"] = os.getpid()
     if message["type"] == "built":
-        for output in message["outputs"].values():
-            for artifact in [output, *output.get("sidecars", {}).values()]:
+        for artifact in [message, *message.get("sidecars", {}).values()]:
+            if "path" in artifact:
                 with open(artifact["path"]) as f:
                     artifact["content"] = f.read()
     line = json.dumps(message) + "\n"
@@ -112,11 +114,13 @@ def main():
 
     def request(message):
         with lock:
+            if message.get("type") == "build":
+                log({"type": "build", "outputs": sorted(message.get("outputs", []))})
             conn.write((json.dumps(message) + "\n").encode())
             conn.flush()
 
     threading.Thread(target=control, args=(request,), daemon=True).start()
-    version = 1
+    version = 2
     for arg in args:
         if arg.startswith("--hello-version="):
             version = int(arg.split("=", 1)[1])
@@ -128,6 +132,17 @@ def main():
                 return
 
 
+def build(request, state, args, outputs):
+    """Ask for a build of `outputs`."""
+    request({"type": "build", "outputs": outputs})
+    state["builds"] += 1
+    if state["builds"] == 2 and "--flood-on-second-build" in args:
+        # Far more than a socket buffer, but less than the longest line `buck2 dev` accepts:
+        # this returns only once `buck2 dev` reads it, which it must do while it builds.
+        request({"type": "build", "outputs": ["site"], "pad": "x" * (2 << 20)})
+        log({"type": "flooded"})
+
+
 def handle(message, args, request, state):
     """Log `message` and answer it. Returns whether the server keeps running."""
     log(message)
@@ -137,29 +152,21 @@ def handle(message, args, request, state):
         request({"type": "hello", "version": max(message["versions"])})
     elif kind == "ready":
         if "--too-long" in args:
-            request({"type": "build", "pad": "x" * (5 << 20)})
+            request({"type": "_long", "pad": "x" * (5 << 20)})
         if "--bad-request" in args:
             request({"type": "bulid", "outputs": ["site"]})
         if "--all-outputs" in args:
-            request({"type": "build", "outputs": message["outputs"]})
+            build(request, state, args, message["outputs"])
         else:
-            request({"type": "build", "outputs": ["site"]})
+            build(request, state, args, ["site"])
     elif kind == "stale" and "--patcher" in args:
         exe = message["outputs"].get("exe", {})
         if "lib" in exe.get("within", []):
-            request({"type": "build", "outputs": ["patch"]})
+            build(request, state, args, ["patch"])
         else:
-            request({"type": "build", "outputs": ["exe", "patch"]})
+            build(request, state, args, ["exe", "patch"])
     elif kind == "stale" and "--manual" not in args:
-        request({"type": "build", "outputs": sorted(message["outputs"])})
-    elif kind == "building":
-        state["builds"] += 1
-        if state["builds"] == 2 and "--flood-on-second-build" in args:
-            # Far more than a socket buffer, but less than the longest line `buck2 dev`
-            # accepts: this returns only once `buck2 dev` reads it, which it must do while it
-            # builds.
-            request({"type": "build", "outputs": ["site"], "pad": "x" * (2 << 20)})
-            log({"type": "flooded"})
+        build(request, state, args, sorted(message["outputs"]))
     elif kind == "built" and "--exit-after-built" in args:
         log({"type": "exiting"})
         return False

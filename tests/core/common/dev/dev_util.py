@@ -28,19 +28,22 @@ from buck2.tests.e2e_util.buck_workspace import buck_test
 # The messages that `buck2 dev` sends the server.
 PROTOCOL = {
     "ready",
-    "building",
     "built",
     "failed",
     "cancelled",
+    "error",
     "stale",
     "graph_changed",
     "shutdown",
     "unsupported",
 }
 
-# What `DevSession.next` and `DevSession.expect` see: the messages, and `started`, which each
-# server logs when it starts.
-OBSERVED = PROTOCOL | {"started"}
+# What `DevSession.next` and `DevSession.expect` see: the messages, `started`, which each server
+# logs when it starts, and `build`, which it logs just before it sends a `build` request.
+OBSERVED = PROTOCOL | {"started", "build"}
+
+# The messages that end the build of an output.
+RESULTS = {"built", "failed", "cancelled"}
 
 
 class DevSession:
@@ -116,15 +119,18 @@ class DevSession:
 
     async def expect(self, *kinds: str, timeout: float = 90) -> List[Dict[str, Any]]:
         """Assert that the next messages and server starts are of types `kinds`, in this order,
-        all within `timeout` seconds, and return them. On failure, the message says what
-        arrived instead."""
+        all within `timeout` seconds, and return them. The kind `result` is any message that
+        ends the build of an output. On failure, the message says what arrived instead."""
         deadline = time.monotonic() + timeout
         got = []
         for kind in kinds:
             event = await self._next_until(deadline)
             if event is not None:
                 got.append(event)
-            if event is None or event["type"] != kind:
+            matches = event is not None and (
+                event["type"] == kind or (kind == "result" and event["type"] in RESULTS)
+            )
+            if not matches:
                 # Show a little of what follows, too.
                 await asyncio.sleep(1)
                 got += [
@@ -196,14 +202,26 @@ class DevSession:
         assert later == [], later
 
     async def start(self, outputs: int = 1) -> Dict[str, Any]:
-        """Wait for the server to start, connect, and get its first build. Returns the `built`
-        message, which has the server's `pid`."""
-        _, ready, building, built = await self.expect(
-            "started", "ready", "building", "built"
-        )
-        assert ready["pid"] == built["pid"]
-        assert building["files"] == []
-        return built
+        """Wait for the server to start, connect, and get its first build of `outputs` outputs.
+        Returns the `built` message, which has the server's `pid`, of the only output, or, with
+        several, the `built` messages by output."""
+        _, ready, _ = await self.expect("started", "ready", "build")
+        results = await self.results(outputs)
+        for result in results.values():
+            assert result["type"] == "built", result
+            assert ready["pid"] == result["pid"]
+        if outputs == 1:
+            (built,) = results.values()
+            return built
+        return results
+
+    async def results(
+        self, count: int, timeout: float = 90
+    ) -> Dict[str, Dict[str, Any]]:
+        """The next `count` messages, which must each end the build of an output (`built`,
+        `failed` or `cancelled`), by output."""
+        got = await self.expect(*(["result"] * count), timeout=timeout)
+        return {message["output"]: message for message in got}
 
     def request(self, message: Dict[str, Any]) -> None:
         """Have the running server send `message` to `buck2 dev`, or, for a type starting with
@@ -247,12 +265,12 @@ def summary(events: List[Dict[str, Any]]) -> List[str]:
     """The events, short, for assertion messages."""
     out = []
     for e in events:
-        detail = {k: v for k, v in e.items() if k in ("gen", "files", "error", "pid")}
-        if e["type"] == "built":
-            detail["outputs"] = {
-                name: output.get("content") for name, output in e["outputs"].items()
-            }
-        elif "outputs" in e:
+        detail = {
+            k: v
+            for k, v in e.items()
+            if k in ("output", "token", "files", "error", "pid", "content")
+        }
+        if "outputs" in e:
             detail["outputs"] = e["outputs"]
         if "error" in detail:
             detail["error"] = str(detail["error"])[:200]
@@ -283,23 +301,30 @@ def path(buck: Buck, rel: str) -> str:
 
 
 def files(buck: Buck, message: Dict[str, Any]) -> List[str]:
-    """The `files` of a `building` or `stale` message, relative to the project root."""
+    """The `files` of an output in a `stale` message, relative to the project root."""
     root = os.path.realpath(buck.cwd)
     return sorted(os.path.relpath(os.path.realpath(f), root) for f in message["files"])
 
 
 def site(built: Dict[str, Any]) -> str:
-    return built["outputs"]["site"]["content"]
+    """The content of `site` in a `built` message for it."""
+    assert built["output"] == "site", built
+    return built["content"]
 
 
-def contents(built: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """The content of each output of a `built` message."""
-    return {name: output.get("content") for name, output in built["outputs"].items()}
+def contents(results: Dict[str, Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    """The content of each output of `results`, by output, as `DevSession.results` gives them,
+    or of the one output of a `built` message."""
+    if "type" in results:
+        return {results["output"]: results.get("content")}
+    return {name: message.get("content") for name, message in results.items()}
 
 
-def changed(built: Dict[str, Any]) -> Dict[str, bool]:
-    """Whether each output of a `built` message changed."""
-    return {name: output["changed"] for name, output in built["outputs"].items()}
+def changed(results: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
+    """Whether each output of `results` changed. See `contents`."""
+    if "type" in results:
+        return {results["output"]: results["changed"]}
+    return {name: message["changed"] for name, message in results.items()}
 
 
 def write(buck: Buck, rel: str, content: str) -> None:

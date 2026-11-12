@@ -7,7 +7,8 @@
 # above-listed licenses.
 
 # A `buck2 dev` server for `test_dev_linked`. It logs `started`, connects, asks for every output
-# on `ready`, and for every output that `stale` lists, and on `built` runs each output: its `argv`, or else the file at its `path`. It
+# on `ready`, and for every output that `stale` lists, and on `built` runs the output: its `argv`,
+# or else the file at its `path`, and each of its sidecars. It
 # appends each message it gets to `buck-out/dev_events.jsonl`, like `app/server.py`, with what
 # each run printed and its exit code under `ran`, and the content of the output's file under
 # `content`. Like `app/server.py`, it sends each line that the tests add to
@@ -76,14 +77,13 @@ def main():
             conn.flush()
 
     threading.Thread(target=control, args=(request,), daemon=True).start()
-    request({"type": "hello", "version": 1})
+    request({"type": "hello", "version": 2})
     for line in conn:
         message = json.loads(line)
         kind = message["type"]
         if kind == "built":
-            for output in message["outputs"].values():
-                for artifact in [output, *output.get("sidecars", {}).values()]:
-                    run(artifact)
+            for artifact in [message, *message.get("sidecars", {}).values()]:
+                run(artifact)
         log(message)
         if kind == "ready":
             request({"type": "build", "outputs": message["outputs"]})

@@ -1945,6 +1945,29 @@ impl DaemonApi for BuckdServer {
         .await
     }
 
+    type DevSessionStream = ResponseStream;
+    async fn dev_session(
+        &self,
+        req: Request<tonic::Streaming<StreamingRequest>>,
+    ) -> Result<Response<Self::DevSessionStream>, Status> {
+        self.run_bidirectional(
+            req,
+            DefaultCommandOptions,
+            |ctx,
+             partial_result_dispatcher,
+             _client_ctx,
+             req: StreamingRequestHandler<buck2_cli_proto::DevSessionMessage>| {
+                Box::pin(async move {
+                    OTHER_SERVER_COMMANDS
+                        .get()?
+                        .dev_session(ctx, partial_result_dispatcher, req)
+                        .await
+                })
+            },
+        )
+        .await
+    }
+
     type DapStream = ResponseStream;
     async fn dap(
         &self,

@@ -67,36 +67,34 @@ class DevBxlTest(BuckTestCase):
         the server."""
         dev = await start_app(buck)
         try:
-            _, ready, building, built = await dev.expect(
-                "started", "ready", "building", "built"
-            )
+            _, ready, build = await dev.expect("started", "ready", "build")
             assert ready["outputs"] == ["shout", "site"]
             assert ready["scopes"] == ["lib"]
-            assert building["outputs"] == ["shout", "site"]
-            assert contents(built) == {
+            assert build["outputs"] == ["shout", "site"]
+            assert contents(await dev.results(2)) == {
                 "shout": "LIB V1\nAPP V1\n",
                 "site": "lib v1\napp v1\n",
             }
 
             # What the function's own action is built from is what `site` is built from.
             write(buck, "app/main.txt", "app v2\n")
-            message, _, built = await dev.expect("stale", "building", "built")
+            message, _ = await dev.expect("stale", "build")
             assert stale(buck, message) == {
                 "shout": ([], ["app/main.txt"]),
                 "site": ([], ["app/main.txt"]),
             }
-            assert contents(built) == {
+            assert contents(await dev.results(2)) == {
                 "shout": "LIB V1\nAPP V2\n",
                 "site": "lib v1\napp v2\n",
             }
 
             write(buck, "lib/lib.txt", "lib v2\n")
-            message, _, built = await dev.expect("stale", "building", "built")
+            message, _ = await dev.expect("stale", "build")
             assert stale(buck, message) == {
                 "shout": (["lib"], ["lib/lib.txt"]),
                 "site": (["lib"], ["lib/lib.txt"]),
             }
-            assert contents(built) == {
+            assert contents(await dev.results(2)) == {
                 "shout": "LIB V2\nAPP V2\n",
                 "site": "lib v2\napp v2\n",
             }
@@ -106,7 +104,7 @@ class DevBxlTest(BuckTestCase):
             # builds, so it may be built from any file of that target, as an output of a rule
             # may be built from any file of a dependency.
             write(buck, "app/extra.txt", "extra v2\n")
-            message, _, built = await dev.expect("stale", "building", "built")
+            message, _, built = await dev.expect("stale", "build", "built")
             assert stale(buck, message) == {"shout": ([], ["app/extra.txt"])}
             assert changed(built) == {"shout": False}
             await dev.quiet()
@@ -118,22 +116,22 @@ class DevBxlTest(BuckTestCase):
         """A change to the function's file analyses it again, and makes every output stale."""
         dev = await start_app(buck)
         try:
-            first = await dev.start()
+            first = await dev.start(outputs=2)
             write(buck, BXL, read(buck, BXL) + "# changed\n")
-            _, _, building, built = await dev.expect(
-                "graph_changed", "stale", "building", "built"
-            )
-            assert files(buck, building) == [BXL]
-            assert changed(built) == {"shout": False, "site": False}
-            assert built["pid"] == first["pid"]
+            _, message, _ = await dev.expect("graph_changed", "stale", "build")
+            assert stale(buck, message) == {"shout": ([], [BXL]), "site": ([], [BXL])}
+            results = await dev.results(2)
+            assert changed(results) == {"shout": False, "site": False}
+            assert results["site"]["pid"] == first["site"]["pid"]
 
             write(buck, BXL, read(buck, BXL).replace("tr a-z A-Z <", 'sed "s/^/> /" <'))
-            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
-            assert contents(built) == {
+            await dev.expect("graph_changed", "stale", "build")
+            results = await dev.results(2)
+            assert contents(results) == {
                 "shout": "> lib v1\n> app v1\n",
                 "site": "lib v1\napp v1\n",
             }
-            assert changed(built) == {"shout": True, "site": False}
+            assert changed(results) == {"shout": True, "site": False}
             await dev.quiet()
         finally:
             await dev.stop()

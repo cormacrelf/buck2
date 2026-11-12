@@ -10,15 +10,16 @@
 
 //! The daemon side of `buck2 dev`.
 //!
-//! `buck2 dev` sends three kinds of request, each a separate daemon command:
+//! A `buck2 dev` session is one daemon command, which runs as long as `buck2 dev` does (see
+//! `session`). It takes three kinds of request:
 //!
 //! - `Server` builds the `DevInfo` server.
 //! - `Watch` says what each changed path is to the server and to each output, and whether
 //!   their targets changed.
-//! - `Build` builds named `DevInfo` outputs.
+//! - `Build` builds named outputs: those of `DevInfo`, and dynamic ones.
 //!
 //! The client runs the server, and acts on the file changes that the daemon's file watcher pushes
-//! to it through a subscription, so no daemon command lasts longer than one build.
+//! to it through a subscription.
 //!
 //! The server and each output claim the files that they may be built from, and a file may
 //! belong to several of them. What claims files is a list of `Slot`s, and a set of slots is a
@@ -37,6 +38,10 @@
 //! `DevDynamicClaimsKey`, with one output slot. `buck2 dev` sends the dynamic outputs that it
 //! tracks with each `Watch`, and the session's file interest is the union of all the claims.
 
+mod session;
+
+pub(crate) use session::dev_session_command;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
@@ -44,10 +49,6 @@ use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -77,23 +78,19 @@ use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProvide
 use buck2_build_api::materialize::HasMaterializationQueueTracker;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_build_api::materialize::materialize_and_upload_artifact_group;
-use buck2_cli_proto::new_generic::DevAction;
-use buck2_cli_proto::new_generic::DevBuilt;
 use buck2_cli_proto::new_generic::DevBuiltOutput;
 use buck2_cli_proto::new_generic::DevBuiltSidecar;
 use buck2_cli_proto::new_generic::DevChange;
 use buck2_cli_proto::new_generic::DevDynamicCall;
 use buck2_cli_proto::new_generic::DevDynamicWatched;
-use buck2_cli_proto::new_generic::DevInterrupted;
 use buck2_cli_proto::new_generic::DevOutputChanges;
-use buck2_cli_proto::new_generic::DevRequest;
-use buck2_cli_proto::new_generic::DevResponse;
+use buck2_cli_proto::new_generic::DevOutputError;
 use buck2_cli_proto::new_generic::DevServer;
+use buck2_cli_proto::new_generic::DevSessionStart;
 use buck2_cli_proto::new_generic::DevTargets;
 use buck2_cli_proto::new_generic::DevWatchRequest;
 use buck2_cli_proto::new_generic::DevWatchState;
 use buck2_cli_proto::new_generic::DevWatched;
-use buck2_cli_proto::new_generic::NewGenericPartialResult;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::metadata::FileType;
@@ -123,7 +120,6 @@ use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-use buck2_data::BuildResult;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
@@ -142,7 +138,6 @@ use buck2_node::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::target_calculation::ConfiguredTargetCalculation;
 use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
-use buck2_server_ctx::ctx::FileChangeBatch;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::dev_interest::FileInterest;
 use buck2_server_ctx::dev_interest::add_interest;
@@ -152,9 +147,6 @@ use buck2_server_ctx::dev_interest::session_held_if_any;
 use buck2_server_ctx::dev_interest::set_interest;
 use buck2_server_ctx::dev_interest::stable_hash;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
-use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::template::ServerCommandTemplate;
-use buck2_server_ctx::template::run_server_command;
 use dice::CancellationContext;
 use dice::DiceComputations;
 use dice::DiceTransaction;
@@ -163,9 +155,6 @@ use dice::Key;
 use dice::NoValueSerialize;
 use dice::ValueSerialize;
 use dupe::Dupe;
-use futures::StreamExt;
-use futures::channel::oneshot;
-use futures::stream::BoxStream;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 
@@ -290,7 +279,7 @@ impl DevSubject {
     async fn of_request(
         server_ctx: &dyn ServerCommandContextTrait,
         ctx: &DiceTransaction,
-        req: &DevRequest,
+        req: &DevSessionStart,
         global_cfg_options: &GlobalCfgOptions,
     ) -> buck2_error::Result<DevSubject> {
         if let Some(bxl_args) = &req.bxl_args {
@@ -546,484 +535,241 @@ fn dev_policy(
     })
 }
 
-pub(crate) async fn dev_command(
-    ctx: &dyn ServerCommandContextTrait,
-    partial_result_dispatcher: PartialResultDispatcher<
-        buck2_cli_proto::NewGenericPartialResultMessage,
-    >,
-    req: DevRequest,
-) -> buck2_error::Result<DevResponse> {
-    // A build stops when a file that it builds from changes. Subscribe before the command syncs
-    // the file watcher, so that no change falls between what the build sees and what the
-    // subscription reports. A change in between is reported but is no change to the build.
-    let changes = match &req.action {
-        DevAction::Build { .. } => ctx.subscribe_to_file_changes().await.ok(),
-        DevAction::Server | DevAction::Watch(_) | DevAction::Release => None,
-    };
-    run_server_command(
-        DevServerCommand {
-            req,
-            changes: Mutex::new(changes),
-        },
-        ctx,
-        partial_result_dispatcher,
-    )
-    .await
+/// What a session runs, as a transaction sees it: the target or the bxl function, and the
+/// `DevInfo` or `RunInfo` that it has.
+struct Target {
+    global_cfg_options: GlobalCfgOptions,
+    subject: DevSubject,
+    /// Held across awaits, so this needs the owned form.
+    info: DevProvider,
 }
 
-struct DevServerCommand {
-    req: DevRequest,
-    changes: Mutex<Option<BoxStream<'static, FileChangeBatch>>>,
-}
-
-#[async_trait]
-impl ServerCommandTemplate for DevServerCommand {
-    type StartEvent = buck2_data::DevCommandStart;
-    type EndEvent = buck2_data::DevCommandEnd;
-    type Response = DevResponse;
-    type PartialResult = buck2_cli_proto::NewGenericPartialResultMessage;
-
-    async fn command(
-        &self,
+impl Target {
+    async fn resolve(
         server_ctx: &dyn ServerCommandContextTrait,
-        partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
-        mut ctx: DiceTransaction,
-    ) -> buck2_error::Result<Self::Response> {
-        let changes = self
-            .changes
-            .lock()
-            .ok()
-            .and_then(|mut changes| changes.take());
-        let partial_results = Mutex::new(partial_result_dispatcher);
-        let response = dev(server_ctx, &mut ctx, &self.req, changes, &partial_results).await;
-        if response.is_err() && matches!(self.req.action, DevAction::Watch(_)) {
-            // What fixes the target may be outside what it was built from.
-            clear_interest(&self.req.session);
-        }
-        response
-    }
-
-    fn build_result(&self, _response: &Self::Response) -> Option<BuildResult> {
-        Some(BuildResult {
-            build_completed: true,
+        dice: &DiceTransaction,
+        start: &DevSessionStart,
+    ) -> buck2_error::Result<Target> {
+        let global_cfg_options =
+            global_cfg_options_from_client_context(&start.target_cfg, server_ctx, &mut dice.ctx())
+                .await?;
+        let subject = DevSubject::of_request(server_ctx, dice, start, &global_cfg_options).await?;
+        let providers = subject.providers(&mut dice.ctx()).await?;
+        let info = DevProvider::of(&providers, &subject)?;
+        Ok(Target {
+            global_cfg_options,
+            subject,
+            info,
         })
     }
 }
 
-async fn dev(
+/// Analyse the target, build the server, and set up the local resources of the session.
+async fn server_action(
     server_ctx: &dyn ServerCommandContextTrait,
-    ctx: &mut DiceTransaction,
-    req: &DevRequest,
-    changes: Option<BoxStream<'static, FileChangeBatch>>,
-    partial_results: &Mutex<
-        PartialResultDispatcher<buck2_cli_proto::NewGenericPartialResultMessage>,
-    >,
-) -> buck2_error::Result<DevResponse> {
-    if let DevAction::Release = &req.action {
-        // Needs no analysis: the target may not build any more.
-        if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
-            resources.release_all().await?;
-        }
-        return Ok(DevResponse::Released);
-    }
-    let global_cfg_options =
-        global_cfg_options_from_client_context(&req.target_cfg, server_ctx, &mut ctx.ctx())
-            .await?;
-    let subject = DevSubject::of_request(server_ctx, ctx, req, &global_cfg_options).await?;
-    let providers = subject.providers(&mut ctx.ctx()).await?;
-    // Held across awaits, so this needs the owned form.
-    let info = DevProvider::of(&providers, &subject)?;
+    dice: &DiceTransaction,
+    target: &Target,
+    session: &str,
+) -> buck2_error::Result<DevServer> {
+    let info = &target.info;
     let outputs = info.view().outputs()?;
-    match &req.action {
-        DevAction::Server => {
-            let (server, digest) = build_command(
-                &mut ctx.ctx(),
-                || info.view().server_command_line(),
-                "Failed to build the `buck2 dev` server",
-            )
-            .await?;
-            let resources = dev_resources(&mut ctx.ctx(), &info).await?;
-            let resources = if resources.is_empty()
-                && session_held_if_any::<SessionResources>(&req.session).is_none()
-            {
-                ResourcesUpdate::default()
-            } else {
-                let mut wanted = Vec::with_capacity(resources.len());
-                for resource in resources {
-                    let what = format!(
-                        "Failed to build the setup command of local resource `{}` (`{}`)",
-                        resource.name, resource.target
-                    );
-                    let (argv, digest) =
-                        build_command(&mut ctx.ctx(), || resource.setup_command_line(), &what)
-                            .await?;
-                    let env = resource
-                        .info
-                        .as_ref()
-                        .value()
-                        .as_ref()
-                        .env_var_mapping()
-                        .into_iter()
-                        .collect();
-                    wanted.push(WantedResource {
-                        name: resource.name,
-                        target: resource.target,
-                        info: resource.info,
-                        key: SetupKey { argv, digest, env },
-                    });
-                }
-                let held = session_held(&req.session, SessionResources::default)
-                    .ok_or_else(|| DevError::NoSession(req.session.clone()))?;
-                held.update(&mut ctx.ctx(), server_ctx.cancellation_context(), wanted)
-                    .await?
-            };
-            Ok(DevResponse::Server(DevServer {
-                project_root: server_ctx.project_root().root().to_string(),
-                server,
-                digest,
-                outputs: outputs.keys().cloned().collect(),
-                scopes: info.view().scopes().into_keys().collect(),
-                handlers: info
-                    .view()
-                    .handlers()
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect(),
-                interactive: info.view().interactive(),
-                env: resources.env,
-                resources: resources.running,
-                resources_exited: resources.exited,
-                resource_errors: resources.errors,
-            }))
-        }
-        DevAction::Watch(request) => {
-            let resources = dev_resources(&mut ctx.ctx(), &info).await?;
-            let policy = dev_policy(info.view(), resource_inputs(&resources)?)?;
-            let (mut watched, claims) =
-                watch_files(&mut ctx.ctx(), &subject, &policy, request).await?;
-            let mut interests = vec![claims.interest.dupe()];
-            // A handler that fails may be fixed by a change outside what anything is built
-            // from, such as to the file that it reads.
-            let mut all_known = true;
-            let handlers: Vec<buck2_error::Result<DevSubject>> = {
-                let mut handlers = Vec::with_capacity(request.dynamic.len());
-                for dynamic in &request.dynamic {
-                    handlers.push(
-                        dynamic_subject(
-                            server_ctx,
-                            ctx,
-                            &subject,
-                            &info,
-                            &global_cfg_options,
-                            &dynamic.call,
-                        )
-                        .await,
-                    );
-                }
-                handlers
-            };
-            let subject = &subject;
-            let scopes = &policy.scopes;
-            let results = ctx
-                .ctx()
-                .compute_join(
-                    request.dynamic.iter().zip(handlers),
-                    async |dice, (dynamic, handler)| {
-                        let result = async {
-                            let claims = dynamic_claims(dice, subject, handler?).await?;
-                            let policy = dynamic_policy(&dynamic.call.name, scopes.clone());
-                            let changes = claims_changes(
-                                dice,
-                                &claims,
-                                &policy,
-                                &request.paths,
-                                dynamic.previous.as_ref(),
-                                request.missed,
-                            )
-                            .await?;
-                            buck2_error::Ok((changes, claims))
-                        }
-                        .await;
-                        (dynamic, result)
-                    },
-                )
-                .await;
-            for (dynamic, result) in results {
-                let name = &dynamic.call.name;
-                match result {
-                    Ok((changes, claims)) => {
-                        interests.push(claims.interest.dupe());
-                        watched.outputs.outputs.extend(changes.changes.outputs);
-                        for message in &claims.incomplete {
-                            if !watched.incomplete.contains(message) {
-                                watched.incomplete.push(message.clone());
-                            }
-                        }
-                        watched.dynamic.insert(
-                            name.clone(),
-                            DevDynamicWatched {
-                                state: Some(changes.state),
-                                graph_changed: changes.graph_changed,
-                            },
-                        );
-                    }
-                    Err(_) => {
-                        // What the output is built from is not known, so any change may be to
-                        // it. The server hears why when it asks for it.
-                        all_known = false;
-                        let mut list: Vec<DevChange> = request
-                            .paths
-                            .iter()
-                            .map(|path| DevChange {
-                                path: Some(path.clone()),
-                                scopes: Vec::new(),
-                            })
-                            .collect();
-                        if request.missed {
-                            list.push(DevChange {
-                                path: Some(String::new()),
-                                scopes: Vec::new(),
-                            });
-                        }
-                        if list.is_empty() && dynamic.previous.is_some() {
-                            // It failed since the last answer, after a change that names no
-                            // file.
-                            list.push(DevChange {
-                                path: None,
-                                scopes: Vec::new(),
-                            });
-                        }
-                        if !list.is_empty() {
-                            watched.outputs.outputs.insert(name.clone(), list);
-                        }
-                        watched.dynamic.insert(
-                            name.clone(),
-                            DevDynamicWatched {
-                                state: None,
-                                graph_changed: true,
-                            },
-                        );
-                    }
-                }
-            }
-            // From here on the session's file change subscription drops the changes that cannot
-            // matter to these claims. `buck2 dev` asks again after every change that is let
-            // through, and so after every change to the claims.
-            if all_known {
-                set_interest(
-                    &req.session,
-                    Arc::new(FileInterest::union(interests.iter().map(|i| &**i))),
+    let (server, digest) = build_command(
+        &mut dice.ctx(),
+        || info.view().server_command_line(),
+        "Failed to build the `buck2 dev` server",
+    )
+    .await?;
+    let resources = dev_resources(&mut dice.ctx(), info).await?;
+    let resources =
+        if resources.is_empty() && session_held_if_any::<SessionResources>(session).is_none() {
+            ResourcesUpdate::default()
+        } else {
+            let mut wanted = Vec::with_capacity(resources.len());
+            for resource in resources {
+                let what = format!(
+                    "Failed to build the setup command of local resource `{}` (`{}`)",
+                    resource.name, resource.target
                 );
-            } else {
-                clear_interest(&req.session);
-            }
-            // A local resource that exited is set up again by the analysis that the client runs
-            // when the server may be new.
-            if let Some(resources) = session_held_if_any::<SessionResources>(&req.session) {
-                if resources.any_exited().await {
-                    watched.outputs.server = true;
-                }
-            }
-            Ok(DevResponse::Watch(watched))
-        }
-        DevAction::Release => Err(internal_error!("`Release` is handled above")),
-        DevAction::Build {
-            outputs: names,
-            streaming,
-            dynamic,
-        } => {
-            let sidecars = info.view().sidecars()?;
-            let mut wanted: Vec<Wanted> = Vec::with_capacity(names.len());
-            // The dynamic outputs that cannot be built, with why: they fail on their own.
-            let mut unbuildable: BTreeMap<String, String> = BTreeMap::new();
-            // The handler of each dynamic output to build.
-            let mut handlers: Vec<(String, DevSubject)> = Vec::new();
-            for name in names {
-                if let Some(call) = dynamic.iter().find(|call| call.name == *name) {
-                    match resolve_dynamic(
-                        server_ctx,
-                        ctx,
-                        &subject,
-                        &info,
-                        &outputs,
-                        &global_cfg_options,
-                        call,
-                    )
-                    .await
-                    {
-                        Ok((handler, output)) => {
-                            wanted.push(Wanted {
-                                name: name.clone(),
-                                output,
-                                sidecars: Vec::new(),
-                            });
-                            handlers.push((name.clone(), handler));
-                        }
-                        Err(e) => {
-                            unbuildable.insert(name.clone(), output_error(&e));
-                        }
-                    }
-                    continue;
-                }
-                let output = outputs.get(name).ok_or_else(|| DevError::UnknownOutput {
-                    subject: subject.dupe(),
-                    name: name.clone(),
-                })?;
-                wanted.push(Wanted {
-                    name: name.clone(),
-                    output: output.clone(),
-                    sidecars: sidecars.get(name).cloned().unwrap_or_default(),
+                let (argv, digest) =
+                    build_command(&mut dice.ctx(), || resource.setup_command_line(), &what).await?;
+                let env = resource
+                    .info
+                    .as_ref()
+                    .value()
+                    .as_ref()
+                    .env_var_mapping()
+                    .into_iter()
+                    .collect();
+                wanted.push(WantedResource {
+                    name: resource.name,
+                    target: resource.target,
+                    info: resource.info,
+                    key: SetupKey { argv, digest, env },
                 });
             }
-            if wanted.is_empty() {
-                return Ok(DevResponse::Build(DevBuilt {
-                    outputs: BTreeMap::new(),
-                    failed: unbuildable,
-                    dynamic: BTreeMap::new(),
-                }));
-            }
-            // What each dynamic output is built from, which a `Watch` compares with next. The
-            // session's file change subscription lets through the changes to it from now on.
-            let subject = &subject;
-            let found = ctx
-                .ctx()
-                .compute_join(handlers, async |dice, (name, handler)| {
-                    (name, dynamic_claims(dice, subject, handler).await)
-                })
-                .await;
-            let mut states = BTreeMap::new();
-            let mut dynamic_builds: Vec<(String, Arc<DevClaims>, AtomicU64)> = Vec::new();
-            for (name, claims) in found {
-                // An output whose claims cannot be found does not stop the build.
-                if let Ok(claims) = claims {
-                    add_interest(&req.session, &claims.interest);
-                    states.insert(name.clone(), claims.state());
-                    dynamic_builds.push((name, claims, AtomicU64::new(slot_bit(1))));
-                }
-            }
-            let info = &info;
-            let argv = move |name: &str, artifact_fs: &ArtifactFs, ensured: &Ensured| {
-                let command = info
-                    .view()
-                    .output_command_line(name)
-                    .ok_or_else(|| internal_error!("Output `{name}` is not a command line"))?;
-                command_argv(artifact_fs, command, ensured)
-            };
-            let argv: Argv = &argv;
-            // The slots of the outputs that the build has yet to finish. A change to a file of
-            // one of them stops it. Only the outputs' slots matter here.
-            let all = dev_policy(info.view(), Vec::new())?.names;
-            let builds = AtomicU64::new(
-                all.iter()
-                    .enumerate()
-                    .filter(|(_, name)| {
-                        names.contains(name) && !dynamic.iter().any(|call| call.name == **name)
-                    })
-                    .fold(0, |mask, (output, _)| mask | slot_bit(output + 1)),
+            let held = session_held(session, SessionResources::default)
+                .ok_or_else(|| DevError::NoSession(session.to_owned()))?;
+            held.update(&mut dice.ctx(), server_ctx.cancellation_context(), wanted)
+                .await?
+        };
+    Ok(DevServer {
+        project_root: server_ctx.project_root().root().to_string(),
+        server,
+        digest,
+        outputs: outputs.keys().cloned().collect(),
+        scopes: info.view().scopes().into_keys().collect(),
+        handlers: info
+            .view()
+            .handlers()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+        interactive: info.view().interactive(),
+        env: resources.env,
+        resources: resources.running,
+        resources_exited: resources.exited,
+        resource_errors: resources.errors,
+    })
+}
+
+/// Say what the changes of `request` are to the server and to each output, and set what the
+/// session's file change subscription lets through. `dynamic` has the call of each dynamic
+/// output of the request, with the state of its last answer.
+async fn watch_action(
+    server_ctx: &dyn ServerCommandContextTrait,
+    dice: &DiceTransaction,
+    target: &Target,
+    session: &str,
+    request: &DevWatchRequest,
+    dynamic: &[(DevDynamicCall, Option<DevWatchState>)],
+) -> buck2_error::Result<DevWatched> {
+    let info = &target.info;
+    let subject = &target.subject;
+    let resources = dev_resources(&mut dice.ctx(), info).await?;
+    let policy = dev_policy(info.view(), resource_inputs(&resources)?)?;
+    let (mut watched, claims) = watch_files(&mut dice.ctx(), subject, &policy, request).await?;
+    let mut interests = vec![claims.interest.dupe()];
+    // A handler that fails may be fixed by a change outside what anything is built from, such as
+    // to the file that it reads.
+    let mut all_known = true;
+    let handlers: Vec<buck2_error::Result<DevSubject>> = {
+        let mut handlers = Vec::with_capacity(dynamic.len());
+        for (call, _) in dynamic {
+            handlers.push(
+                dynamic_subject(
+                    server_ctx,
+                    dice,
+                    subject,
+                    info,
+                    &target.global_cfg_options,
+                    call,
+                )
+                .await,
             );
-            let builds = &builds;
-            let all = &all;
-            let dynamic_builds = &dynamic_builds;
-            let emit = move |built: DevBuilt| -> buck2_error::Result<()> {
-                for name in built.outputs.keys().chain(built.failed.keys()) {
-                    if let Some((_, _, building)) =
-                        dynamic_builds.iter().find(|(dynamic, _, _)| dynamic == name)
-                    {
-                        building.store(0, Ordering::SeqCst);
-                    } else if let Some(output) = all.iter().position(|n| n == name) {
-                        builds.fetch_and(!slot_bit(output + 1), Ordering::SeqCst);
+        }
+        handlers
+    };
+    let scopes = &policy.scopes;
+    let results = dice
+        .ctx()
+        .compute_join(
+            dynamic.iter().zip(handlers),
+            async |dice, ((call, previous), handler)| {
+                let result = async {
+                    let claims = dynamic_claims(dice, subject, handler?).await?;
+                    let policy = dynamic_policy(&call.name, scopes.clone());
+                    let changes = claims_changes(
+                        dice,
+                        &claims,
+                        &policy,
+                        &request.paths,
+                        previous.as_ref(),
+                        request.missed,
+                    )
+                    .await?;
+                    buck2_error::Ok((changes, claims))
+                }
+                .await;
+                (call, previous, result)
+            },
+        )
+        .await;
+    for (call, previous, result) in results {
+        let name = &call.name;
+        match result {
+            Ok((changes, claims)) => {
+                interests.push(claims.interest.dupe());
+                watched.outputs.outputs.extend(changes.changes.outputs);
+                for message in &claims.incomplete {
+                    if !watched.incomplete.contains(message) {
+                        watched.incomplete.push(message.clone());
                     }
                 }
-                let json = serde_json::to_string(&NewGenericPartialResult::Dev(built))
-                    .buck_error_context("Could not serialize `NewGenericPartialResult`")?;
-                if let Ok(mut partial_results) = partial_results.lock() {
-                    partial_results.emit(buck2_cli_proto::NewGenericPartialResultMessage {
-                        new_generic_partial_result: json,
+                watched.dynamic.insert(
+                    name.clone(),
+                    DevDynamicWatched {
+                        state: Some(changes.state),
+                        graph_changed: changes.graph_changed,
+                    },
+                );
+            }
+            Err(_) => {
+                // What the output is built from is not known, so any change may be to it. The
+                // server hears why when it asks for it.
+                all_known = false;
+                let mut list: Vec<DevChange> = request
+                    .paths
+                    .iter()
+                    .map(|path| DevChange {
+                        path: Some(path.clone()),
+                        scopes: Vec::new(),
+                    })
+                    .collect();
+                if request.missed {
+                    list.push(DevChange {
+                        path: Some(String::new()),
+                        scopes: Vec::new(),
                     });
                 }
-                Ok(())
-            };
-            let stream: Option<Stream> = streaming.then_some(&emit);
-            if let Some(stream) = stream {
-                // A streaming build sends each output that failed on its own.
-                for (name, error) in std::mem::take(&mut unbuildable) {
-                    stream(DevBuilt {
-                        outputs: BTreeMap::new(),
-                        failed: BTreeMap::from([(name, error)]),
-                        dynamic: BTreeMap::new(),
-                    })?;
+                if list.is_empty() && previous.is_some() {
+                    // It failed since the last answer, after a change that names no file.
+                    list.push(DevChange {
+                        path: None,
+                        scopes: Vec::new(),
+                    });
                 }
-            }
-            let finish = |built: buck2_error::Result<DevBuilt>| {
-                let mut built = built?;
-                built.failed.extend(unbuildable);
-                built.dynamic = states;
-                buck2_error::Ok(DevResponse::Build(built))
-            };
-            let Some(changes) = changes else {
-                return finish(
-                    build(
-                        server_ctx.project_root(),
-                        &mut ctx.ctx(),
-                        wanted,
-                        argv,
-                        stream,
-                    )
-                    .await,
+                if !list.is_empty() {
+                    watched.outputs.outputs.insert(name.clone(), list);
+                }
+                watched.dynamic.insert(
+                    name.clone(),
+                    DevDynamicWatched {
+                        state: None,
+                        graph_changed: true,
+                    },
                 );
-            };
-            let claims = dev_claims(&mut ctx.ctx(), subject).await?;
-            let mut watched: Vec<(&DevClaims, &AtomicU64)> = vec![(&*claims, builds)];
-            watched.extend(
-                dynamic_builds
-                    .iter()
-                    .map(|(_, claims, building)| (&**claims, building)),
-            );
-            let io = ctx
-                .ctx()
-                .global_data()
-                .get::<Arc<dyn IoProvider>>()
-                .map_err(|_| internal_error!("The daemon has no I/O provider"))?
-                .dupe();
-            // Each of the two stops the other: the build when a file that it builds from
-            // changes, and the wait for such a change when the build is done.
-            let (built_tx, built_rx) = oneshot::channel::<()>();
-            let (changed_tx, changed_rx) = oneshot::channel::<()>();
-            let project_root = server_ctx.project_root();
-            let watched = &watched;
-            let mut dice = ctx.ctx();
-            let (built, interrupted) = dice
-                .compute2(
-                    async move |dice| {
-                        tokio::select! {
-                            built = build(project_root, dice, wanted, argv, stream) => {
-                                let _ignored = built_tx.send(());
-                                Some(built)
-                            }
-                            // Dropping the build cancels it.
-                            _ = changed_rx => None,
-                        }
-                    },
-                    async move |dice| {
-                        tokio::select! {
-                            interrupted = changed_files(dice, changes, watched, io) => {
-                                let _ignored = changed_tx.send(());
-                                Some(interrupted)
-                            }
-                            _ = built_rx => None,
-                        }
-                    },
-                )
-                .await;
-            match (built, interrupted) {
-                (Some(built), _) => finish(built),
-                (None, Some(interrupted)) => Ok(DevResponse::Interrupted(interrupted)),
-                (None, None) => Err(internal_error!(
-                    "A `buck2 dev` build stopped without a file change"
-                )),
             }
         }
     }
+    // From here on the session's file change subscription drops the changes that cannot matter
+    // to these claims. `buck2 dev` asks again after every change that is let through, and so
+    // after every change to the claims.
+    if all_known {
+        set_interest(
+            session,
+            Arc::new(FileInterest::union(interests.iter().map(|i| &**i))),
+        );
+    } else {
+        clear_interest(session);
+    }
+    // A local resource that exited is set up again by the analysis that the client runs when
+    // the server may be new.
+    if let Some(resources) = session_held_if_any::<SessionResources>(session) {
+        if resources.any_exited().await {
+            watched.outputs.server = true;
+        }
+    }
+    Ok(watched)
 }
 
 /// Build what a command line names, and return the command line, with absolute paths, and a
@@ -1072,89 +818,6 @@ impl FileShape {
             RawPathMetadata::Directory => FileShape::Directory,
         }
     }
-}
-
-/// Wait for a file that the build is built from to change from what this command saw, and say
-/// which did. A file saved without a change, and one that nothing builds from, are no change.
-/// `claims` has the claims of the target, and of each dynamic output that the build builds, each
-/// with the slots of the outputs that the build has yet to finish.
-async fn changed_files(
-    dice: &mut DiceComputations<'_>,
-    mut changes: BoxStream<'static, FileChangeBatch>,
-    claims: &[(&DevClaims, &AtomicU64)],
-    io: Arc<dyn IoProvider>,
-) -> DevInterrupted {
-    while let Some(batch) = changes.next().await {
-        if batch.missed {
-            return DevInterrupted {
-                paths: Vec::new(),
-                missed: true,
-            };
-        }
-        let mut changed = Vec::new();
-        for path in batch.paths {
-            if !claims.iter().any(|(claims, _)| claims.may_claim(&path)) {
-                continue;
-            }
-            // A path that cannot be looked at counts as changed.
-            if builds_from_changed(dice, claims, &io, &path)
-                .await
-                .unwrap_or(true)
-            {
-                changed.push(path.to_string());
-            }
-        }
-        if !changed.is_empty() {
-            return DevInterrupted {
-                paths: changed,
-                missed: false,
-            };
-        }
-    }
-    // The file watcher is gone, as when the daemon shuts down.
-    futures::future::pending().await
-}
-
-/// Whether what the build has yet to finish, the slots of each of `claims`, is built from
-/// `path`, and the file differs from what this command saw.
-async fn builds_from_changed(
-    dice: &mut DiceComputations<'_>,
-    claims: &[(&DevClaims, &AtomicU64)],
-    io: &Arc<dyn IoProvider>,
-    path: &ProjectRelativePath,
-) -> buck2_error::Result<bool> {
-    let cell_resolver = dice.get_cell_resolver().await?;
-    let mut relevant = false;
-    for (claims, builds) in claims {
-        let builds = builds.load(Ordering::SeqCst);
-        if builds == 0 || !claims.may_claim(path) {
-            continue;
-        }
-        relevant = match claims.classify(dice, cell_resolver, path).await? {
-            Claimed::Source { may, .. } => may & builds != 0,
-            Claimed::BuildFile | Claimed::Bzl => true,
-            Claimed::Nothing => false,
-        };
-        if relevant {
-            break;
-        }
-    }
-    if !relevant {
-        return Ok(false);
-    }
-    // What this command sees: what the build read, or will read. A file that the build has not
-    // read yet is read now, and so is no change to it.
-    let before = DiceFileComputations::read_path_metadata_if_exists(
-        dice,
-        cell_resolver.get_cell_path(&path),
-    )
-    .await?
-    .map(FileShape::of);
-    let now = io
-        .read_path_metadata_if_exists_impl(IProjectRelativePath::intern_directly(path))
-        .await?
-        .map(FileShape::of);
-    Ok(before != now)
 }
 
 /// An output to build.
@@ -1229,92 +892,81 @@ fn contents(
     Ok(contents)
 }
 
-/// Hands on the result of one output of a streaming build.
-type Stream<'a> = &'a (dyn Fn(DevBuilt) -> buck2_error::Result<()> + Sync);
-
-/// Build each output on its own: one that fails does not keep the others from the server. An
-/// output fails if one of its sidecars, or an artifact associated with it or with a sidecar,
-/// does. With `stream`, the result of each output but the last to finish goes to `stream` as
-/// soon as it is known, and the result has only the last.
-async fn build(
+/// Build an output, with its sidecars and the artifacts associated with them, and materialise
+/// it. The output fails if any of them does.
+async fn build_output(
     project_root: &ProjectRoot,
     dice: &mut DiceComputations<'_>,
-    wanted: Vec<Wanted>,
+    wanted: Wanted,
     argv: Argv<'_>,
-    stream: Option<Stream<'_>>,
-) -> buck2_error::Result<DevBuilt> {
-    let artifact_fs = dice.get_artifact_fs().await?;
-    let artifact_fs = &artifact_fs;
-    // The outputs that have yet to finish.
-    let remaining = AtomicUsize::new(wanted.len());
-    let remaining = &remaining;
-    let results = dice
-        .compute_join(wanted, async |dice, wanted| {
-            let Wanted {
-                name,
-                output,
-                sidecars,
-            } = wanted;
-            let command = matches!(output, DevOutputSpec::Command(_));
-            // The output itself has no name here.
-            let mut artifacts = vec![(None, output.groups())];
-            artifacts.extend(
-                sidecars
-                    .into_iter()
-                    .map(|(sidecar, artifact)| (Some(sidecar), artifact.groups())),
-            );
-            let values = dice
-                .try_compute_join(artifacts, async |dice, (sidecar, groups)| {
-                    let groups = materialize_groups(dice, groups).await?;
-                    buck2_error::Ok((sidecar, groups))
-                })
-                .await;
-            let result = match values {
-                Ok(values) => {
-                    output_result(project_root, artifact_fs, argv, &name, command, values)?
-                }
-                Err(e) => Err(output_error(&e)),
-            };
-            if let Some(stream) = stream {
-                if remaining.fetch_sub(1, Ordering::SeqCst) > 1 {
-                    let mut built = DevBuilt {
-                        outputs: BTreeMap::new(),
-                        failed: BTreeMap::new(),
-                        dynamic: BTreeMap::new(),
-                    };
-                    match result {
-                        Ok(output) => {
-                            built.outputs.insert(name, output);
-                        }
-                        Err(error) => {
-                            built.failed.insert(name, error);
-                        }
-                    }
-                    stream(built)?;
-                    return buck2_error::Ok(None);
-                }
-            }
-            buck2_error::Ok(Some((name, result)))
+) -> Result<DevBuiltOutput, DevOutputError> {
+    let result = async {
+        let artifact_fs = dice.get_artifact_fs().await?;
+        let Wanted {
+            name,
+            output,
+            sidecars,
+        } = wanted;
+        let command = matches!(output, DevOutputSpec::Command(_));
+        // The output itself has no name here.
+        let mut artifacts = vec![(None, output.groups())];
+        artifacts.extend(
+            sidecars
+                .into_iter()
+                .map(|(sidecar, artifact)| (Some(sidecar), artifact.groups())),
+        );
+        let values = dice
+            .try_compute_join(artifacts, async |dice, (sidecar, groups)| {
+                let groups = materialize_groups(dice, groups).await?;
+                buck2_error::Ok((sidecar, groups))
+            })
+            .await;
+        Ok(match values {
+            Ok(values) => output_result(project_root, &artifact_fs, argv, &name, command, values)?,
+            Err(e) => Err(output_error(&e)),
         })
-        .await;
-    let mut outputs = BTreeMap::new();
-    let mut failed = BTreeMap::new();
-    for result in results {
-        match result? {
-            Some((name, Ok(output))) => {
-                outputs.insert(name, output);
-            }
-            Some((name, Err(error))) => {
-                failed.insert(name, error);
-            }
-            None => {}
-        }
     }
-    Ok(DevBuilt {
-        outputs,
-        failed,
-        dynamic: BTreeMap::new(),
-    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(e) => Err(output_error(&e)),
+    }
+}
+
+/// Whether the slots `slots` of `claims` are built from `path`, and the file differs from what
+/// the transaction of `dice` saw.
+async fn changed_since(
+    dice: &mut DiceComputations<'_>,
+    claims: &DevClaims,
+    slots: u64,
+    io: &Arc<dyn IoProvider>,
+    path: &ProjectRelativePath,
+) -> buck2_error::Result<bool> {
+    if !claims.may_claim(path) {
+        return Ok(false);
+    }
+    let cell_resolver = dice.get_cell_resolver().await?;
+    let relevant = match claims.classify(dice, cell_resolver, path).await? {
+        Claimed::Source { may, .. } => may & slots != 0,
+        Claimed::BuildFile | Claimed::Bzl => true,
+        Claimed::Nothing => false,
+    };
+    if !relevant {
+        return Ok(false);
+    }
+    // What the transaction sees: what the build read, or will read. A file that the build has
+    // not read yet is read now, and so is no change to it.
+    let before = DiceFileComputations::read_path_metadata_if_exists(
+        dice,
+        cell_resolver.get_cell_path(&path),
+    )
+    .await?
+    .map(FileShape::of);
+    let now = io
+        .read_path_metadata_if_exists_impl(IProjectRelativePath::intern_directly(path))
+        .await?
+        .map(FileShape::of);
+    Ok(before != now)
 }
 
 /// What the server gets of an output that built, from its artifacts and those of its sidecars,
@@ -1326,7 +978,7 @@ fn output_result(
     name: &str,
     command: bool,
     mut values: Vec<(Option<String>, Ensured)>,
-) -> buck2_error::Result<Result<DevBuiltOutput, String>> {
+) -> buck2_error::Result<Result<DevBuiltOutput, DevOutputError>> {
     let mut output = None;
     if command {
         // The output comes first. What its command line names is all that it is.
@@ -1376,7 +1028,15 @@ const MAX_ERROR_STREAM: usize = 16 << 10;
 
 /// Why an output failed to build. For an action, that is what the console shows for it, with
 /// its command, exit code and output, rather than only which target failed to build.
-fn output_error(e: &buck2_error::Error) -> String {
+fn output_error(e: &buck2_error::Error) -> DevOutputError {
+    DevOutputError {
+        error: error_message(e),
+        action: e.action_error().is_some(),
+    }
+}
+
+/// `e`, as `buck2 dev` shows it. See `output_error`.
+fn error_message(e: &buck2_error::Error) -> String {
     if let Some(action_error) = e.action_error() {
         let mut action_error = action_error.clone();
         if let Some(details) = action_error

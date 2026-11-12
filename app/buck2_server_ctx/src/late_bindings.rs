@@ -15,8 +15,6 @@ use buck2_cli_proto::new_generic::CompleteRequest;
 use buck2_cli_proto::new_generic::CompleteResponse;
 use buck2_cli_proto::new_generic::DebugEvalRequest;
 use buck2_cli_proto::new_generic::DebugEvalResponse;
-use buck2_cli_proto::new_generic::DevRequest;
-use buck2_cli_proto::new_generic::DevResponse;
 use buck2_cli_proto::new_generic::ExpandExternalCellsRequest;
 use buck2_cli_proto::new_generic::ExpandExternalCellsResponse;
 use buck2_cli_proto::new_generic::ExplainRequest;
@@ -70,14 +68,15 @@ pub trait OtherServerCommands: Send + Sync + 'static {
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: ExpandExternalCellsRequest,
     ) -> buck2_error::Result<ExpandExternalCellsResponse>;
-    async fn dev(
+    /// A `buck2 dev` session, which runs as long as the client keeps the request stream open.
+    async fn dev_session(
         &self,
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<
             buck2_cli_proto::NewGenericPartialResultMessage,
         >,
-        req: DevRequest,
-    ) -> buck2_error::Result<DevResponse>;
+        requests: StreamingRequestHandler<buck2_cli_proto::DevSessionMessage>,
+    ) -> buck2_error::Result<buck2_cli_proto::NewGenericResponseMessage>;
 }
 
 pub static OTHER_SERVER_COMMANDS: LateBinding<&'static dyn OtherServerCommands> =

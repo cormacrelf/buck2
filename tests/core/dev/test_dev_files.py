@@ -46,8 +46,8 @@ class DevFilesTest(BuckTestCase):
             temp = buck.cwd / "app/.main.txt.tmp"
             temp.write_text("app v2\n")
             os.replace(temp, buck.cwd / "app/main.txt")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
+            stale, _, built = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -66,8 +66,8 @@ class DevFilesTest(BuckTestCase):
             temp = buck.cwd / "app/.main.txt.tmp"
             temp.write_text("app v1\n")
             os.replace(temp, buck.cwd / "app/main.txt")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
+            stale, _, built = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
             assert changed(built) == {"site": False}
             await dev.quiet()
             assert_kept(dev, first)
@@ -86,7 +86,7 @@ class DevFilesTest(BuckTestCase):
                 os.fsync(f.fileno())
                 await asyncio.sleep(0.05)
                 f.write("app v2\n")
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -99,7 +99,7 @@ class DevFilesTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/main.txt", "")
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == ""
             assert changed(built) == {"site": True}
             await dev.quiet()
@@ -114,8 +114,8 @@ class DevFilesTest(BuckTestCase):
             await dev.start()
             os.unlink(buck.cwd / "app/main.txt")
             write(buck, "app/main.txt", "app v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
+            stale, _, built = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -123,20 +123,19 @@ class DevFilesTest(BuckTestCase):
 
     @dev_test()
     async def test_source_file_deleted_then_recreated(self, buck: Buck) -> None:
-        """A source file deleted: loading the build file fails, which sends `failed` without
-        `building`, and the server keeps running. Creating it again sends `graph_changed`, and
-        builds."""
+        """A source file deleted: loading the build file fails, which sends `error`, and the
+        server keeps running. Creating it again sends `graph_changed`, and builds."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             os.unlink(buck.cwd / "app/main.txt")
-            (failed,) = await dev.expect("failed")
-            assert "Error coercing attribute `srcs`" in failed["error"], failed["error"]
+            (error,) = await dev.expect("error")
+            assert "Error coercing attribute `srcs`" in error["error"], error["error"]
             await dev.quiet()
             assert_kept(dev, first)
 
             write(buck, "app/main.txt", "app v2\n")
-            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -144,13 +143,13 @@ class DevFilesTest(BuckTestCase):
 
     @dev_test()
     async def test_source_file_renamed_away_and_back(self, buck: Buck) -> None:
-        """A source file renamed away: `failed`. Renamed back: `graph_changed`, which tells the
+        """A source file renamed away: `error`. Renamed back: `graph_changed`, which tells the
         server that the analysis works again."""
         dev = await start_dev(buck, "//app:all")
         try:
             first = await dev.start()
             os.rename(buck.cwd / "app/main.txt", buck.cwd / "app/main.txt.bak")
-            await dev.expect("failed")
+            await dev.expect("error")
             await dev.wait_until_quiet()
             os.rename(buck.cwd / "app/main.txt.bak", buck.cwd / "app/main.txt")
             await dev.expect("graph_changed", timeout=10)
@@ -166,10 +165,10 @@ class DevFilesTest(BuckTestCase):
         try:
             first = await dev.start()
             os.rename(buck.cwd / "app/pages", buck.cwd / "app/pages_moved")
-            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == ""
             os.rename(buck.cwd / "app/pages_moved", buck.cwd / "app/pages")
-            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == "page a\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -184,10 +183,10 @@ class DevFilesTest(BuckTestCase):
         try:
             await dev.start()
             write(buck, "app/pages/TARGETS.fixture", "")
-            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == ""
             os.unlink(buck.cwd / "app/pages/TARGETS.fixture")
-            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == "page a\n"
             await dev.quiet()
         finally:
@@ -213,38 +212,40 @@ class DevFilesTest(BuckTestCase):
         change to it, and its removal."""
         dev = await start_dev(buck, "//app:patch")
         try:
-            first = await dev.start()
+            first = await dev.start(outputs=2)
             assert contents(first)["patch"] == "page a\n"
 
             write(buck, "app/pages/b.txt", "page b\n")
-            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
-            assert building["outputs"] == ["patch", "site"]
-            assert files(buck, building) == ["app/pages/b.txt"]
-            assert contents(built) == {
+            _, stale, build = await dev.expect("graph_changed", "stale", "build")
+            assert build["outputs"] == ["patch", "site"]
+            for name in ["patch", "site"]:
+                assert files(buck, stale["outputs"][name]) == ["app/pages/b.txt"]
+            assert contents(await dev.results(2)) == {
                 "patch": "page a\npage b\n",
                 "site": "lib v1\npage a\npage b\n",
             }
             await dev.quiet()
 
             write(buck, "app/pages/b.txt", "page b v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["patch", "site"]
-            assert contents(built)["patch"] == "page a\npage b v2\n"
+            _, build = await dev.expect("stale", "build")
+            assert build["outputs"] == ["patch", "site"]
+            assert contents(await dev.results(2))["patch"] == "page a\npage b v2\n"
             await dev.quiet()
 
             os.unlink(buck.cwd / "app/pages/b.txt")
-            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
-            assert building["outputs"] == ["patch", "site"]
-            assert contents(built)["patch"] == "page a\n"
+            _, _, build = await dev.expect("graph_changed", "stale", "build")
+            assert build["outputs"] == ["patch", "site"]
+            assert contents(await dev.results(2))["patch"] == "page a\n"
             await dev.quiet()
 
             # `patch` is not built from the dependency.
             write(buck, "lib/lib.txt", "lib v2\n")
-            _, building, _ = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["site"]
-            assert files(buck, building) == ["lib/lib.txt"]
+            stale, build, _ = await dev.expect("stale", "build", "built")
+            assert build["outputs"] == ["site"]
+            assert sorted(stale["outputs"]) == ["site"]
+            assert files(buck, stale["outputs"]["site"]) == ["lib/lib.txt"]
             await dev.quiet()
-            assert_kept(dev, first)
+            assert_kept(dev, first["site"])
         finally:
             await dev.stop()
 
@@ -257,14 +258,14 @@ class DevFilesTest(BuckTestCase):
             first = await dev.start()
             os.unlink(buck.cwd / "app/main.txt")
             os.mkdir(buck.cwd / "app/main.txt")
-            (failed,) = await dev.expect("failed")
-            assert "Error coercing attribute `srcs`" in failed["error"], failed["error"]
+            (error,) = await dev.expect("error")
+            assert "Error coercing attribute `srcs`" in error["error"], error["error"]
             await dev.quiet()
             assert_kept(dev, first)
 
             os.rmdir(buck.cwd / "app/main.txt")
             write(buck, "app/main.txt", "app v2\n")
-            _, _, _, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == "app v2\n"
             await dev.quiet()
         finally:
@@ -278,8 +279,8 @@ class DevFilesTest(BuckTestCase):
         try:
             first = await dev.start()
             os.chmod(buck.cwd / "app/main.txt", 0o755)
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
+            stale, _, built = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
             assert changed(built) == {"site": False}
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -301,12 +302,12 @@ class DevFilesTest(BuckTestCase):
             main = buck.cwd / "app/main.txt"
             os.unlink(main)
             os.symlink("target_a.txt", main)
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "target a\n"
 
             os.unlink(main)
             os.symlink("target_b.txt", main)
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "target b\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -324,11 +325,11 @@ class DevFilesTest(BuckTestCase):
             main = buck.cwd / "app/main.txt"
             os.unlink(main)
             os.symlink("target_a.txt", main)
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "target a\n"
 
             write(buck, "app/target_a.txt", "target a2\n")
-            _, _, built = await dev.expect("stale", "building", "built", timeout=10)
+            _, _, built = await dev.expect("stale", "build", "built", timeout=10)
             assert site(built) == "target a2\n"
             assert built["pid"] == first["pid"]
         finally:
@@ -350,8 +351,8 @@ class DevFilesTest(BuckTestCase):
                 'srcs = ["main.txt"],',
                 'srcs = ["main.txt", "other.txt"],',
             )
-            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
-            assert files(buck, building) == [APP, "app/main.txt", "lib/lib.txt"]
+            _, stale, _, built = await dev.expect("graph_changed", "stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == [APP, "app/main.txt", "lib/lib.txt"]
             assert site(built) == "lib v2\napp v2\nother v1\n"
             assert built["pid"] == first["pid"]
             await dev.quiet()
@@ -367,7 +368,7 @@ class DevFilesTest(BuckTestCase):
             for i in range(10):
                 write(buck, "app/main.txt", f"app v{i + 2}\n")
                 await asyncio.sleep(0.05)
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "app v11\n"
             await dev.quiet()
         finally:
@@ -385,8 +386,8 @@ class DevFilesTest(BuckTestCase):
             assert_kept(dev, first)
 
             write(buck, "app/main.txt", "app v2\n")
-            _, building, _ = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
+            stale, _, _ = await dev.expect("stale", "build", "built")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
         finally:
             await dev.stop()
 
@@ -403,7 +404,7 @@ class DevFilesTest(BuckTestCase):
             )
             # dev.md says that `buck2 dev` does not act on `.buckconfig` changes, but the
             # daemon reads it again when `buck2 dev` asks what changed, and the target changed.
-            _, _, building, built = await dev.expect("graph_changed", "stale", "building", "built")
+            _, _, _, built = await dev.expect("graph_changed", "stale", "build", "built")
             assert site(built) == "other v1\n"
             assert built["pid"] == first["pid"]
 

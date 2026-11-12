@@ -28,7 +28,7 @@ dev_app(
     mode = "outputs",
     srcs = ["main.txt"],
     server = "server.py",
-    server_args = ["--hello-version=2"],
+    server_args = ["--hello-version=3"],
 )
 
 dev_app(

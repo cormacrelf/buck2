@@ -70,11 +70,18 @@ def stale(buck: Buck, message: Dict[str, Any]) -> Dict[str, Tuple[List[str], Lis
     }
 
 
-async def start_manual(buck: Buck, target: str) -> Tuple[DevSession, Dict[str, Any]]:
+async def start_manual(
+    buck: Buck, target: str
+) -> Tuple[DevSession, Dict[str, Dict[str, Any]]]:
     """Start `buck2 dev` with a server that does not answer `stale`, and wait for its first
-    build."""
+    build. Returns the `built` message of each output that the server asked for, by output."""
     dev = await start_dev(buck, target, "none", "--", "--manual")
-    return dev, await dev.start()
+    _, ready, build = await dev.expect("started", "ready", "build")
+    results = await dev.results(len(build["outputs"]))
+    for result in results.values():
+        assert result["type"] == "built", result
+        assert result["pid"] == ready["pid"]
+    return dev, results
 
 
 ALL = ["exe", "patch", "site"]
@@ -87,12 +94,10 @@ class DevScopesTest(BuckTestCase):
     ) -> None:
         dev = await start_dev(buck, "//app:outputs")
         try:
-            _, ready, _, built = await dev.expect(
-                "started", "ready", "building", "built"
-            )
+            _, ready, _ = await dev.expect("started", "ready", "build")
             assert ready["outputs"] == ["site", "extra"]
             assert ready["scopes"] == []
-            assert contents(built) == {
+            assert contents(await dev.results(2)) == {
                 "site": "lib v1\napp v1\n",
                 "extra": "extra v1\n",
             }
@@ -100,29 +105,32 @@ class DevScopesTest(BuckTestCase):
             # Each file makes the outputs that may be built from it stale, and no other. The
             # server asks for them.
             write(buck, "app/main.txt", "app v2\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build, built = await dev.expect("stale", "build", "built")
             assert stale(buck, message) == {"site": ([], ["app/main.txt"])}
-            assert building["outputs"] == ["site"]
-            assert files(buck, building) == ["app/main.txt"]
+            assert build["outputs"] == ["site"]
             assert contents(built) == {"site": "lib v1\napp v2\n"}
 
             write(buck, "app/extra.txt", "extra v2\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build, built = await dev.expect("stale", "build", "built")
             assert stale(buck, message) == {"extra": ([], ["app/extra.txt"])}
             assert contents(built) == {"extra": "extra v2\n"}
 
             # A file of a dependency.
             write(buck, "lib/lib.txt", "lib v2\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build, built = await dev.expect("stale", "build", "built")
             assert stale(buck, message) == {"site": ([], ["lib/lib.txt"])}
             assert contents(built) == {"site": "lib v2\napp v2\n"}
 
             # Both at once.
             write(buck, "app/main.txt", "app v3\n")
             write(buck, "app/extra.txt", "extra v3\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build = await dev.expect("stale", "build")
             assert sorted(message["outputs"]) == ["extra", "site"]
-            assert building["outputs"] == ["extra", "site"]
+            assert build["outputs"] == ["extra", "site"]
+            assert contents(await dev.results(2)) == {
+                "site": "lib v2\napp v3\n",
+                "extra": "extra v3\n",
+            }
             await dev.quiet()
         finally:
             await dev.stop()
@@ -131,7 +139,7 @@ class DevScopesTest(BuckTestCase):
     async def test_server_file_is_only_checked(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:outputs")
         try:
-            first = await dev.start()
+            first = (await dev.start(outputs=2))["site"]
 
             # No output is built from the server script, so a save of it makes nothing stale,
             # and the server's command is the same. So is a file that nothing is built from.
@@ -142,12 +150,13 @@ class DevScopesTest(BuckTestCase):
 
             # New contents start the server again, and the new server asks for what it needs.
             write(buck, "app/server.py", read(buck, "app/server.py") + "# changed\n")
-            shutdown, started, _, building, built = await dev.expect(
-                "shutdown", "started", "ready", "building", "built"
+            shutdown, started, _, build = await dev.expect(
+                "shutdown", "started", "ready", "build"
             )
             assert shutdown["pid"] == first["pid"]
-            assert built["pid"] == started["pid"]
-            assert building["outputs"] == ["extra", "site"]
+            assert build["outputs"] == ["extra", "site"]
+            results = await dev.results(2)
+            assert {result["pid"] for result in results.values()} == {started["pid"]}
             await dev.quiet()
         finally:
             await dev.stop()
@@ -164,9 +173,8 @@ class DevScopesTest(BuckTestCase):
             await dev.quiet()
 
             dev.request({"type": "build", "outputs": ["site"]})
-            building, built = await dev.expect("building", "built")
-            assert building["outputs"] == ["site"]
-            assert files(buck, building) == ["app/main.txt"]
+            build, built = await dev.expect("build", "built")
+            assert build["outputs"] == ["site"]
             assert contents(built) == {"site": "lib v1\napp v2\n"}
             # A build makes nothing stale.
             await dev.quiet()
@@ -220,7 +228,8 @@ class DevScopesTest(BuckTestCase):
 
             # The server gets the outputs, and the next change starts again.
             dev.request({"type": "build", "outputs": ALL})
-            await dev.expect("building", "built")
+            await dev.expect("build")
+            await dev.results(3)
             await dev.quiet()
             write(buck, "lib/lib.txt", "lib v3\n")
             (message,) = await dev.expect("stale")
@@ -239,7 +248,7 @@ class DevScopesTest(BuckTestCase):
             write(buck, "defs.bzl", read(buck, "defs.bzl") + "# changed\n")
             _, message = await dev.expect("graph_changed", "stale")
             assert stale(buck, message) == {name: ([], ["defs.bzl"]) for name in ALL}
-            assert message["pid"] == first["pid"]
+            assert message["pid"] == first["site"]["pid"]
             await dev.quiet()
         finally:
             await dev.stop()
@@ -273,8 +282,8 @@ class DevScopesTest(BuckTestCase):
 
             # And it stays there.
             dev.request({"type": "build", "outputs": ["patch"]})
-            _, built = await dev.expect("building", "built")
-            assert contents(built)["patch"] == "lib v1\npage a\npage b\n"
+            _, built = await dev.expect("build", "built")
+            assert contents(built) == {"patch": "lib v1\npage a\npage b\n"}
             write(buck, "app/pages/b.txt", "page b2\n")
             (message,) = await dev.expect("stale")
             assert stale(buck, message)["patch"] == (["app", "both"], ["app/pages/b.txt"])
@@ -303,10 +312,10 @@ class DevScopesTest(BuckTestCase):
             # `exe` and `patch` are built from `main.txt` too, but the server never asked for
             # them.
             write(buck, "app/main.txt", "app v2\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build, built = await dev.expect("stale", "build", "built")
             assert stale(buck, message) == {"site": (["app"], ["app/main.txt"])}
-            assert building["outputs"] == ["site"]
-            assert list(built["outputs"]) == ["site"]
+            assert build["outputs"] == ["site"]
+            assert built["output"] == "site"
             await dev.quiet()
         finally:
             await dev.stop()
@@ -322,7 +331,7 @@ class DevScopesTest(BuckTestCase):
 
             # The server gets a new `patch`, and not `exe`.
             dev.request({"type": "build", "outputs": ["patch"]})
-            await dev.expect("building", "built")
+            await dev.expect("build", "built")
             await dev.quiet()
 
             write(buck, "lib/lib.txt", "lib v3\n")
@@ -340,9 +349,12 @@ class DevScopesTest(BuckTestCase):
                 ["both"],
                 ["app/main.txt", "lib/lib.txt"],
             )
+            assert stale(buck, message)["patch"] == (
+                ["both"],
+                ["app/main.txt", "lib/lib.txt"],
+            )
             dev.request({"type": "build", "outputs": ["patch"]})
-            building, _ = await dev.expect("building", "built")
-            assert files(buck, building) == ["app/main.txt", "lib/lib.txt"]
+            await dev.expect("build", "built")
             write(buck, "lib/lib.txt", "lib v4\n")
             (message,) = await dev.expect("stale")
             assert stale(buck, message)["exe"] == (
@@ -355,15 +367,14 @@ class DevScopesTest(BuckTestCase):
 
     @dev_test()
     async def test_ack_sets_when_the_server_got_an_output(self, buck: Buck) -> None:
-        dev, built = await start_manual(buck, "//app:scopes")
+        dev, _ = await start_manual(buck, "//app:scopes")
         try:
-            assert built["last_of_generation"]
             write(buck, "app/main.txt", "app v2\n")
             await dev.expect("stale")
 
             # The server gets `exe`, but has not said that it has it, so it is still stale.
             dev.request({"type": "build", "outputs": ["exe"], "stale_until_ack": True})
-            _, built = await dev.expect("building", "built")
+            _, built = await dev.expect("build", "built")
             write(buck, "lib/lib.txt", "lib v2\n")
             (message,) = await dev.expect("stale")
             assert stale(buck, message)["exe"] == (
@@ -373,10 +384,12 @@ class DevScopesTest(BuckTestCase):
 
             # With the `exe` of that build, the server is up to date with `patch` too, which
             # that build did not build. What changed before the build no longer makes them
-            # stale; what changed after it still does.
-            dev.request({"type": "ack", "gen": built["gen"], "outputs": ["exe", "patch"]})
-            dev.request({"type": "ack", "gen": built["gen"] + 100, "outputs": ["site"]})
-            dev.request({"type": "ack", "gen": built["gen"], "outputs": ["nothing"]})
+            # stale; what changed after it still does. A token that no `built` gave, and a name
+            # that is not an output, are ignored.
+            token = built["token"]
+            dev.request({"type": "ack", "token": token, "outputs": ["exe", "patch"]})
+            dev.request({"type": "ack", "token": token + 100, "outputs": ["site"]})
+            dev.request({"type": "ack", "token": token, "outputs": ["nothing"]})
             # `ack` has no answer. Give the server time to send them.
             await dev.quiet(1)
             write(buck, "lib/lib.txt", "lib v3\n")
@@ -388,31 +401,25 @@ class DevScopesTest(BuckTestCase):
             }
         finally:
             output = await dev.stop()
-        assert "which has not started" in output, output
+        assert f"with token {token + 100}, which no `built` gave" in output, output
         assert "`nothing`, which is not an output" in output, output
 
     @dev_test()
-    async def test_streaming_sends_each_output_when_it_is_built(
-        self, buck: Buck
-    ) -> None:
+    async def test_each_output_is_sent_when_it_is_built(self, buck: Buck) -> None:
         dev, _ = await start_manual(buck, "//app:outputs_slow")
         try:
+            # `site` takes 8 seconds to build, and `extra` no time.
             write(buck, "app/delay.txt", "8\n")
             await dev.expect("stale")
-            dev.request(
-                {"type": "build", "outputs": ["extra", "site"], "streaming": True}
-            )
-            building, first = await dev.expect("building", "built")
-            assert first["gen"] == building["gen"]
-            assert list(first["outputs"]) == ["extra"]
-            assert not first["last_of_generation"]
+            dev.request({"type": "build", "outputs": ["extra", "site"]})
+            build, first = await dev.expect("build", "built")
+            assert build["outputs"] == ["extra", "site"]
+            assert contents(first) == {"extra": "extra v1\n"}
 
             # `extra` is done, so a change to its file does not stop the build of `site`.
             write(buck, "app/extra.txt", "extra v2\n")
             (last,) = await dev.expect("built")
-            assert last["gen"] == building["gen"]
             assert contents(last) == {"site": "lib v1\napp v1\n"}
-            assert last["last_of_generation"]
             (message,) = await dev.expect("stale")
             assert stale(buck, message) == {"extra": ([], ["app/extra.txt"])}
         finally:
@@ -422,36 +429,37 @@ class DevScopesTest(BuckTestCase):
     async def test_patcher(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:patcher")
         try:
-            await dev.start()
+            await dev.start(outputs=3)
 
             # A change to `lib`: everything since the binary was built is in `lib`, so the
             # server asks for a patch.
             write(buck, "lib/lib.txt", "lib v2\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build, built = await dev.expect("stale", "build", "built")
             assert message["outputs"]["exe"]["within"] == ["lib"]
-            assert building["outputs"] == ["patch"]
+            assert build["outputs"] == ["patch"]
             assert contents(built) == {"patch": "lib v2\napp v1\n"}
 
-            # Another change to `lib`: `exe` still has only changes in `lib`.
+            # Another change to `lib`: `exe` still has only changes in `lib`, and `patch` only
+            # the one since its last build.
             write(buck, "lib/lib.txt", "lib v3\n")
-            message, building, built = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["patch"]
-            assert files(buck, building) == ["lib/lib.txt"]
+            message, build, built = await dev.expect("stale", "build", "built")
+            assert build["outputs"] == ["patch"]
+            assert files(buck, message["outputs"]["patch"]) == ["lib/lib.txt"]
 
             # A change elsewhere: the server asks for both, and starts the app again.
             write(buck, "app/main.txt", "app v2\n")
-            message, building, built = await dev.expect("stale", "building", "built")
+            message, build = await dev.expect("stale", "build")
             assert message["outputs"]["exe"]["within"] == []
-            assert building["outputs"] == ["exe", "patch"]
-            assert contents(built) == {
+            assert build["outputs"] == ["exe", "patch"]
+            assert contents(await dev.results(2)) == {
                 "exe": "lib v3\napp v2\n",
                 "patch": "lib v3\napp v2\n",
             }
 
             # From the new binary, a change to `lib` is a patch again.
             write(buck, "lib/lib.txt", "lib v4\n")
-            message, building, built = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["patch"]
+            message, build, built = await dev.expect("stale", "build", "built")
+            assert build["outputs"] == ["patch"]
             await dev.quiet()
         finally:
             await dev.stop()
@@ -461,24 +469,29 @@ class DevScopesTest(BuckTestCase):
         write(buck, "app/delay.txt", "30\n")
         dev = await start_dev(buck, "//app:scopes_slow", "none", "--", "--manual")
         try:
-            _, _, building = await dev.expect("started", "ready", "building")
-            assert building["outputs"] == ALL
+            _, _, build = await dev.expect("started", "ready", "build")
+            assert build["outputs"] == ALL
             await asyncio.sleep(2)
 
-            # The server never got these outputs, so no scope is known for them.
+            # Each of them is built from both files, so each build stops. The server never got
+            # these outputs, so no scope is known for them.
             write(buck, "app/delay.txt", "0\n")
             write(buck, "app/main.txt", "app v2\n")
-            cancelled, message = await dev.expect("cancelled", "stale", timeout=30)
-            assert cancelled["gen"] == building["gen"]
+            results = await dev.results(3, timeout=30)
+            assert {name: r["type"] for name, r in results.items()} == {
+                name: "cancelled" for name in ALL
+            }
+            (message,) = await dev.expect("stale")
             assert stale(buck, message) == {
                 name: ([], ["app/delay.txt", "app/main.txt"]) for name in ALL
             }
             await dev.quiet()
 
             dev.request({"type": "build", "outputs": ALL})
-            building, built = await dev.expect("building", "built")
-            assert files(buck, building) == ["app/delay.txt", "app/main.txt"]
-            assert contents(built)["site"] == "lib v1\napp v2\n"
+            await dev.expect("build")
+            assert contents(await dev.results(3)) == {
+                name: "lib v1\napp v2\n" for name in ALL
+            }
         finally:
             await dev.stop()
 
@@ -492,7 +505,7 @@ class DevScopesTest(BuckTestCase):
             write(buck, "app/delay.txt", "60\n")
             await dev.expect("stale")
             dev.request({"type": "build", "outputs": ["site"]})
-            (first,) = await dev.expect("building")
+            await dev.expect("build")
             await asyncio.sleep(2)
 
             # `lib` changes while it runs. The build would use the change, so it stops, and
@@ -500,7 +513,7 @@ class DevScopesTest(BuckTestCase):
             write(buck, "app/delay.txt", "0\n")
             write(buck, "lib/lib.txt", "lib v2\n")
             cancelled, message = await dev.expect("cancelled", "stale", timeout=30)
-            assert cancelled["gen"] == first["gen"]
+            assert cancelled["output"] == "site"
             assert stale(buck, message)["site"] == (
                 ["both"],
                 ["app/delay.txt", "lib/lib.txt"],
@@ -519,12 +532,9 @@ class DevScopesTest(BuckTestCase):
             # A new server has asked for nothing, so nothing is stale for it: it asks for what
             # it needs, and gets it as the files are.
             write(buck, "app/server.py", read(buck, "app/server.py") + "# changed\n")
-            _, _, _, building, built = await dev.expect(
-                "shutdown", "started", "ready", "building", "built"
-            )
-            assert building["outputs"] == ALL
-            assert building["files"] == []
-            assert contents(built)["patch"] == "lib v2\napp v1\n"
+            _, _, _, build = await dev.expect("shutdown", "started", "ready", "build")
+            assert build["outputs"] == ALL
+            assert contents(await dev.results(3))["patch"] == "lib v2\napp v1\n"
             await dev.quiet()
 
             # The next change is the first since it got them.
@@ -543,7 +553,8 @@ class DevScopesTest(BuckTestCase):
             write(buck, "lib/lib.txt", "FAIL lib\n")
             await dev.expect("stale")
             dev.request({"type": "build", "outputs": ["patch"]})
-            await dev.expect("building", "failed")
+            _, failed = await dev.expect("build", "failed")
+            assert failed["output"] == "patch"
             await dev.quiet()
 
             write(buck, "lib/lib.txt", "lib v2\n")
@@ -557,7 +568,7 @@ class DevScopesTest(BuckTestCase):
             )
 
             dev.request({"type": "build", "outputs": ["patch"]})
-            _, built = await dev.expect("building", "built")
+            _, built = await dev.expect("build", "built")
             assert contents(built) == {"patch": "lib v2\napp v2\n"}
             await dev.quiet()
             write(buck, "app/main.txt", "app v3\n")
@@ -592,13 +603,11 @@ class DevScopesTest(BuckTestCase):
     async def test_sidecars_are_built_with_their_output(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:sidecars")
         try:
-            _, ready, _, built = await dev.expect(
-                "started", "ready", "building", "built"
-            )
+            _, ready, _, built = await dev.expect("started", "ready", "build", "built")
             # A sidecar is not an output.
             assert ready["outputs"] == ["site"]
             check = read(buck, "app/check.txt")
-            assert sidecars(built["outputs"]["site"]) == {
+            assert sidecars(built) == {
                 "check": (check, True),
                 "extra": ("extra v1\n", True),
                 "src": ("app v1\n", True),
@@ -607,11 +616,11 @@ class DevScopesTest(BuckTestCase):
             # A file that only a sidecar is built from makes the output stale. The sidecar is
             # new, and the output and the other sidecars are not.
             write(buck, "app/extra.txt", "extra v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["site"]
-            assert files(buck, building) == ["app/extra.txt"]
+            message, build, built = await dev.expect("stale", "build", "built")
+            assert files(buck, message["outputs"]["site"]) == ["app/extra.txt"]
+            assert build["outputs"] == ["site"]
             assert changed(built) == {"site": False}
-            assert sidecars(built["outputs"]["site"]) == {
+            assert sidecars(built) == {
                 "check": (check, False),
                 "extra": ("extra v2\n", True),
                 "src": ("app v1\n", False),
@@ -619,10 +628,10 @@ class DevScopesTest(BuckTestCase):
 
             # A file of the output, which is a sidecar itself.
             write(buck, "app/main.txt", "app v2\n")
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert contents(built) == {"site": "app v2\n"}
             assert changed(built) == {"site": True}
-            assert sidecars(built["outputs"]["site"]) == {
+            assert sidecars(built) == {
                 "check": (check, False),
                 "extra": ("extra v2\n", False),
                 "src": ("app v2\n", True),
@@ -630,7 +639,8 @@ class DevScopesTest(BuckTestCase):
 
             # The server cannot ask for a sidecar by itself.
             dev.request({"type": "build", "outputs": ["extra"]})
-            _, failed = await dev.expect("building", "failed")
+            _, failed = await dev.expect("build", "failed")
+            assert failed["output"] == "extra", failed
             assert "no output named `extra`" in failed["error"], failed
             await dev.quiet()
         finally:
@@ -645,14 +655,22 @@ class DevScopesTest(BuckTestCase):
             # The action of `flood` writes about a hundred thousand files under `buck-out`.
             # They are no changes to the project: the build is not stopped, and nothing is
             # stale after it.
-            _, _, _, built = await dev.expect("started", "ready", "building", "built")
-            assert contents(built) == {"flood": "app v1\n", "site": "app v1\n"}
+            assert contents(await dev.start(outputs=2)) == {
+                "flood": "app v1\n",
+                "site": "app v1\n",
+            }
             await dev.quiet(5)
 
             write(buck, "app/main.txt", "app v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["app/main.txt"]
-            assert contents(built) == {"flood": "app v2\n", "site": "app v2\n"}
+            message, _ = await dev.expect("stale", "build")
+            assert stale(buck, message) == {
+                "flood": ([], ["app/main.txt"]),
+                "site": ([], ["app/main.txt"]),
+            }
+            assert contents(await dev.results(2)) == {
+                "flood": "app v2\n",
+                "site": "app v2\n",
+            }
             await dev.quiet(5)
         finally:
             await dev.stop()
@@ -663,7 +681,7 @@ class DevScopesTest(BuckTestCase):
     ) -> None:
         dev = await start_dev(buck, "//app:outputs")
         try:
-            await dev.start()
+            await dev.start(outputs=2)
 
             # A package in a directory that the root of the project gets after the daemon
             # started watching, and that `site` is then built from.
@@ -677,16 +695,14 @@ class DevScopesTest(BuckTestCase):
             await dev.quiet()
             edit_target(buck, APP, "outputs", '"//lib:lib"', '"//lib:lib", "//more:more"')
             # The target of both outputs changed, so both are stale.
-            _, _, building, built = await dev.expect(
-                "graph_changed", "stale", "building", "built"
-            )
-            assert building["outputs"] == ["extra", "site"]
-            assert contents(built)["site"] == "lib v1\nmore v1\napp v1\n"
+            _, _, build = await dev.expect("graph_changed", "stale", "build")
+            assert build["outputs"] == ["extra", "site"]
+            assert contents(await dev.results(2))["site"] == "lib v1\nmore v1\napp v1\n"
 
             # A change to a file in that directory is seen.
             write(buck, "more/more.txt", "more v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert files(buck, building) == ["more/more.txt"]
+            message, _, built = await dev.expect("stale", "build", "built")
+            assert stale(buck, message) == {"site": ([], ["more/more.txt"])}
             assert contents(built) == {"site": "lib v1\nmore v2\napp v1\n"}
             await dev.quiet()
         finally:

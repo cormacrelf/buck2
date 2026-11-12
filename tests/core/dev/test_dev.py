@@ -22,7 +22,7 @@ from buck2.tests.core.common.dev.dev_util import (
     assert_kept,
     contents,
     dev_test,
-    path,
+    files,
     site,
     start_dev,
     stopped,
@@ -41,19 +41,17 @@ class DevTest(BuckTestCase):
         try:
             ready = await dev.wait_for("ready")
             assert ready["outputs"] == ["site"]
-            assert ready["version"] == 1
-            built = await dev.wait_for("built")
-            assert site(built) == "lib v1\napp v1\n"
+            assert ready["version"] == 2
+            first = await dev.wait_for("built")
+            assert site(first) == "lib v1\napp v1\n"
 
             write(buck, "app/main.txt", "app v2\n")
-            building = await dev.wait_for("building")
-            assert [os.path.realpath(f) for f in building["files"]] == [
-                path(buck, "app/main.txt")
-            ]
+            stale = await dev.wait_for("stale")
+            assert files(buck, stale["outputs"]["site"]) == ["app/main.txt"]
             built = await dev.wait_for("built")
             assert site(built) == "lib v1\napp v2\n"
-            assert built["outputs"]["site"]["changed"]
-            assert built["gen"] == building["gen"]
+            assert built["changed"]
+            assert built["token"] > first["token"]
         finally:
             await dev.stop()
 
@@ -63,12 +61,12 @@ class DevTest(BuckTestCase):
         try:
             # The server asks again with a version from the list, on the same connection.
             _, unsupported, ready = await dev.expect("started", "unsupported", "ready")
-            assert unsupported["versions"] == [1], unsupported
-            assert ready["version"] == 1
+            assert unsupported["versions"] == [2], unsupported
+            assert ready["version"] == 2
             await dev.wait_for("built")
         finally:
             output = await dev.stop()
-        assert "asked for protocol version 2" in output, output
+        assert "asked for protocol version 3" in output, output
 
     @dev_test()
     async def test_unknown_request_is_reported(self, buck: Buck) -> None:
@@ -127,7 +125,7 @@ class DevTest(BuckTestCase):
 
             # Start a dev build that takes 15 seconds.
             write(buck, "app/delay.txt", "15\n")
-            await dev.wait_for("building")
+            await dev.wait_for("build")
             await asyncio.sleep(2)
 
             # A build with different files preempts the dev build instead of waiting for it.
@@ -154,7 +152,7 @@ class DevTest(BuckTestCase):
 
             # Start a dev build that takes 60 seconds.
             write(buck, "app/delay.txt", "60\n")
-            first = await dev.wait_for("building")
+            await dev.wait_for("build")
             await asyncio.sleep(2)
 
             # A change to a file that the build builds from stops it. Once the files stop
@@ -162,15 +160,11 @@ class DevTest(BuckTestCase):
             start = time.monotonic()
             write(buck, "app/delay.txt", "0\n")
             write(buck, "app/main.txt", "app v2\n")
-            cancelled = await dev.wait_for("cancelled")
-            assert cancelled["gen"] == first["gen"]
-            await dev.wait_for("stale")
-            building = await dev.wait_for("building")
-            assert path(buck, "app/main.txt") in [
-                os.path.realpath(f) for f in building["files"]
-            ]
+            (cancelled,) = await dev.expect("cancelled")
+            assert cancelled["output"] == "site"
+            stale = await dev.wait_for("stale")
+            assert "app/main.txt" in files(buck, stale["outputs"]["site"])
             built = await dev.wait_for("built")
-            assert built["gen"] == building["gen"]
             assert site(built) == "app v2\n"
             assert time.monotonic() - start < 30
         finally:
@@ -185,18 +179,18 @@ class DevTest(BuckTestCase):
             await dev.wait_for("built")
 
             write(buck, "app/delay.txt", "4\n")
-            first = await dev.wait_for("building")
+            await dev.wait_for("build")
             await asyncio.sleep(1)
 
-            # A new file that no target uses, and a file of the build saved unchanged.
+            # A new file that no target uses, and a file of the build saved unchanged. The
+            # build goes on and builds the site.
             write(buck, "app/unrelated.txt", "unrelated\n")
             os.utime(buck.cwd / "app/main.txt")
-            built = await dev.wait_for("built")
-            assert built["gen"] == first["gen"]
+            await dev.expect("built")
 
             # The build read `main.txt` as it is after the save, so the save is no reason to
             # build again after it.
-            await dev.assert_none("building", 3)
+            await dev.assert_none("build", 3)
             assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
         finally:
             await dev.stop()
@@ -208,17 +202,17 @@ class DevTest(BuckTestCase):
             await dev.wait_for("built")
 
             write(buck, "app/delay.txt", "4\n")
-            first = await dev.wait_for("building")
+            await dev.wait_for("build")
             await asyncio.sleep(1)
 
             # A new file that the build does not use yet: the build goes on, and the site is
             # stale with the file after it.
             write(buck, "app/pages/b.txt", "page b\n")
-            built = await dev.wait_for("built")
-            assert built["gen"] == first["gen"]
+            (first,) = await dev.expect("built")
+            assert site(first) == "page a\n"
             await dev.wait_for("graph_changed")
             built = await dev.wait_for("built")
-            assert built["gen"] > first["gen"]
+            assert built["token"] > first["token"]
             assert site(built) == "page a\npage b\n"
             assert all(e["type"] != "cancelled" for e in dev._events()), dev._events()
         finally:
@@ -245,15 +239,14 @@ class DevTest(BuckTestCase):
             shutdown, started, _ = await dev.expect("shutdown", "started", "ready")
             assert shutdown["pid"] == first["pid"]
             assert started["pid"] != first["pid"]
-            building, built = await dev.expect("building", "built")
-            assert building["files"] == []
+            _, built = await dev.expect("build", "built")
             assert built["pid"] == started["pid"]
             await dev.quiet()
 
             # A file that the command does not name makes the site stale, and the server keeps
             # running.
             write(buck, "app/main.txt", "app v2\n")
-            _, _, built = await dev.expect("stale", "building", "built")
+            _, _, built = await dev.expect("stale", "build", "built")
             assert site(built) == "app v2\n"
             assert built["pid"] == started["pid"]
             await dev.quiet()
@@ -264,28 +257,21 @@ class DevTest(BuckTestCase):
     async def test_server_is_read_during_a_build(self, buck: Buck) -> None:
         dev = await start_dev(buck, "//app:slow_flood")
         try:
-            await dev.wait_for("built")
+            first = await dev.wait_for("built")
 
-            # Start a dev build that takes 10 seconds. The server sends a request far bigger
-            # than a socket buffer when it starts, which it can only finish sending if
-            # `buck2 dev` reads it during the build.
+            # Start a dev build that takes 10 seconds. Right after the server asks for it, it
+            # sends a request far bigger than a socket buffer, which it can only finish sending
+            # if `buck2 dev` reads it during the build.
             write(buck, "app/delay.txt", "10\n")
-            building = await dev.wait_for("building")
-            await dev.wait_for("flooded", timeout=30)
-            assert all(
-                e.get("gen") != building["gen"]
-                for e in dev._events()
-                if e["type"] in ("built", "failed")
-            ), dev._events()
+            await dev.expect("stale", "build", "build")
+            await dev.wait_for("flooded", timeout=8)
 
-            # The request is handled during the build, and its build joins the first for
-            # `site`.
-            second = await dev.wait_for("building")
-            assert second["gen"] > building["gen"]
-            built = await dev.wait_for("built")
-            assert built["gen"] == building["gen"]
-            built = await dev.wait_for("built")
-            assert built["gen"] == second["gen"]
+            # The request asks for `site` too, so it joins the build of `site` that runs: the
+            # server gets one `built` for both.
+            (built,) = await dev.expect("built", timeout=30)
+            assert site(built) == "app v1\n"
+            assert built["token"] > first["token"]
+            await dev.quiet()
         finally:
             await dev.stop()
 
@@ -392,7 +378,7 @@ class DevTest(BuckTestCase):
             # file to the package.
             write(buck, "app/other.txt", "other v2\n")
             await dev.assert_none("graph_changed", 3)
-            await dev.assert_none("building", 0)
+            await dev.assert_none("build", 0)
 
             # A real change still builds.
             write(buck, "app/main.txt", "app v2\n")
@@ -481,22 +467,23 @@ class DevTest(BuckTestCase):
     ) -> None:
         dev = await start_dev(buck, "//app:deep")
         try:
-            first = await dev.start()
+            first = await dev.start(outputs=2)
             assert contents(first) == {"site": "lib v1\napp v1\n", "deep": "lib v1\n"}
 
             # `lib.txt` is only reachable from `deep` through a dynamic action and a
             # transitive set.
             write(buck, "lib/lib.txt", "lib v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["deep", "site"]
-            assert contents(built) == {"site": "lib v2\napp v1\n", "deep": "lib v2\n"}
+            _, build = await dev.expect("stale", "build")
+            assert build["outputs"] == ["deep", "site"]
+            results = await dev.results(2)
+            assert contents(results) == {"site": "lib v2\napp v1\n", "deep": "lib v2\n"}
 
             # The app's own file is not below `deep`: only the site is stale.
             write(buck, "app/main.txt", "app v2\n")
-            _, building, built = await dev.expect("stale", "building", "built")
-            assert building["outputs"] == ["site"]
+            _, build, built = await dev.expect("stale", "build", "built")
+            assert build["outputs"] == ["site"]
             assert site(built) == "lib v2\napp v2\n"
-            assert built["pid"] == first["pid"]
+            assert built["pid"] == first["site"]["pid"]
             await dev.quiet()
         finally:
             await dev.stop()
@@ -544,10 +531,10 @@ class DevTest(BuckTestCase):
             # Break the server's build. `buck2 dev` builds the server again after each
             # change, also to the build file.
             write(buck, "app/check.txt", "broken\n")
-            await dev.wait_for("failed")
+            await dev.wait_for("error")
             targets = (buck.cwd / "app/TARGETS.fixture").read_text()
             write(buck, "app/TARGETS.fixture", targets + "# changed\n")
-            await dev.wait_for("failed")
+            await dev.wait_for("error")
 
             # Fixing it does not change the graph, but the analysis runs again.
             write(buck, "app/check.txt", "ok\n")

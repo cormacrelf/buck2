@@ -67,12 +67,6 @@ pub(crate) async fn new_generic_command(
                 )
                 .await?,
         ),
-        NewGenericRequest::Dev(d) => NewGenericResponse::Dev(
-            OTHER_SERVER_COMMANDS
-                .get()?
-                .dev(context, partial_result_dispatcher, d)
-                .await?,
-        ),
         NewGenericRequest::Docs(d) => NewGenericResponse::Docs(
             DOCS_SERVER_COMMAND
                 .get()?
