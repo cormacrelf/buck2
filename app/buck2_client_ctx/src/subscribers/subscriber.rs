@@ -29,6 +29,12 @@ pub enum SessionUpdate {
     Stop,
     /// The client was continued after `Stop`.
     Continued,
+    /// Nothing runs for now in the client's command, which lasts for the whole session: show
+    /// the status line until something starts again.
+    Idle,
+    /// Take the display off the terminal for good, as for a program that takes the terminal over.
+    /// `EventsCtx` sets the flag once it is off.
+    Erase(std::sync::Arc<std::sync::atomic::AtomicBool>),
 }
 
 /// Visitor trait.  Implement this to subscribe to the event streams.

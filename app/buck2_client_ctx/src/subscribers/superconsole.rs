@@ -953,7 +953,9 @@ impl StatefulSuperConsoleImpl {
     }
 
     async fn handle_event(&mut self, event: &Arc<BuckEvent>) -> buck2_error::Result<()> {
-        if self.idle {
+        // In a session, what the daemon sends while nothing runs, such as its snapshots, leaves
+        // the status line up. Work starts with a span.
+        if self.idle && matches!(event.data(), buck2_data::buck_event::Data::SpanStart(_)) {
             self.start_command(event);
         }
         self.state.update_event_observer(event).await?;
@@ -1678,6 +1680,13 @@ impl StatefulSuperConsoleImpl {
                 self.canvas.flush()?;
             }
             SessionUpdate::Continued => self.render()?,
+            SessionUpdate::Idle => {
+                if !self.idle {
+                    self.end_command()?;
+                }
+            }
+            // `EventsCtx` erases the canvas.
+            SessionUpdate::Erase(_) => {}
         }
         Ok(())
     }

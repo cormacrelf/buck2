@@ -205,6 +205,8 @@ pub struct SimpleConsole<E> {
     /// printed for every command, such as the build ID and the cache hits, and the files that
     /// changed, which the client reports itself.
     session: bool,
+    /// In a session, nothing runs for now: no keepalive lines until something starts.
+    idle: bool,
 }
 
 impl<E> SimpleConsole<E>
@@ -231,6 +233,7 @@ where
             health_warning_backoff: HealthWarningBackoff::new(now),
             output_limit: ConsoleOutputLimit::new(),
             session: false,
+            idle: false,
         }
     }
 
@@ -254,6 +257,7 @@ where
             health_warning_backoff: HealthWarningBackoff::new(now),
             output_limit: ConsoleOutputLimit::new(),
             session: false,
+            idle: false,
         }
     }
 
@@ -397,6 +401,10 @@ where
     }
 
     pub(crate) async fn handle_event(&mut self, event: &Arc<BuckEvent>) -> buck2_error::Result<()> {
+        if self.idle && matches!(event.data(), buck2_data::buck_event::Data::SpanStart(_)) {
+            self.idle = false;
+            self.last_print_time = Instant::now();
+        }
         self.update_event_observer(event).await?;
 
         self.handle_event_inner(event).await?;
@@ -734,12 +742,21 @@ where
     }
 
     async fn handle_session_update(&mut self, update: &SessionUpdate) -> buck2_error::Result<()> {
-        if let SessionUpdate::Output(lines) = update {
-            for line in lines {
-                // ast-grep-ignore: rust/buck2-cli-simpleconsole-echo
-                crate::eprintln!("{}", line)?;
+        match update {
+            SessionUpdate::Output(lines) => {
+                for line in lines {
+                    // ast-grep-ignore: rust/buck2-cli-simpleconsole-echo
+                    crate::eprintln!("{}", line)?;
+                }
+                self.notify_printed();
             }
-            self.notify_printed();
+            SessionUpdate::Idle => {
+                // The action errors were printed as they happened. The session's command ends
+                // with only those since it was last idle.
+                self.idle = true;
+                self.action_errors.clear();
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -768,6 +785,9 @@ where
 
     async fn tick(&mut self, _: &Tick) -> buck2_error::Result<()> {
         let now = Instant::now();
+        if self.idle {
+            return Ok(());
+        }
         if self.verbosity.print_status() && now - self.last_print_time > KEEPALIVE_TIME_LIMIT {
             let show_waiting_line = self.waiting_line.should_show(now);
             let mut show_stats = self.expect_spans;

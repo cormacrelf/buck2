@@ -531,6 +531,11 @@ impl EventsCtx {
         &mut self,
         update: SessionUpdate,
     ) -> buck2_error::Result<()> {
+        if let SessionUpdate::Erase(done) = &update {
+            self.erase_interactive_output().await?;
+            done.store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
         self.try_for_each_subscriber(|s| s.handle_session_update(&update))
             .await?;
         if let SessionUpdate::Stop = update {
