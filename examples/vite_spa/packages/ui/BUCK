@@ -1,0 +1,12 @@
+load("//apps/web:vite.bzl", "STYLE")
+load("//vite:defs.bzl", "vite_package")
+
+vite_package(
+    srcs = glob(["src/**"]),
+    exports = {
+        ".": "src/index.ts",
+        "./icons": "src/icons/index.ts",
+        "./tokens.css": "src/tokens.css",
+    },
+    **STYLE
+)

@@ -1,0 +1,24 @@
+load("//apps/web:vite.bzl", "STYLE")
+load("//vite:defs.bzl", "vite_package")
+
+# src/generated/taxa.ts is made from taxa.json by scripts/generate.mjs, here by a build step, so
+# an edit to taxa.json reaches the page like an edit to a source.
+vite_package(
+    srcs = glob(
+        ["src/**"],
+        exclude = ["src/generated/**"],
+    ),
+    exports = {".": "src/index.ts"},
+    generated = {"src/generated/taxa.ts": ":generated"},
+    **STYLE
+)
+
+genrule(
+    name = "generated",
+    srcs = [
+        "scripts/generate.mjs",
+        "taxa.json",
+    ],
+    out = "taxa.ts",
+    cmd = "node $SRCDIR/scripts/generate.mjs $SRCDIR/taxa.json $OUT",
+)

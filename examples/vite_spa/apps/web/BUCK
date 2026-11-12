@@ -1,0 +1,65 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_importer")
+load("//vite:defs.bzl", "vite_constants", "vite_package")
+load("//:lock.bzl", "LOCK")
+load(":vite.bzl", "PACKAGE", "STYLE")
+
+# The app's modules for `buck2 dev vite/dev.bxl:dev -- --app //apps/web:web`. What
+# vite.config.ts configures, said again for buck2.
+vite_package(
+    srcs = glob(["src/**"]),
+    aliases = {"@/": "src/"},
+    define = {
+        "__APP_VERSION__": json.encode(PACKAGE["version"]),
+        "__DEBUG_PANEL__": "true",
+    },
+    html = "index.html",
+    image_presets = {
+        "card": {"as": "picture", "format": "avif;webp;jpg", "w": "360;720"},
+    },
+    public = "public",
+    scss_additional_data = '@use "@/styles/tokens" as *;\n',
+    # vite-imagetools and @vitejs/plugin-react are built in. The app's own plugins run as they
+    # are: the build hooks of markdown and photo in each module's action, and the server hooks
+    # of build-info and markdown in the dev server.
+    plugins = ":vite_plugins",
+    build_plugins = {
+        "plugins/markdown.ts:markdown": [".md"],
+        "plugins/photo.ts:photo": [".jpg"],
+    },
+    server_plugins = [
+        'plugins/build-info.ts:buildInfo:[{"preloadFonts":["src/assets/fonts/ibm-plex-mono-latin-400-normal.woff2"]}]',
+        "plugins/markdown.ts:markdown",
+    ],
+    # build-info's module reads git and the clock when Vite starts, which an action must not.
+    # Here it is built from what buck2 knows.
+    virtual = {"virtual:build-info": ":build_info"},
+    **STYLE
+)
+
+nodejs_library(
+    name = "vite_plugins",
+    package_name = "@fieldnotes/web-vite-plugins",
+    srcs = glob(["plugins/*.ts"]),
+    node_modules = pnpm_importer().node_modules,
+    type = "module",
+)
+
+# The versions the plugin reports, as the lockfile has them.
+_deps = LOCK["importers"]["apps/web"]
+
+vite_constants(
+    name = "build_info",
+    values = {
+        # Not stamped: the module is the same for every commit, so it does not rebuild the app
+        # on each one.
+        "builtAt": "1970-01-01T00:00:00.000Z",
+        "channel": "dev",
+        "commit": None,
+        "dependencies": {
+            name: (_deps.get("dependencies", {}).get(name) or _deps["devDependencies"][name])["version"].split("(")[0]
+            for name in ["react", "react-router", "vite"]
+        },
+        "mode": "development",
+        "version": PACKAGE["version"],
+    },
+)

@@ -1,0 +1,107 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//vite:defs.bzl", "ViteModulesInfo", "ViteNpmInfo", "vite_ext")
+
+def _dev(ctx):
+    """`buck2 dev vite/dev.bxl:dev -- --app //apps/web:web`: the Vite dev server for the app,
+    with each module built on demand by the handler `module`, and each npm package by `npm`."""
+    app = ctx.configured_targets(ctx.cli_args.app)
+    info = ctx.analysis(app).providers()[ViteModulesInfo]
+    if info.html == None:
+        fail("{} has no `html`".format(ctx.cli_args.app))
+    server = ctx.analysis(ctx.configured_targets("root//vite/server:main")).providers()[RunInfo]
+    args = ["--app", info.package, "--npm", ctx.cli_args.npm]
+    if info.public:
+        args += ["--public", info.public]
+    if info.server_plugins:
+        args.append(info.server_plugins)
+    return [
+        DefaultInfo(),
+        DevInfo(
+            server = cmd_args(server, args),
+            outputs = {"index": info.html},
+            handlers = {
+                "module": "root//vite/dev.bxl:module",
+                "npm": "root//vite/dev.bxl:npm",
+            },
+        ),
+    ]
+
+dev = bxl_main(
+    impl = _dev,
+    cli_args = {
+        "app": cli_args.target_label(),
+        "npm": cli_args.string(default = "root//:esm"),
+    },
+)
+
+def _package_of(ctx, path):
+    """The package that `path` is in: the nearest directory above it with a BUCK file."""
+    parts = path.split("/")[:-1]
+    for i in range(len(parts), -1, -1):
+        d = "/".join(parts[:i])
+        if ctx.fs.exists((d + "/" if d else "") + "BUCK"):
+            return d
+    fail("no package above `{}`".format(path))
+
+def _module(ctx):
+    """A `buck2 dev` handler: the compiled module of `--key`, a source's path in the project with
+    `~<query>` for a query, from the `vite_library` of its package."""
+    key = ctx.cli_args.key
+    path, _, query = key.partition("~")
+    pkg = _package_of(ctx, path)
+    for target in ctx.uquery().eval("kind(vite_library, '//{}:')".format(pkg)):
+        info = ctx.analysis(ctx.configured_targets(target.label)).providers()[ViteModulesInfo]
+        if key in info.modules:
+            return [DefaultInfo(default_output = info.modules[key])]
+        if path in info.srcs:
+            return [DefaultInfo(default_output = _compile(ctx, info, path, query))]
+    fail("no `vite_library` in //{} has the module `{}`".format(pkg, key))
+
+def _compile(ctx, info, path, query):
+    """A module that the library does not declare, because only its importer knows it: an
+    image with resize directives (`?w=400;800&format=webp`), or a query that a plugin answers
+    (`?photo`, `?meta`). The handler declares the action that compiles it, and the files it
+    makes besides the module, such as the images, come with it."""
+    actions = ctx.bxl_actions().actions
+    name = "vite/q/{}~{}".format(path, hash(query) & 0xffffffff)
+    out = actions.declare_output(name + ".js")
+    # The module names its assets by their paths in the project, so they must not move with
+    # their contents.
+    assets = actions.declare_output(name + ".assets", dir = True, has_content_based_path = False)
+    actions.run(
+        cmd_args(
+            info.transform,
+            info.plugins.get(vite_ext(path), []),
+            "--path",
+            path,
+            "--query=" + query,
+            "--src",
+            info.srcs[path],
+            "--out",
+            out.as_output(),
+            "--assets",
+            assets.as_output(),
+            hidden = info.styles,
+        ),
+        category = "vite_transform",
+        identifier = path + "?" + query,
+    )
+    return out.with_associated_artifacts([assets])
+
+module = bxl_main(impl = _module, cli_args = {"key": cli_args.string()})
+
+def _npm(ctx):
+    """A `buck2 dev` handler: the pre-bundled ES modules of the npm store entry `--entry`."""
+    esm = ctx.analysis(ctx.configured_targets(ctx.cli_args.target)).providers()[ViteNpmInfo].esm
+    if ctx.cli_args.entry not in esm:
+        fail("`{}` is not an entry of the npm store".format(ctx.cli_args.entry))
+    return [DefaultInfo(default_output = esm[ctx.cli_args.entry])]
+
+npm = bxl_main(impl = _npm, cli_args = {"entry": cli_args.string(), "target": cli_args.string()})

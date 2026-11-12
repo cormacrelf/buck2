@@ -1,6 +1,8 @@
 packages:
   - 'apps/*'
   - 'packages/*'
+  # The buck2 build: the module compiler and the dev server.
+  - 'vite/*'
 
 # sass pulls in @parcel/watcher for its CLI --watch mode, which Vite doesn't
 # use; its prebuilt binaries arrive as optional dependencies anyway.

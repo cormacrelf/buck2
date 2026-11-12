@@ -1,0 +1,14 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_workspace")
+load("//vite:defs.bzl", "vite_npm")
+load(":pnpm-lock.yaml", lock = "value")
+load(":pnpm-workspace.yaml", workspace = "value")
+
+pnpm_workspace(lock, workspace)
+
+# Every npm package of the lockfile, pre-bundled for the browser, each by an action of its own
+# that runs only when a page loads the package.
+vite_npm(
+    name = "esm",
+    store = ":npm",
+    visibility = ["PUBLIC"],
+)

@@ -111,3 +111,90 @@ Checked against the dev server's HMR socket:
 Some things large Vite apps also do that this example leaves out: Tailwind or
 other utility-CSS plugins, file-based route generation, Babel plugins such as
 the React Compiler, WebAssembly, `server.proxy`, and tests (Vitest).
+
+## With buck2
+
+The same app also runs under `buck2 dev`, with buck2 compiling every module:
+
+```sh
+buck2 dev vite/dev.bxl:dev -- --app //apps/web:web
+```
+
+Open <http://localhost:5173/> (or set `PORT`). It needs `node` on `PATH` and network
+access the first time, to fetch the npm packages in `pnpm-lock.yaml`. It does not need
+`pnpm install`, `pnpm build:packages` or `tsc --watch`.
+
+### What buck2 does and what Vite does
+
+Vite still serves the page. It runs its HMR client and module graph, rewrites imports for
+HMR (`?t=`, `import.meta.hot`), injects `import.meta.env`, and fills in `%VITE_*%`. It
+compiles nothing and watches nothing: oxc, the dependency optimizer and the file watcher are
+turned off.
+
+Every module is a buck2 action, run when the browser first asks for the module and cached
+after that:
+
+- **Sources**: `vite/tools/transform.mjs` compiles one file with oxc-transform
+  (TypeScript, JSX, React refresh) and resolves its imports to the URLs that serve them.
+  Each `?raw`, `?url`, `?inline` and `?worker` import is a module of its own.
+- **Stylesheets**: Sass, then lightningcss for CSS modules, `url()`s and the
+  `browserslist` prefixes that autoprefixer adds under Vite.
+- **`import.meta.glob`** and `import(\`./messages/${locale}.json\`)` are expanded against
+  the package's sources, which BUCK globs. A new note changes the glob, and the module that
+  globs it is built again.
+- **Images**: `?w=…&format=…&as=picture` and `?preset=card` resize with sharp in an action
+  per image and query. The bxl handler declares that action when the query is first asked
+  for, since only the importer knows it.
+- **npm packages**: `vite_npm` pre-bundles each store entry with esbuild, one action per
+  package, with its dependencies left as imports of their own bundles. Vite's optimizer
+  bundles every dependency together, and does it again when one is added. Stylesheets in npm
+  packages (`@fontsource/literata`) become modules too.
+- **`packages/geo`** is compiled from source per file, as the app's modules are, so an edit
+  there reaches the page without `tsc` writing `dist/`.
+- **`packages/taxa`**: `scripts/generate.mjs` runs as a genrule, and an edit to
+  `taxa.json` is an HMR update of the pages that use it.
+
+The app's own plugins run unmodified. Their build hooks run inside the actions: `markdown`
+for `.md` and `photo` for `.jpg`, as listed in `apps/web/BUCK`. Their server hooks run in
+the dev server: `buildInfo`'s `/version.json` and its `index.html` tags, and `markdown`'s
+`hotUpdate`, which sends `fieldnotes:note-update`. `virtual:build-info` is the exception. Its
+`load` reads git and the clock, which a cached action must not, so `apps/web/BUCK` builds it
+from the lockfile and `package.json` instead.
+
+`vite.config.ts` is not read. What it configures is said again in `apps/web/BUCK` and
+`apps/web/vite.bzl`: aliases, `define`, the CSS module naming, Sass `additionalData`, the
+imagetools preset.
+
+### Changes, as measured
+
+With `buck2 dev --debounce-ms 10`, from saving a file to the HMR message on Vite's
+websocket:
+
+| Edit | Result | Time |
+| --- | --- | --- |
+| A component | `js-update` of it | ~115ms |
+| `packages/ui` component or CSS module | `js-update` of the component | ~120ms |
+| `taxa.json` | `js-update` of the two pages using it | ~140ms |
+| A note's body | the plugin's `fieldnotes:note-update` event, no module update | ~145ms |
+| A note's title | the event, and `js-update`s of the lists | ~140ms |
+| `packages/geo/src` | `full-reload` (the worker imports it, as Vite does for `dist/`) | ~115ms |
+| `featureFlags.ts` | `full-reload` | ~125ms |
+| `_tokens.scss` | every `.scss` module rebuilt; `js-update` only of `NotePage`, whose CSS changed | ~1.6s |
+| Whitespace in a CSS module | nothing: the compiled module is the same | |
+
+The first load of all 138 modules builds everything and takes about 8 seconds. After that,
+a reload takes about 100ms.
+
+### Limits
+
+- Every Sass module starts dart-sass again (about 100ms), which `_tokens.scss` shows.
+  `vite.persistent_worker = true` runs the transforms in a persistent worker, but buck2 gives
+  each command its own worker pool, and each build of `buck2 dev` is a command. So a
+  worker only pays off once it outlives the command.
+- Each module is a dynamic output of `buck2 dev`, and each change is looked up in each one's
+  graph, so the time per change grows with the modules loaded: about 70ms with 30 modules
+  in `examples/dev_vite_buck`, against about 115ms here.
+- The modules the handler declares (images, `?photo`, `?meta`) count as built from every
+  source of their package, so any edit in `apps/web` builds them again. They come back the
+  same, so nothing reaches the page.
+- There is no production build through these modules yet; `pnpm build` is still Vite's.

@@ -1,0 +1,10 @@
+load("//apps/web:vite.bzl", "STYLE")
+load("//vite:defs.bzl", "vite_package")
+
+# package.json exports `dist/`, which `tsc` compiles. The browser gets each source compiled on
+# its own instead, so an edit here is an HMR update, with no `tsc --watch` in between.
+vite_package(
+    srcs = glob(["src/**"]),
+    exports = {".": "src/index.ts"},
+    **STYLE
+)

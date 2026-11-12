@@ -3,3 +3,4 @@ dist/
 # Written by packages/taxa/scripts/generate.mjs from taxa.json.
 packages/taxa/src/generated/
 *.tsbuildinfo
+buck-out/
