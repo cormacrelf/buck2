@@ -1,0 +1,17 @@
+load("//vite:defs.bzl", "vite_package")
+
+vite_package(
+    srcs = glob(["src/**"]),
+    aliases = {"@/": "src/"},
+    generated = {"src/build_info.ts": ":build_info"},
+    html = "index.html",
+    package_name = "@demo/web",
+    public = "public",
+)
+
+genrule(
+    name = "build_info",
+    srcs = ["gen_build_info.py", "release.json"],
+    out = "build_info.ts",
+    cmd = "python3 $SRCDIR/gen_build_info.py $SRCDIR/release.json $OUT",
+)

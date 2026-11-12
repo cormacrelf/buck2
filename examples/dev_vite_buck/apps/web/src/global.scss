@@ -1,0 +1,10 @@
+@use "theme";
+
+:root {
+  --accent: #{theme.$accent};
+}
+
+body {
+  font-family: theme.$font;
+  background: url("./paper.svg");
+}

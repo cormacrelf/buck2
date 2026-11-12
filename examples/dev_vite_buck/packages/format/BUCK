@@ -1,0 +1,8 @@
+load("//vite:defs.bzl", "vite_package")
+
+# The package's `exports` name `dist/`, which `tsc` compiles. The browser gets each source,
+# compiled on its own, so a change to one reaches the page without `tsc --watch`.
+vite_package(
+    srcs = glob(["src/**"]),
+    exports = {".": "src/index.ts"},
+)

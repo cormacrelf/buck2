@@ -1,0 +1,14 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_package")
+
+pnpm_package(
+    package_name = "@vitebuck/server",
+    srcs = ["server.mjs"],
+    type = "module",
+)
+
+nodejs_binary(
+    name = "main",
+    library = ":server",
+    entry_point = "server.mjs",
+    visibility = ["PUBLIC"],
+)

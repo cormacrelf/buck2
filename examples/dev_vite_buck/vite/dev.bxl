@@ -1,0 +1,72 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("//vite:defs.bzl", "ViteModulesInfo", "ViteNpmInfo")
+
+def _dev(ctx):
+    """`buck2 dev vite/dev.bxl:dev -- --app //apps/web:web`: the Vite dev server for the app,
+    with each module built on demand by the handler `module`, and each npm package by `npm`."""
+    app = ctx.configured_targets(ctx.cli_args.app)
+    info = ctx.analysis(app).providers()[ViteModulesInfo]
+    if info.html == None:
+        fail("{} has no `html`".format(ctx.cli_args.app))
+    server = ctx.analysis(ctx.configured_targets("root//vite/server:main")).providers()[RunInfo]
+    args = ["--app", info.package, "--npm", ctx.cli_args.npm]
+    if info.public:
+        args += ["--public", info.public]
+    return [
+        DefaultInfo(),
+        DevInfo(
+            server = cmd_args(server, args),
+            outputs = {"index": info.html},
+            handlers = {
+                "module": "root//vite/dev.bxl:module",
+                "npm": "root//vite/dev.bxl:npm",
+            },
+        ),
+    ]
+
+dev = bxl_main(
+    impl = _dev,
+    cli_args = {
+        "app": cli_args.target_label(),
+        "npm": cli_args.string(default = "root//:esm"),
+    },
+)
+
+def _package_of(ctx, path):
+    """The package that `path` is in: the nearest directory above it with a BUCK file."""
+    parts = path.split("/")[:-1]
+    for i in range(len(parts), -1, -1):
+        d = "/".join(parts[:i])
+        if ctx.fs.exists((d + "/" if d else "") + "BUCK"):
+            return d
+    fail("no package above `{}`".format(path))
+
+def _module(ctx):
+    """A `buck2 dev` handler: the compiled module of `--key`, a source's path in the project with
+    `~<query>` for a query, from the `vite_library` of its package."""
+    key = ctx.cli_args.key
+    path = key.split("~")[0]
+    pkg = _package_of(ctx, path)
+    for target in ctx.uquery().eval("kind(vite_library, '//{}:')".format(pkg)):
+        info = ctx.analysis(ctx.configured_targets(target.label)).providers()[ViteModulesInfo]
+        if key in info.modules:
+            return [DefaultInfo(default_output = info.modules[key])]
+    fail("no `vite_library` in //{} has the module `{}`".format(pkg, key))
+
+module = bxl_main(impl = _module, cli_args = {"key": cli_args.string()})
+
+def _npm(ctx):
+    """A `buck2 dev` handler: the pre-bundled ES modules of the npm store entry `--entry`."""
+    esm = ctx.analysis(ctx.configured_targets(ctx.cli_args.target)).providers()[ViteNpmInfo].esm
+    if ctx.cli_args.entry not in esm:
+        fail("`{}` is not an entry of the npm store".format(ctx.cli_args.entry))
+    return [DefaultInfo(default_output = esm[ctx.cli_args.entry])]
+
+npm = bxl_main(impl = _npm, cli_args = {"entry": cli_args.string(), "target": cli_args.string()})

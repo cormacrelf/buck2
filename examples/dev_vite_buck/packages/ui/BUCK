@@ -1,0 +1,6 @@
+load("//vite:defs.bzl", "vite_package")
+
+vite_package(
+    srcs = glob(["src/**"]),
+    exports = {".": "src/index.ts"},
+)

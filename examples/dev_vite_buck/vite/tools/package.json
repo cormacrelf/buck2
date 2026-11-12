@@ -1,0 +1,14 @@
+{
+  "name": "@vitebuck/tools",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "cjs-module-lexer": "^2.1.0",
+    "es-module-lexer": "^2.0.0",
+    "esbuild": "^0.28.2",
+    "lightningcss": "^1.33.0",
+    "oxc-transform": "^0.158.0",
+    "sass": "^1.108.2"
+  }
+}

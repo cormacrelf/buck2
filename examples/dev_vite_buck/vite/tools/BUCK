@@ -1,0 +1,17 @@
+load("@prelude//nodejs:pnpm.bzl", "pnpm_package")
+
+pnpm_package(
+    package_name = "@vitebuck/tools",
+    srcs = glob(["*.mjs"]),
+    type = "module",
+)
+
+[
+    nodejs_binary(
+        name = name,
+        library = ":tools",
+        entry_point = name + ".mjs",
+        visibility = ["PUBLIC"],
+    )
+    for name in ["html", "npm_esm", "transform"]
+]
