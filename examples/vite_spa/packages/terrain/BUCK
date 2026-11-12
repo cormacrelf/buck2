@@ -1,0 +1,25 @@
+load("//apps/web:vite.bzl", "STYLE")
+load("//vite:defs.bzl", "vite_package")
+
+# src/generated/terrain.ts is made from terrain.json by scripts/survey.mjs, here by a build step
+# that takes at least five seconds. Only the Terrain page imports this package, so nothing waits
+# for that step until the browser opens the page.
+vite_package(
+    srcs = glob(
+        ["src/**"],
+        exclude = ["src/generated/**"],
+    ),
+    exports = {".": "src/index.ts"},
+    generated = {"src/generated/terrain.ts": ":generated"},
+    **STYLE
+)
+
+genrule(
+    name = "generated",
+    srcs = [
+        "scripts/survey.mjs",
+        "terrain.json",
+    ],
+    out = "terrain.ts",
+    cmd = "node $SRCDIR/scripts/survey.mjs $SRCDIR/terrain.json $OUT --min-ms 5000",
+)

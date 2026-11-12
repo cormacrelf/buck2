@@ -20,6 +20,7 @@ apps/web/               the app
 packages/ui/            React components, consumed as TypeScript source
 packages/geo/           GPX parsing and distance maths, compiled with tsc to dist/
 packages/taxa/          species list; TypeScript generated from taxa.json
+packages/terrain/       heightmap for the Terrain page; TypeScript generated from terrain.json
 ```
 
 ## Running it
@@ -156,6 +157,11 @@ after that:
   there reaches the page without `tsc` writing `dist/`.
 - **`packages/taxa`**: `scripts/generate.mjs` runs as a genrule, and an edit to
   `taxa.json` is an HMR update of the pages that use it.
+- **`packages/terrain`** shows that buck2 builds only what the open page needs. Its genrule is
+  made to take five seconds, and only the Terrain page imports the package and the d3 packages
+  it draws with. Nothing waits for any of it until the browser opens that page, and the page
+  shows how long it waited. A second visit is instant. Change `seed` in `terrain.json` to wait
+  again, as an HMR update.
 
 The app's own plugins run unmodified. Their build hooks run inside the actions: `markdown`
 for `.md` and `photo` for `.jpg`, as listed in `apps/web/BUCK`. Their server hooks run in

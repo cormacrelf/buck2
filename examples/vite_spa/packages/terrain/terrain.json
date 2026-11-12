@@ -1,0 +1,9 @@
+{
+  "name": "Glen Corrie survey",
+  "seed": 1847,
+  "width": 160,
+  "height": 100,
+  "octaves": 6,
+  "smoothing": 3,
+  "seaLevel": 0.3
+}

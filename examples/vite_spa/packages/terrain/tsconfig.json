@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "types": [],
+    "strict": true,
+    "noUnusedLocals": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["src"]
+}

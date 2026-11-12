@@ -14,6 +14,7 @@ const NAV: Array<{ to: string; label: MessageKey; enabled: boolean }> = [
   { to: '/notes', label: 'nav.notes', enabled: true },
   { to: '/gallery', label: 'nav.gallery', enabled: true },
   { to: '/tracks', label: 'nav.tracks', enabled: true },
+  { to: '/terrain', label: 'nav.terrain', enabled: true },
   { to: '/species', label: 'nav.species', enabled: flags.speciesChecklist },
   { to: '/about', label: 'nav.about', enabled: true },
 ];

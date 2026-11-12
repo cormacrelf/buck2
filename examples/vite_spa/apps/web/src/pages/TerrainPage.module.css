@@ -1,0 +1,24 @@
+.map {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: var(--fn-radius);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: var(--fn-space-3);
+  margin: var(--fn-space-3) 0 0;
+}
+
+.stats dt {
+  color: var(--fn-ink-muted);
+  font-size: 0.8rem;
+}
+
+.stats dd {
+  margin: 0;
+  font-family: 'Plex Mono', ui-monospace, monospace;
+  font-size: 1.1rem;
+}
