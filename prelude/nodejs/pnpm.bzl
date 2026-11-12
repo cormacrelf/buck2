@@ -20,12 +20,14 @@ The lockfile is loaded as data, so there is no generated BUCK file to keep up to
   ```
 
 - Its `BUCK` file defines the npm store and, for each workspace package (pnpm calls them
-  importers), the npm packages that package depends on:
+  importers), the npm packages that package depends on. `pnpm-workspace.yaml` brings the
+  patches and the packages allowed to run install scripts:
 
   ```python
   load("@prelude//nodejs:pnpm.bzl", "pnpm_workspace")
   load(":pnpm-lock.yaml", lock = "value")
-  pnpm_workspace(lock)
+  load(":pnpm-workspace.yaml", workspace = "value")
+  pnpm_workspace(lock, workspace)
   ```
 
 - Each workspace package's `BUCK` file defines its library, with its dependencies, workspace
@@ -38,6 +40,16 @@ The lockfile is loaded as data, so there is no generated BUCK file to keep up to
 
 A workspace package's target is named after its directory, so `packages/ui` is
 `//packages/ui:ui`; that is how the packages that depend on it find it.
+
+Bins work as under `pnpm run`. A binary or test runs with the bins of its library's
+dependencies and of its top-level packages on PATH, and each library has them in
+`node_modules/.bin` beside it. `//:npm/packages/ui[vite]` runs the bin npx would run for
+`vite`, a dependency of `packages/ui`, and `nodejs_npm_bin` runs one by name, with `buck2 run`
+or as the tool of a build action:
+
+```python
+nodejs_npm_bin(name = "tsc", links = "//:npm/packages/ui", package = "typescript", bin = "tsc")
+```
 """
 
 load(":rules.bzl", _rules = "rules")
@@ -148,9 +160,82 @@ def _importers(lock: dict) -> dict[str, struct]:
         result[path] = struct(workspace = workspace, npm = npm, optional = optional)
     return result
 
+def _settings(workspace: dict | None, root_package: dict | None) -> dict:
+    """pnpm's settings: those of `pnpm-workspace.yaml` over those of the root `package.json`'s
+    `pnpm` field."""
+    settings = {}
+    if root_package != None:
+        settings.update(root_package.get("pnpm") or {})
+    if workspace != None:
+        settings.update(workspace)
+    return settings
+
+def _patch_files(lock: dict, settings: dict) -> dict[str, str]:
+    """The patch file of each patch hash in the lockfile. pnpm 9 records the path in the
+    lockfile; later versions record only the hash, and the path is in the settings."""
+    configured = settings.get("patchedDependencies") or {}
+    files = {}
+    for key, value in (lock.get("patchedDependencies") or {}).items():
+        if type(value) == "dict":
+            patch_hash = value.get("hash")
+            path = value.get("path")
+        else:
+            patch_hash = value
+            path = configured.get(key)
+        if not path:
+            fail("pnpm-lock.yaml: `{}` is patched, but no `patchedDependencies` setting names its patch file; pass `pnpm_workspace` the loaded `pnpm-workspace.yaml` as `workspace`".format(key))
+        files[str(patch_hash)] = _normpath(path)
+    return files
+
+def _patch_hash(snapshot: str) -> str | None:
+    marker = "(patch_hash="
+    start = snapshot.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    return snapshot[start:snapshot.index(")", start)]
+
+def _spec_matches(spec: str, package: str) -> bool:
+    """Whether a package key matches an entry of `allowBuilds` or `onlyBuiltDependencies`:
+    a name, or a name and exact versions, as in `esbuild@0.25.0 || 0.25.1`."""
+    name = _package_name(package)
+    if spec == name:
+        return True
+    at = spec.rfind("@")
+    if at <= 0 or spec[:at] != name:
+        return False
+    version = package[len(name) + 1:]
+    return version in [v.strip() for v in spec[at + 1:].split("||")]
+
+def _builds(settings: dict, package: str) -> bool:
+    """Whether pnpm runs the install scripts of `package`. As in pnpm 10 and later, nothing runs
+    them unless a setting allows it."""
+    if settings.get("onlyBuiltDependenciesFile"):
+        fail("pnpm settings: `onlyBuiltDependenciesFile` is not supported; list the packages in `allowBuilds` or `onlyBuiltDependencies`")
+    for spec in (settings.get("neverBuiltDependencies") or []) + (settings.get("ignoredBuiltDependencies") or []):
+        if _spec_matches(spec, package):
+            return False
+    # A matching `false` wins over a matching `true`.
+    verdicts = []
+    for spec, allow in (settings.get("allowBuilds") or {}).items():
+        if _spec_matches(spec, package):
+            if type(allow) != "bool":
+                fail("pnpm settings: `allowBuilds` entry `{}` is `{}`, not true or false; run `pnpm approve-builds`".format(spec, allow))
+            verdicts.append(allow)
+    if verdicts:
+        return False not in verdicts
+    for spec in settings.get("onlyBuiltDependencies") or []:
+        if _spec_matches(spec, package):
+            return True
+    return settings.get("dangerouslyAllowAllBuilds") == True
+
 def pnpm_workspace(
         lock: dict,
+        workspace: dict | None = None,
+        root_package: dict | None = None,
         name: str = "npm",
+        node_gyp: str = "node-gyp",
+        build_local_only: bool = True,
         registry: str = "https://registry.npmjs.org",
         libc: str = "glibc",
         os_settings: dict[str, str] = _OS_SETTINGS,
@@ -160,6 +245,19 @@ def pnpm_workspace(
     and a `nodejs_npm_links` named `<name>/<path>` with the npm dependencies of each importer at
     `path` that has any (`<name>/_` for the workspace root).
 
+    `workspace` is the loaded `pnpm-workspace.yaml` and `root_package` the loaded root
+    `package.json`; pnpm's settings come from the first, then the `pnpm` field of the second.
+    Two settings matter here. `patchedDependencies` names the patch files the lockfile's
+    `patchedDependencies` hashes stand for; each patched package is extracted, then patched,
+    and a patch file whose sha256 differs from the lockfile's hash fails the build. Then
+    `allowBuilds` (pnpm 11), or `onlyBuiltDependencies` (pnpm 10), less
+    `neverBuiltDependencies` and `ignoredBuiltDependencies`, or `dangerouslyAllowAllBuilds`,
+    decide which packages run their install scripts (`preinstall`, `install`, `postinstall`,
+    or `node-gyp rebuild` when they have a `binding.gyp` and neither of the first two). Those
+    run as build actions, with the package's dependencies beside it and their bins on PATH,
+    and only locally unless `build_local_only` is False. `node-gyp` is on their PATH when the
+    workspace root depends on the npm package named `node_gyp`.
+
     Packages restricted to other platforms by their `os` or `cpu` are left out through a
     `select` on `os_settings` and `cpu_settings`, and those restricted to a C library other
     than `libc` always are. Tarballs come from `registry` unless the lockfile gives a URL.
@@ -167,6 +265,9 @@ def pnpm_workspace(
     _check_lock(lock)
     packages = lock.get("packages") or {}
     snapshots = lock.get("snapshots") or {}
+    settings = _settings(workspace, root_package)
+    patch_files = _patch_files(lock, settings)
+    importers = _importers(lock)
 
     store_packages = {}
     excluded = []
@@ -196,22 +297,40 @@ def pnpm_workspace(
         if deps:
             snapshot_deps[snapshot] = deps
 
+    patches = {}
+    build = []
+    for snapshot, package in snapshot_packages.items():
+        patch_hash = _patch_hash(snapshot)
+        if patch_hash != None:
+            if patch_hash not in patch_files:
+                fail("pnpm-lock.yaml: snapshot `{}` is patched, but `patchedDependencies` has no patch with that hash".format(snapshot))
+            patches[snapshot] = (patch_files[patch_hash], patch_hash)
+        if _builds(settings, package):
+            build.append(snapshot)
+    root = importers.get(".")
+    node_gyp_snapshot = root.npm.get(node_gyp) if root != None else None
+
     _rules["nodejs_npm_store"](
         name = name,
         packages = store_packages,
         snapshot_packages = snapshot_packages,
         snapshots = snapshot_deps,
         exclude = excluded + _platform_excludes(packages, os_settings, "os") + _platform_excludes(packages, cpu_settings, "cpu"),
+        patches = patches,
+        build = build,
+        node_gyp = node_gyp_snapshot,
+        build_local_only = build_local_only,
         visibility = visibility,
     )
 
-    for path, importer in _importers(lock).items():
+    for path, importer in importers.items():
         if importer.npm:
             _rules["nodejs_npm_links"](
                 name = _importer_target(name, path),
                 store = ":" + name,
                 packages = importer.npm,
                 optional = importer.optional,
+                bins = [alias for alias, snapshot in importer.npm.items() if (packages.get(_package_key(snapshot)) or {}).get("hasBin")],
                 visibility = visibility,
             )
 

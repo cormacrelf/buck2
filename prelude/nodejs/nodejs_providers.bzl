@@ -33,6 +33,9 @@ NodejsLinksInfo = provider(
     doc = "Third-party packages from an npm store, linked under `node_modules` by name: next to the package of the `nodejs_library` that lists them in `node_modules`, or at the top of a binary's or test's `node_modules`.",
     fields = {
         "links": provider_field(list[NodejsLinkedPackage]),
+        # `npm_bins_dir` of `links`, and the entries its symlinks lead to.
+        "bins": provider_field(Artifact),
+        "inputs": provider_field(NodejsInputsTSet),
     },
 )
 
@@ -53,6 +56,9 @@ NodejsLibraryPackage = record(
     inputs = field(NodejsInputsTSet | None, default = None),
     # The same for `types_entry`.
     types_inputs = field(NodejsInputsTSet | None, default = None),
+    # The bins of the packages the library depends on, the `node_modules/.bin` beside it in
+    # `entry`: what `pnpm run` puts on PATH for the package's scripts.
+    bin_dir = field(Artifact | None, default = None),
 )
 
 NodejsLibraryTSet = transitive_set()
@@ -250,14 +256,16 @@ def package_inputs(
         entry: Artifact | None,
         packages: list[NodejsLibraryPackage],
         links: list[NodejsLinkedPackage],
-        types: bool = False) -> NodejsInputsTSet:
+        types: bool = False,
+        extra: list[Artifact] = []) -> NodejsInputsTSet:
     """`entry`, if any, and everything that symlinks to the entries of `packages` (`types_entry`
     if `types`, else `entry`) and to the npm store packages of `links` lead to."""
     children = [(p.types_inputs if types else p.inputs) for p in packages]
     children = [c for c in children if c != None] + [link.closure for link in links]
     kwargs = {"children": children} if children else {}
-    if entry != None:
-        kwargs["value"] = [entry]
+    value = ([entry] if entry != None else []) + extra
+    if value:
+        kwargs["value"] = value
     return actions.tset(NodejsInputsTSet, **kwargs)
 
 def closure_inputs(

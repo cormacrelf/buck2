@@ -9,6 +9,7 @@
 load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//decls:common.bzl", "buck")
 load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
+load("@prelude//os_lookup:defs.bzl", "Os", "OsLookup")
 load(
     ":nodejs_providers.bzl",
     "NodejsLibraryInfo",
@@ -26,7 +27,7 @@ load(
     "split_node_modules",
     "strip_type_declarations",
 )
-load(":nodejs_closure.bzl", "package_entry")
+load(":nodejs_closure.bzl", "npm_bins_dir", "package_entry")
 load(":nodejs_toolchain.bzl", "NodejsToolchainInfo")
 load(":nodejs_typescript.bzl", "compile_module_typescript", "compile_typescript")
 
@@ -387,7 +388,18 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
         )
 
     runtime_dir = strip_type_declarations(ctx.actions, package_tree_tool, package_dir, "runtime_dir")
-    entry = package_entry(ctx.actions, "entry", ctx.label, dir_name, runtime_dir, direct, links, types = False)
+    bin_packages = {p.dir_name: p.entry.project("node_modules/" + p.dir_name) for p in direct if p.label != ctx.label}
+    bin_packages.update({link.name: link.dir for link in links})
+    bin_dir = None
+    if bin_packages:
+        bin_dir = npm_bins_dir(
+            ctx.actions,
+            package_tree_tool,
+            "bins",
+            bin_packages,
+            ctx.attrs._target_os_type[OsLookup].os == Os("windows"),
+        ).project("node_modules/.bin")
+    entry = package_entry(ctx.actions, "entry", ctx.label, dir_name, runtime_dir, direct, links, types = False, bin_dir = bin_dir)
     types_entry = package_entry(ctx.actions, "types_entry", ctx.label, dir_name, package_dir, direct, links, types = True)
     own_package = NodejsLibraryPackage(
         label = ctx.label,
@@ -397,8 +409,9 @@ def nodejs_library_impl(ctx: AnalysisContext) -> list[Provider]:
         dir_name = dir_name,
         entry = entry,
         types_entry = types_entry,
-        inputs = package_inputs(ctx.actions, entry, direct, links),
+        inputs = package_inputs(ctx.actions, entry, direct, links, extra = [bin_dir] if bin_dir != None else []),
         types_inputs = package_inputs(ctx.actions, types_entry, direct, links, types = True),
+        bin_dir = bin_dir,
     )
     transitive_outputs = get_transitive_outputs(ctx.actions, value = own_package, deps = dep_infos)
     node_modules = build_node_modules(ctx.actions, "node_modules", transitive_outputs, own_package = own_package)
@@ -643,6 +656,7 @@ nodejs_library = prelude_rule(
             "version": attrs.option(attrs.string(), default = None),
             "_nodejs_toolchain": toolchains_common.nodejs(),
             "_package_tree_tool": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//nodejs/tools:package_tree")),
+            "_target_os_type": buck.target_os_type_arg(),
         }
         | buck.labels_arg()
         | buck.contacts_arg()

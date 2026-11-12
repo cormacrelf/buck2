@@ -30,10 +30,11 @@ def package_entry(
     package_dir: Artifact,
     direct: list[NodejsLibraryPackage],
     links: list[NodejsLinkedPackage],
-    types: bool) -> Artifact:
+    types: bool,
+    bin_dir: Artifact | None = None) -> Artifact:
     """A pnpm-style entry for one first-party package: `node_modules/<dir_name>`, a copy of
     `package_dir`, beside links to the entries of `direct` (`types_entry` if `types`, else
-    `entry`) and to the npm store packages of `links`.
+    `entry`) and to the npm store packages of `links`, and `bin_dir`, their bins, as `node_modules/.bin`.
 
     Node and `tsc` resolve a package from its real path, so code in the copy finds exactly
     these siblings, and through `node_modules` ancestors, whatever the consumer composes above.
@@ -50,6 +51,8 @@ def package_entry(
     for link in links:
         _claim(claimed, link.name, str(link.owner.raw_target()), label)
         contents["node_modules/" + link.name] = entry.symlink(link.dir)
+    if bin_dir != None:
+        contents["node_modules/.bin"] = entry.symlink(bin_dir)
     return make(name, contents = contents)
 
 def compose_node_modules(
@@ -60,8 +63,10 @@ def compose_node_modules(
     trees: list[NodejsTreeInfo],
     root_files: dict[str, Artifact] = {},
     root_file_desc: str = "root file '{path}'",
-    links: list[NodejsLinkedPackage] = []) -> Artifact:
-    """A directory holding one `node_modules` of first-party `packages`, npm store `links` and third-party `trees`.
+    links: list[NodejsLinkedPackage] = [],
+    bin_dir: Artifact | None = None) -> Artifact:
+    """A directory holding one `node_modules` of first-party `packages`, npm store `links` and third-party `trees`,
+    and `bin_dir`, if any, linked as its `.bin`.
 
     `packages` and `owners` are keyed by install directory; each package is a symlink to
     the package directory of its entry (`NodejsLibraryPackage.entry`), so it resolves its own
@@ -79,6 +84,8 @@ def compose_node_modules(
     for link in links:
         _claim(first_party, link.name, str(link.owner.raw_target()), name)
         symlinks["node_modules/" + link.name] = link.dir
+    if bin_dir != None:
+        symlinks["node_modules/.bin"] = bin_dir
     srcs = {}
     for root_name, root_file in root_files.items():
         segments = check_relative_path(root_name, "invalid `root_files` path", allow_colon = True)
@@ -213,3 +220,18 @@ _compose = dynamic_actions(
         "trees": dynattrs.value(list[(Artifact, str, list[str])]),
     },
 )
+
+def npm_bins_dir(actions: AnalysisActions, package_tree_tool: RunInfo, name: str, packages: dict[str, Artifact], windows: bool) -> Artifact:
+    """A directory of `node_modules/<alias>`, a relative symlink to each of `packages`, and
+    `node_modules/.bin`, the bins those packages declare, as npm and pnpm write it, with
+    `node_modules/.bin/.default/<alias>` for the bin each package runs when named alone. Its
+    symlinks lead out of it by relative path, so it works where it is, on PATH or linked in as
+    another tree's `node_modules/.bin`, with the entries of `packages` as inputs."""
+    out = actions.declare_output(name, dir = True, has_content_based_path = False)
+    cmd = cmd_args(package_tree_tool, "npm-bins", "--out", out.as_output())
+    for alias in sorted(packages):
+        cmd.add("--package", cmd_args(alias, packages[alias], delimiter = "="))
+    if windows:
+        cmd.add("--windows")
+    actions.run(cmd, category = "npm_bins", identifier = name)
+    return out

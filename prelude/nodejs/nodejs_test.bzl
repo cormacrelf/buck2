@@ -170,7 +170,7 @@ def _framework_command(ctx: AnalysisContext) -> struct:
     staged = stage_nodejs_entries(
         ctx, mains, mains_attr = "`srcs`", staged_attrs = "`srcs`", srcs = srcs, stage = jest != None or vitest != None or ctx.attrs.tsconfig != None
     )
-    args = cmd_args(ctx.attrs._test_adapter, "--framework", ctx.attrs.framework, hidden = staged.hidden)
+    args = cmd_args(staged.preload, ctx.attrs._test_adapter, "--framework", ctx.attrs.framework, hidden = staged.hidden)
     for arg in ctx.attrs.node_args:
         args.add("--node-arg", arg)
     if jest != None:
@@ -386,6 +386,8 @@ nodejs_test = prelude_rule(
             "supports_test_execution_caching": attrs.bool(default = False),
             "_nodejs_toolchain": toolchains_common.nodejs(),
             "_target_os_type": buck.target_os_type_arg(),
+            "_package_tree_tool": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//nodejs/tools:package_tree")),
+            "_path_preload": attrs.default_only(attrs.source(default = "prelude//nodejs/tools:path_preload.cjs")),
             "_test_adapter": attrs.default_only(attrs.source(default = "prelude//nodejs/tools:nodejs_test_adapter.cjs")),
         }
         | buck.labels_arg()

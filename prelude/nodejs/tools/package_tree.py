@@ -15,7 +15,9 @@ package_tree.py archive --src DIR --format FORMAT --out FILE [--root ROOT] [--ex
 package_tree.py compress --src FILE --out OUT [--sha256 FILE] --zstd ZSTD...
 package_tree.py manifest --tree DIR --out FILE
 package_tree.py strip-types --src DIR --out DIR
-package_tree.py npm-entry --tarball FILE --name NAME --links FILE --out DIR
+package_tree.py npm-entry --tarball FILE --name NAME --links FILE --out DIR [--patch FILE --patch-hash HASH]
+    [--build --node NODE [--node-gyp DIR]]
+package_tree.py npm-bins --out DIR [--package ALIAS=DIR]... [--windows]
 package_tree.py localize --src DIR --out DIR
 package_tree.py validate-package --package DIR --name NAME [--dir-name NAME] [--main PATH] [--bin NAME:PATH]... [--type TYPE] [--version VERSION]
     [--module DIR [--module-src-root PATH]] --out FILE
@@ -44,10 +46,15 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
 from typing import BinaryIO, NamedTuple
+
+from npm_bins import make_bins_executable, package_bins, write_bins
+from npm_lifecycle import run_install_scripts
+from npm_patch import apply_patch
 
 
 def assemble_package(
@@ -1401,12 +1408,27 @@ def _run_compress(args: argparse.Namespace) -> int:
     return 0
 
 
-def npm_entry(tarball: Path, name: str, links: list[list[str]], out: Path) -> None:
+def npm_entry(
+    tarball: Path,
+    name: str,
+    links: list[list[str]],
+    out: Path,
+    patch: Path | None = None,
+    patch_hash: str | None = None,
+    node: str | None = None,
+    node_gyp: Path | None = None,
+) -> None:
     """Extracts an npm package tarball to `out/node_modules/<name>`, and makes each `[alias,
     target]` of `links` a symlink `out/node_modules/<alias>` to `target`.
 
     npm tarballs hold one top-level directory, usually `package/`, which is dropped. Only files
-    and directories are extracted, as npm does; files keep only their execute bits.
+    and directories are extracted, as npm does; files keep only their execute bits, and the
+    package's bins become executable. `patch`, a pnpm patch file whose sha256 must be
+    `patch_hash`, is applied before anything else sees the package.
+
+    With `node`, the package's install scripts then run, as pnpm runs them, with the bins of
+    its dependencies in `node_modules/.bin` inside the package and on PATH, and `node_gyp`,
+    node-gyp's package directory, as `node-gyp`. The dependencies' entries must be inputs.
     """
     package = out.joinpath("node_modules", *name.split("/"))
     package.mkdir(parents=True)
@@ -1429,10 +1451,58 @@ def npm_entry(tarball: Path, name: str, links: list[list[str]], out: Path) -> No
             with open(dest, "wb") as f:
                 shutil.copyfileobj(data, f)
             os.chmod(dest, 0o755 if member.mode & 0o111 else 0o644)
+    if patch is not None:
+        apply_patch(patch, package, patch_hash)
+    make_bins_executable(package)
     for alias, target in links:
         link = out.joinpath("node_modules", *alias.split("/"))
         link.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, link, target_is_directory=True)
+    if node is None:
+        return
+
+    # From `node_modules/<name>/node_modules/.bin` up to `node_modules`, where the links are.
+    rel_root = "/".join([".."] * (2 + len(name.split("/"))))
+    bin_dir = package / "node_modules" / ".bin"
+    write_bins(
+        bin_dir,
+        {alias: out.joinpath("node_modules", *alias.split("/")) for alias, _ in links},
+        rel_root,
+        os.name == "nt",
+    )
+    if os.sep in node or "/" in node:
+        node = os.path.abspath(node)
+    node_gyp_js = None
+    if node_gyp is not None:
+        bins = package_bins(node_gyp)
+        if "node-gyp" not in bins:
+            raise ValueError(f"{node_gyp}: package.json declares no `node-gyp` bin")
+        node_gyp_js = (node_gyp / bins["node-gyp"]).absolute()
+    tmp = Path(os.environ.get("BUCK_SCRATCH_PATH") or tempfile.mkdtemp()).absolute()
+    run_install_scripts(package.absolute(), node, [bin_dir.absolute()], node_gyp_js, tmp)
+
+
+def npm_bins(out: Path, packages: list[tuple[str, Path]], windows: bool) -> None:
+    """Writes `out/node_modules/<alias>`, a relative symlink to each package directory, and
+    `out/node_modules/.bin`, the bins they declare (see `npm_bins.write_bins`)."""
+    node_modules = out / "node_modules"
+    node_modules.mkdir(parents=True)
+    for alias, directory in packages:
+        link = node_modules.joinpath(*alias.split("/"))
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.relpath(directory, link.parent), link, target_is_directory=True)
+    write_bins(node_modules / ".bin", dict(packages), "..", windows)
+    for alias, directory in packages:
+        # A package with several bins and none named after it has no default: running it says so.
+        bins = package_bins(directory)
+        default = node_modules.joinpath(".bin", ".default", *alias.split("/"))
+        if bins and not os.path.lexists(default):
+            default.parent.mkdir(parents=True, exist_ok=True)
+            message = (
+                f"{alias} has no default bin, only {', '.join(sorted(bins))}; "
+                "run one of them with nodejs_npm_bin(bin = ...)"
+            )
+            default.write_text(f"console.error({json.dumps(message)});\nprocess.exitCode = 1;\n")
 
 
 def _entry_root(real: Path) -> tuple[Path, Path]:
@@ -1505,7 +1575,21 @@ def localize(src: Path, out: Path) -> None:
 def _run_npm_entry(args: argparse.Namespace) -> int:
     with open(args.links) as f:
         links = json.load(f)
-    npm_entry(args.tarball, args.name, links, args.out)
+    if args.build != (args.node is not None):
+        raise ValueError("--build and --node go together")
+    npm_entry(args.tarball, args.name, links, args.out, args.patch, args.patch_hash, args.node, args.node_gyp)
+    return 0
+
+
+def _alias_dir(arg: str) -> tuple[str, Path]:
+    alias, sep, directory = arg.partition("=")
+    if not sep or not alias or not directory:
+        raise argparse.ArgumentTypeError(f"expected ALIAS=DIR, got {arg!r}")
+    return alias, Path(directory)
+
+
+def _run_npm_bins(args: argparse.Namespace) -> int:
+    npm_bins(args.out, args.package, args.windows)
     return 0
 
 
@@ -1573,7 +1657,17 @@ def _parser() -> argparse.ArgumentParser:
     entry.add_argument("--name", required=True)
     entry.add_argument("--links", type=_path, required=True)
     entry.add_argument("--out", type=_path, required=True)
-    entry.set_defaults(run=_run_npm_entry, errors=(ValueError, OSError, tarfile.TarError))
+    entry.add_argument("--patch", type=_path)
+    entry.add_argument("--patch-hash")
+    entry.add_argument("--build", action="store_true")
+    entry.add_argument("--node")
+    entry.add_argument("--node-gyp", type=_path)
+    entry.set_defaults(run=_run_npm_entry, errors=(ValueError, OSError, RuntimeError, tarfile.TarError))
+    bins = commands.add_parser("npm-bins")
+    bins.add_argument("--out", type=_path, required=True)
+    bins.add_argument("--package", type=_alias_dir, action="append", default=[])
+    bins.add_argument("--windows", action="store_true")
+    bins.set_defaults(run=_run_npm_bins, errors=(ValueError, OSError))
     localized = commands.add_parser("localize")
     localized.add_argument("--src", type=_path, required=True)
     localized.add_argument("--out", type=_path, required=True)

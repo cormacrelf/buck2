@@ -10,10 +10,10 @@ load("@prelude//:command_alias.bzl", "CommandAliasOutput", "command_alias", "com
 load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//decls:common.bzl", "buck")
 load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
-load("@prelude//os_lookup:defs.bzl", "OsLookup")
+load("@prelude//os_lookup:defs.bzl", "Os", "OsLookup")
 load("@prelude//utils:arglike.bzl", "ArgLike")  # @unused: Used as a type
 load("@prelude//zip_file:zip_file_toolchain.bzl", "ZipFileToolchainInfo")
-load(":nodejs_closure.bzl", "compose_node_modules")
+load(":nodejs_closure.bzl", "compose_node_modules", "npm_bins_dir")
 load(":nodejs_package.bzl", "get_bundled_node", "localize_tree", "package_standalone")
 load(
     ":nodejs_providers.bzl",
@@ -104,6 +104,7 @@ def _directory_main(ctx: AnalysisContext, mains: list[Artifact], srcs: list[Arti
         hidden = [],
         resources = list(ctx.attrs.resources),
         env = dict(ctx.attrs.env),
+        preload = [],
     )
 
 def stage_nodejs_entries(
@@ -197,6 +198,16 @@ def stage_nodejs_entries(
     collect_packages(get_transitive_outputs(ctx.actions, deps = dep_infos))
     direct = direct_packages(dep_infos)
     packages = {p.dir_name: p for p in direct}
+    bin_packages = {n: p.entry.project("node_modules/" + n) for n, p in packages.items()} | {link.name: link.dir for link in links}
+    bin_dir = None
+    if bin_packages:
+        bin_dir = npm_bins_dir(
+            ctx.actions,
+            ctx.attrs._package_tree_tool[RunInfo],
+            "__bins__/" + ctx.label.name,
+            bin_packages,
+            ctx.attrs._target_os_type[OsLookup].os == Os("windows"),
+        ).project("node_modules/.bin")
     if "package.json" not in staged:
         # Tools that find the project root beside `node_modules`, such as `module-alias/register`, read it.
         staged["package.json"] = ctx.actions.write_json("app.json", {"name": nodejs_manifest_name(ctx.label.name), "private": True, "version": "0.0.0"})
@@ -209,11 +220,27 @@ def stage_nodejs_entries(
         root_files = staged,
         root_file_desc = "{}: {}/`resources` entry '{{artifact}}' at '{{path}}'".format(ctx.label, staged_attrs),
         links = links,
+        bin_dir = bin_dir,
     )
     runtime = staged_dir if dep_infos or data_deps or tree_infos or links or bundled_node or stage or isinstance(ctx.attrs.resources, dict) else None
 
     # What the composed `node_modules` links to.
     hidden = closure_inputs(ctx.actions, direct, links)
+    env = dict(ctx.attrs.env)
+    preload = []
+    # As under `pnpm run`: the bins of the library's dependencies, as for a script of its
+    # package.json, and those of the top-level packages.
+    path_dirs = []
+    if lib_info != None:
+        path_dirs += [p.bin_dir for p in lib_info.direct if p.bin_dir != None]
+    if bin_dir != None:
+        path_dirs.append(cmd_args(staged_dir, format = "{}/node_modules/.bin"))
+    if path_dirs:
+        if "NODEJS_PREPEND_PATH" in env:
+            fail("{}: `env` cannot set `NODEJS_PREPEND_PATH`, which puts `node_modules/.bin` on PATH".format(ctx.label))
+        windows = ctx.attrs._target_os_type[OsLookup].os == Os("windows")
+        env["NODEJS_PREPEND_PATH"] = cmd_args(path_dirs, delimiter = ";" if windows else ":")
+        preload = ["--require", ctx.attrs._path_preload]
     if lib_info != None:
         entries = [
             NodejsEntry(
@@ -233,7 +260,8 @@ def stage_nodejs_entries(
         entries = entries,
         hidden = hidden,
         resources = list(ctx.attrs.resources) if runtime == None else [],
-        env = dict(ctx.attrs.env),
+        env = env,
+        preload = preload,
     )
 
 def nodejs_command(ctx: AnalysisContext, args: cmd_args, env: dict[str, ArgLike]) -> CommandAliasOutput:
@@ -251,7 +279,7 @@ def nodejs_command(ctx: AnalysisContext, args: cmd_args, env: dict[str, ArgLike]
 def build_nodejs_command(ctx: AnalysisContext, bundled_node: (str, Artifact) | None = None) -> struct:
     """Runs `main`, or the `library`'s entry, with `node_args` and `args`."""
     staged = stage_nodejs_entries(ctx, [ctx.attrs.main] if ctx.attrs.main != None else [], bundled_node = bundled_node, directory_main = True)
-    args = cmd_args(ctx.attrs.node_args, staged.entries[0].path, ctx.attrs.args, hidden = staged.hidden)
+    args = cmd_args(staged.preload, ctx.attrs.node_args, staged.entries[0].path, ctx.attrs.args, hidden = staged.hidden)
     return struct(dir = staged.dir, merged = staged.runtime, hidden = staged.hidden, output = nodejs_command(ctx, args, staged.env), env = staged.env, resources = staged.resources)
 
 def _dir_sub_targets(command: struct) -> dict[str, list[Provider]]:
@@ -350,7 +378,11 @@ nodejs_binary = prelude_rule(
     list may also hold `nodejs_npm_links` targets, whose packages are
     linked at the top of `node_modules`. `package_style = "standalone"`
     copies every linked entry into the zip, under
-    `node_modules/.localized`, so it runs without buck-out.
+    `node_modules/.localized`, so it runs without buck-out. As under
+    `pnpm run`, the composed `node_modules` has a `.bin` of the bins of
+    its linked packages, and the script runs with that `.bin`, the `.bin`
+    of `library`'s own dependencies and the directory of Node at the
+    front of PATH (through `NODEJS_PREPEND_PATH`, which `env` cannot set).
     Third-party packages are composed one by one as installed (they keep
     their `.d.ts` files; dot entries such as `.bin` are dropped): a
     package that two sources provide fails the build and names both, and
@@ -393,6 +425,7 @@ nodejs_binary = prelude_rule(
             "package_style": attrs.enum(["inplace", "standalone"], default = "inplace"),
             "_nodejs_toolchain": toolchains_common.nodejs(),
             "_package_tree_tool": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//nodejs/tools:package_tree")),
+            "_path_preload": attrs.default_only(attrs.source(default = "prelude//nodejs/tools:path_preload.cjs")),
             "_target_os_type": buck.target_os_type_arg(),
             "_zip_file_toolchain": toolchains_common.zip_file(),
         }
