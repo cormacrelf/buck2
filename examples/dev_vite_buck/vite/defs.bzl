@@ -86,9 +86,7 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
     styles = [a for p, a in srcs.items() if p.endswith(_CSS)]
     # With `vite.persistent_worker = true`, the transforms run in `tools/worker.mjs`, which keeps
     # oxc, lightningcss and Sass loaded. buck2 gives each command a pool of workers of its own,
-    # though, and each build of `buck2 dev` is a command, so a dev session starts the worker
-    # again for every build and is slower with it than without. It pays off once workers outlive
-    # the command.
+    # and a `buck2 dev` session is one command, so the worker starts once per session.
     if read_root_config("vite", "persistent_worker", "false") == "true":
         tool = WorkerRunInfo(worker = ctx.attrs._worker[WorkerInfo], exe = ctx.attrs._transform[RunInfo].args)
     else:

@@ -132,34 +132,50 @@ def main():
         conn.write((json.dumps(message) + "\n").encode())
         conn.flush()
 
+    # The outputs asked for that have no answer yet, and the answers so far. Each output comes
+    # in a message of its own; this server acts once it has all of them.
+    waiting = set()
+    results = {}
+
+    def build(outputs):
+        waiting.update(outputs)
+        request({"type": "build", "outputs": outputs})
+
     try:
-        request({"type": "hello", "version": 1})
+        request({"type": "hello", "version": 2})
         for line in conn:
             message = json.loads(line)
             # Messages of other types may be added; ignore them.
             kind = message.get("type")
             if kind == "ready":
-                request({"type": "build", "outputs": ["exe", "patch"]})
+                build(["exe", "patch"])
             elif kind == "stale":
                 # `exe`'s changes are those since the running binary was built, which is what
                 # a patch is built against.
                 exe = message["outputs"].get("exe", {})
                 if "lib" in exe.get("within", []):
-                    request({"type": "build", "outputs": ["patch"]})
+                    build(["patch"])
                 else:
                     log("a change cannot be patched; building the app again")
-                    request({"type": "build", "outputs": ["exe", "patch"]})
-            elif kind == "built":
-                outputs = message["outputs"]
-                exe = outputs.get("exe")
-                patch = outputs.get("patch")
-                if exe is not None and (exe["changed"] or app.process is None):
-                    app.start(exe["path"])
-                elif patch is not None and patch["changed"] and app.process is not None:
-                    if not app.patch(patch["path"]):
-                        log("building the app again")
-                        request({"type": "build", "outputs": ["exe", "patch"]})
-            elif kind == "failed":
+                    build(["exe", "patch"])
+            elif kind in ("built", "failed", "cancelled"):
+                waiting.discard(message["output"])
+                results[message["output"]] = message
+                if waiting:
+                    continue
+                exe = results.pop("exe", None)
+                patch = results.pop("patch", None)
+                if any(r["type"] == "failed" for r in (exe, patch) if r is not None):
+                    log("build failed; the app keeps running the last build")
+                elif exe is not None and exe["type"] == "built":
+                    if exe["changed"] or app.process is None:
+                        app.start(exe["path"])
+                elif patch is not None and patch["type"] == "built":
+                    if patch["changed"] and app.process is not None:
+                        if not app.patch(patch["path"]):
+                            log("building the app again")
+                            build(["exe", "patch"])
+            elif kind == "error":
                 log("build failed; the app keeps running the last build")
             elif kind == "shutdown":
                 break

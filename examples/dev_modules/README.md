@@ -45,12 +45,19 @@ asks `buck2 dev` for the output `lib/greet/greet.js`. The first time, it defines
 it:
 
 ```json
-{"type": "build", "streaming": true, "outputs": {
+{"type": "define", "outputs": {
   "lib/greet/greet.js": {"handler": "module", "args": ["--path", "lib/greet/greet.js"]}}}
 ```
 
-Later it asks for it by name, with `null`. It waits for `built`, and serves the
-file. Requests that arrive while a build runs go into the next build together.
+Then, and every later time, it asks for it by name:
+
+```json
+{"type": "build", "outputs": ["lib/greet/greet.js"]}
+```
+
+It waits for the module's `built`, and serves the file. Each module is asked
+for as soon as a page needs it, and builds while others do; a module that two
+pages wait for is built once.
 
 `buck2 dev` finds what each module is built from, as for any output: here, its
 source file and the compiler. After a change, `stale` names the modules that the

@@ -36,10 +36,9 @@ const log = (...a) => process.env.BUCK2_VITE_DEBUG && console.error(`[buck ${per
 class Buck {
   constructor() {
     this.waiters = new Map(); // output name -> [{resolve, reject}]
-    this.defined = new Set();
-    this.pending = new Map(); // output name -> definition (null when already defined)
-    this.got = new Map(); // output name -> last `built` entry
-    this.gens = new Map(); // gen -> output names
+    this.defined = new Set(); // the dynamic outputs that this server defined
+    this.definitions = new Map(); // output name -> handler call, to define with the next build
+    this.pending = new Set(); // output names to ask for with the next build
     this.handlers = { stale: () => {} };
     this.ready = new Promise((r) => (this.onReady = r));
     this.sock = net.connect(process.env.BUCK2_DEV_SOCKET);
@@ -54,28 +53,34 @@ class Buck {
       }
     });
     this.sock.on("close", () => process.exit(0));
-    this.send({ type: "hello", version: 1 });
+    this.send({ type: "hello", version: 2 });
   }
   send(m) {
     this.sock.write(JSON.stringify(m) + "\n");
   }
-  // The output `name`, built: `{path, digest, changed}`. `def` defines it the first time, as a
-  // call of a handler.
+  // The output `name`, built: `{path, digest, changed, ...}`. `def` defines it the first time,
+  // as a call of a handler. What is asked for in one tick goes in one `build`.
   get(name, def) {
     return new Promise((resolve, reject) => {
       if (!this.waiters.has(name)) this.waiters.set(name, []);
       this.waiters.get(name).push({ resolve, reject });
-      if (!this.pending.has(name)) this.pending.set(name, this.defined.has(name) ? null : def ?? null);
+      if (def && !this.defined.has(name)) {
+        this.defined.add(name);
+        this.definitions.set(name, def);
+      }
+      this.pending.add(name);
       if (this.pending.size === 1) setImmediate(() => this.flush());
     });
   }
   flush() {
+    if (this.definitions.size) {
+      this.send({ type: "define", outputs: Object.fromEntries(this.definitions) });
+      this.definitions.clear();
+    }
     if (!this.pending.size) return;
-    const outputs = Object.fromEntries(this.pending);
-    for (const name of this.pending.keys()) this.defined.add(name);
+    log("build", this.pending.size, "outputs");
+    this.send({ type: "build", outputs: [...this.pending] });
     this.pending.clear();
-    log("build", Object.keys(outputs).length, "outputs");
-    this.send({ type: "build", outputs, streaming: true });
   }
   settle(name, f) {
     const ws = this.waiters.get(name);
@@ -87,36 +92,22 @@ class Buck {
       case "ready":
         this.onReady(m);
         break;
-      case "building":
-        this.gens.set(m.gen, m.outputs);
-        break;
       case "built":
-        for (const [name, out] of Object.entries(m.outputs ?? {})) {
-          log("built", name, out.changed ? "changed" : "same");
-          this.got.set(name, out);
-          this.settle(name, (w) => w.resolve(out));
-        }
-        for (const [name, error] of Object.entries(m.failed ?? {})) {
-          // A dynamic output whose handler failed is not defined any more.
-          this.defined.delete(name);
-          this.settle(name, (w) => w.reject(new Error(error)));
-        }
-        if (m.last_of_generation) this.gens.delete(m.gen);
+        log("built", m.output, m.changed ? "changed" : "same");
+        this.settle(m.output, (w) => w.resolve(m));
         break;
       case "failed":
-        for (const name of this.gens.get(m.gen) ?? [...this.waiters.keys()]) {
-          this.settle(name, (w) => w.reject(new Error(m.error)));
+        // Defined again with the next request for it, in case its definition was what failed.
+        this.defined.delete(m.output);
+        this.settle(m.output, (w) => w.reject(new Error(m.error)));
+        break;
+      case "cancelled":
+        // A file changed during the build, and `stale` follows. Ask again if it is awaited.
+        if (this.waiters.has(m.output)) {
+          this.pending.add(m.output);
+          this.flush();
         }
-        this.gens.delete(m.gen);
         break;
-      case "cancelled": {
-        // A file changed during the build. Ask again for what is still awaited; `stale` follows.
-        const names = (this.gens.get(m.gen) ?? []).filter((n) => this.waiters.has(n));
-        this.gens.delete(m.gen);
-        for (const n of names) this.pending.set(n, null);
-        this.flush();
-        break;
-      }
       case "stale":
         this.handlers.stale(m.outputs);
         break;

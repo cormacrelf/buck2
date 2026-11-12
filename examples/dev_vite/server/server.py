@@ -131,7 +131,7 @@ def main():
         conn.flush()
 
     try:
-        request({"type": "hello", "version": 1})
+        request({"type": "hello", "version": 2})
         for line in conn:
             message = json.loads(line)
             # Messages of other types may be added; ignore them.
@@ -141,22 +141,22 @@ def main():
             elif kind == "stale":
                 # A file that the app or the packages are built from changed.
                 request({"type": "build", "outputs": list(message["outputs"])})
-            elif kind == "built":
-                outputs = message["outputs"]
-                if "app" in outputs:
-                    os.makedirs(STAGE, exist_ok=True)
-                    changes = sync(outputs["app"]["sidecars"], STAGE)
-                    have_app = True
-                    if changes:
-                        log("updated " + " ".join(changes))
-                if "packages" in outputs and outputs["packages"]["path"] != packages:
-                    packages = outputs["packages"]["path"]
+            elif kind == "built" and message["output"] == "app":
+                os.makedirs(STAGE, exist_ok=True)
+                changes = sync(message["sidecars"], STAGE)
+                have_app = True
+                if changes:
+                    log("updated " + " ".join(changes))
+                # The packages may have come first.
+                if packages is not None and vite.process is None:
                     vite.start(packages)
-                elif "packages" in outputs and outputs["packages"]["changed"]:
+            elif kind == "built" and message["output"] == "packages":
+                new = message["path"] != packages or message["changed"]
+                packages = message["path"]
+                # Vite starts once the app's files are in place too.
+                if have_app and (new or vite.process is None):
                     vite.start(packages)
-                if have_app and packages is not None and vite.process is None:
-                    vite.start(packages)
-            elif kind == "failed":
+            elif kind in ("failed", "error"):
                 log("build failed; Vite keeps serving the last build")
             elif kind == "shutdown":
                 break

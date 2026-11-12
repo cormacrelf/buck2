@@ -74,7 +74,7 @@ def follow_buck2_dev(site, server):
         conn.write((json.dumps(message) + "\n").encode())
         conn.flush()
 
-    request({"type": "hello", "version": 1})
+    request({"type": "hello", "version": 2})
     for line in conn:
         message = json.loads(line)
         # Messages of other types may be added; ignore them.
@@ -83,15 +83,13 @@ def follow_buck2_dev(site, server):
             request({"type": "build", "outputs": ["www"]})
         elif kind == "stale":
             # A file that the site is built from changed.
-            request({"type": "build", "outputs": list(message["outputs"])})
-        elif kind == "building":
             sys.stderr.write("Building the site...\n")
-        elif kind == "built":
-            www = message["outputs"].get("www")
-            if www is not None:
-                site.set(www["path"])
-                sys.stderr.write("Serving the new site (build %d)\n" % message["gen"])
-        elif kind == "failed":
+            request({"type": "build", "outputs": list(message["outputs"])})
+        elif kind == "built" and message["output"] == "www":
+            site.set(message["path"])
+            if message["changed"]:
+                sys.stderr.write("Serving the new site\n")
+        elif kind in ("failed", "error"):
             sys.stderr.write("Build failed; still serving the last site\n")
         elif kind == "shutdown":
             break

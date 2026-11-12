@@ -33,14 +33,10 @@ class Outputs:
         self._built = {}
         # Name to the error of the last build, for outputs that failed.
         self._failed = {}
-        # The outputs that pages wait for, and that no build has started for yet.
-        self._wanted = set()
-        # The outputs of the build that runs.
-        self._building = None
+        # The outputs that are building.
+        self._building = set()
         # The dynamic outputs that `buck2 dev` knows.
         self._defined = set()
-        # The dynamic outputs that the next build defines.
-        self._new = set()
         # The open event streams, one queue of events each.
         self._streams = []
 
@@ -50,57 +46,38 @@ class Outputs:
             while name not in self._built:
                 if name in self._failed:
                     raise BuildError(self._failed[name])
-                if name not in self._wanted and not self._is_building(name):
-                    self._wanted.add(name)
+                if name not in self._building:
+                    self._building.add(name)
                     if dynamic and name not in self._defined:
                         self._defined.add(name)
-                        self._new.add(name)
-                    self._start()
+                        # The module's source file is its name.
+                        self._request(
+                            {
+                                "type": "define",
+                                "outputs": {
+                                    name: {"handler": "module", "args": ["--path", name]}
+                                },
+                            }
+                        )
+                    # Each module is asked for as soon as a page needs it, and comes as soon as
+                    # it is built, while others build.
+                    self._request({"type": "build", "outputs": [name]})
                 self._lock.wait()
             return self._built[name]
-
-    def _is_building(self, name):
-        return self._building is not None and name in self._building
-
-    def _start(self):
-        """Send a build of the wanted outputs, unless one runs: they go into the next."""
-        if self._building is not None or not self._wanted:
-            return
-        outputs = {}
-        for name in sorted(self._wanted):
-            if name in self._new:
-                # The module's source file is its name.
-                outputs[name] = {"handler": "module", "args": ["--path", name]}
-            else:
-                outputs[name] = None
-        self._new = set()
-        self._building = set(self._wanted)
-        self._wanted = set()
-        # Each module comes as soon as it is built.
-        self._request({"type": "build", "outputs": outputs, "streaming": True})
 
     def on_message(self, message):
         kind = message.get("type")
         with self._lock:
             if kind == "built":
-                for name, output in message["outputs"].items():
-                    self._built[name] = output["path"]
-                for name, error in message.get("failed", {}).items():
-                    self._failed[name] = error
-                    self._forget(name)
-                if message["last_of_generation"]:
-                    self._done()
+                self._building.discard(message["output"])
+                self._built[message["output"]] = message["path"]
             elif kind == "failed":
-                for name in self._building or ():
-                    self._failed[name] = message["error"]
-                    self._forget(name)
-                self._done()
+                self._building.discard(message["output"])
+                self._failed[message["output"]] = message["error"]
+                self._forget(message["output"])
             elif kind == "cancelled":
-                # A file changed during the build: build what is still wanted again.
-                for name in self._building or ():
-                    if name not in self._built:
-                        self._wanted.add(name)
-                self._done()
+                # A file changed during the build. A page that still waits asks again.
+                self._building.discard(message["output"])
             elif kind == "stale":
                 for name in message["outputs"]:
                     self._built.pop(name, None)
@@ -118,10 +95,6 @@ class Outputs:
         if name in self._defined:
             self._defined.discard(name)
             self._request({"type": "forget", "outputs": [name]})
-
-    def _done(self):
-        self._building = None
-        self._start()
 
     def events(self):
         """A new event stream: a list that `stale` adds `reload` to."""
@@ -219,7 +192,7 @@ def main():
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    request({"type": "hello", "version": 1})
+    request({"type": "hello", "version": 2})
     for line in conn:
         message = json.loads(line)
         if message.get("type") == "ready":
