@@ -311,3 +311,12 @@ dev_app(
     },
     server = "server.py",
 )
+
+# `site` is built by a persistent worker, `worker.py`.
+dev_app(
+    name = "worker",
+    mode = "outputs",
+    srcs = ["main.txt"],
+    server = "server.py",
+    worker = "worker.py",
+)

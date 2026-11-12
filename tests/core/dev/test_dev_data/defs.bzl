@@ -57,8 +57,20 @@ concat = rule(
     },
 )
 
+def _worker_output(ctx, name):
+    """Write the message of the persistent worker `worker` and then `srcs`, in the worker."""
+    out = ctx.actions.declare_output(name, has_content_based_path = False)
+    worker = WorkerInfo(exe = cmd_args("python3", ctx.attrs.worker), concurrency = None)
+    ctx.actions.run(
+        cmd_args(out.as_output(), ctx.attrs.srcs),
+        category = "worker",
+        exe = WorkerRunInfo(worker = worker, exe = cmd_args("python3", ctx.attrs.worker)),
+        local_only = True,
+    )
+    return out
+
 def _dev_app(ctx):
-    site = _concat_output(ctx, "site.txt")
+    site = _worker_output(ctx, "site.txt") if ctx.attrs.worker else _concat_output(ctx, "site.txt")
     server_script = ctx.attrs.server
     if ctx.attrs.server_check:
         # Build the server by copying it, which fails while `server_check` says `broken`.
@@ -202,5 +214,7 @@ dev_app = rule(
         "site_name": attrs.string(default = "site"),
         "srcs": attrs.list(attrs.source(), default = []),
         "watch_delay": attrs.option(attrs.source(), default = None),
+        # A persistent worker that builds `site` from `srcs`, in place of `concat`.
+        "worker": attrs.option(attrs.source(), default = None),
     },
 )

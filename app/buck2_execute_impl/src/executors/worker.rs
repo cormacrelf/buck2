@@ -16,8 +16,10 @@ use std::time::Duration;
 
 use buck2_common::client_utils::get_channel_uds;
 use buck2_common::client_utils::retrying;
+use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessObserver;
+use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_events::dispatch::EventDispatcher;
@@ -38,6 +40,7 @@ use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileName;
 use buck2_hash::BuckDashMap;
+use buck2_hash::BuckFixedSortedMap;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutMap;
 use buck2_util::time_span::TimeSpan;
@@ -236,9 +239,9 @@ async fn spawn_worker(
 ) -> Result<WorkerHandle, WorkerInitError> {
     // Use fixed length path at /tmp to avoid 108 character limit for unix domain sockets.
     //
-    // Each command has its own worker pool, so the same worker can be spawned again under the
-    // same trace id: `buck2 dev` sends many commands with its session's trace id, and the
-    // directory of the first spawn is still there. The spawn number keeps them apart.
+    // The same worker can be spawned again under the same trace id: each command has its own
+    // worker pool, and a pool starts a worker again when its definition changes. The directory
+    // of the first spawn is still there, so the spawn number keeps them apart.
     static SPAWNS: AtomicU64 = AtomicU64::new(0);
     let dir_name = format!(
         "{}-{}-{}",
@@ -376,8 +379,43 @@ async fn spawn_worker(
 
 type WorkerFuture = Shared<BoxFuture<'static, Result<Arc<WorkerHandle>, Arc<WorkerInitError>>>>;
 
+/// What a worker process was started from: its command line, its environment, and the digest of
+/// its inputs. A `WorkerId` comes from analysis, which does not run again when the worker's own
+/// code changes, so a worker is only reused while this still matches the spec.
+struct WorkerDefinition {
+    exe: Vec<String>,
+    env: BuckFixedSortedMap<String, String>,
+    inputs: TrackedFileDigest,
+}
+
+impl WorkerDefinition {
+    fn new(spec: &WorkerSpec) -> Self {
+        Self {
+            exe: spec.exe.clone(),
+            env: spec.env.clone(),
+            inputs: Self::inputs_digest(spec).dupe(),
+        }
+    }
+
+    fn inputs_digest(spec: &WorkerSpec) -> &TrackedFileDigest {
+        spec.input_paths.input_directory().fingerprint()
+    }
+
+    /// Compares by reference, as this runs for every action that uses a worker.
+    fn matches(&self, spec: &WorkerSpec) -> bool {
+        self.inputs == *Self::inputs_digest(spec) && self.exe == spec.exe && self.env == spec.env
+    }
+}
+
+struct PooledWorker {
+    definition: WorkerDefinition,
+    worker: WorkerFuture,
+}
+
 pub struct WorkerPool {
-    workers: Arc<parking_lot::Mutex<BuckMutMap<WorkerId, WorkerFuture>>>,
+    /// Replacing an entry drops the pool's reference to the old worker, which is shut down once
+    /// the commands still running in it finish.
+    workers: Arc<parking_lot::Mutex<BuckMutMap<WorkerId, PooledWorker>>>,
     brokers: Arc<parking_lot::Mutex<BuckMutMap<WorkerId, Arc<HostSharingBroker>>>>,
     graceful_shutdown_timeout_s: Option<u32>,
 }
@@ -416,38 +454,49 @@ impl WorkerPool {
         dispatcher: EventDispatcher,
     ) -> (bool, WorkerFuture) {
         let mut workers = self.workers.lock();
-        if let Some(worker_fut) = workers.get(&worker_spec.id) {
-            (false, worker_fut.clone())
-        } else {
-            let worker_id = worker_spec.id;
-            let args = worker_spec.exe.to_vec();
-            let streaming = worker_spec.streaming;
-            let root = root.clone();
-            let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-            let graceful_shutdown_timeout_s = self.graceful_shutdown_timeout_s;
-            let fut = async move {
-                match spawn_worker(
-                    worker_id,
-                    args,
-                    env,
-                    streaming,
-                    &root,
-                    forkserver,
-                    dispatcher,
-                    graceful_shutdown_timeout_s,
-                )
-                .await
-                {
-                    Ok(worker) => Ok(Arc::new(worker)),
-                    Err(e) => Err(Arc::new(e)),
-                }
+        if let Some(pooled) = workers.get(&worker_spec.id) {
+            if pooled.definition.matches(worker_spec) {
+                return (false, pooled.worker.clone());
             }
-            .boxed()
-            .shared();
-
-            workers.insert(worker_id, fut.clone());
-            (true, fut)
+            tracing::info!(
+                "Restarting worker {} because its command line, environment or inputs changed",
+                worker_spec.id
+            );
         }
+        let worker_id = worker_spec.id;
+        let args = worker_spec.exe.to_vec();
+        let streaming = worker_spec.streaming;
+        let root = root.clone();
+        let env: Vec<(OsString, OsString)> = env.into_iter().collect();
+        let graceful_shutdown_timeout_s = self.graceful_shutdown_timeout_s;
+        let fut = async move {
+            match spawn_worker(
+                worker_id,
+                args,
+                env,
+                streaming,
+                &root,
+                forkserver,
+                dispatcher,
+                graceful_shutdown_timeout_s,
+            )
+            .await
+            {
+                Ok(worker) => Ok(Arc::new(worker)),
+                Err(e) => Err(Arc::new(e)),
+            }
+        }
+        .boxed()
+        .shared();
+
+        workers.insert(
+            worker_id,
+            PooledWorker {
+                definition: WorkerDefinition::new(worker_spec),
+                worker: fut.clone(),
+            },
+        );
+        (true, fut)
     }
 }
 

@@ -6,7 +6,15 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# One local execution platform, which the actions of a bxl function need.
+load(":defs.bzl", "local_platform")
+
+# One local execution platform, which the actions of a bxl function need. It has persistent
+# workers, for `dev_app` with `worker` set.
+local_platform(
+    name = "local",
+)
+
 execution_platforms(
     name = "platforms",
+    platforms = [":local"],
 )

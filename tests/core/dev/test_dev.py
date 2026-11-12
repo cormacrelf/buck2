@@ -16,6 +16,7 @@ import asyncio
 import os
 import signal
 import time
+from typing import List
 
 from buck2.tests.core.common.dev.dev_util import (
     alive,
@@ -23,6 +24,8 @@ from buck2.tests.core.common.dev.dev_util import (
     contents,
     dev_test,
     files,
+    read,
+    replace,
     site,
     start_dev,
     stopped,
@@ -52,6 +55,35 @@ class DevTest(BuckTestCase):
             assert site(built) == "lib v1\napp v2\n"
             assert built["changed"]
             assert built["token"] > first["token"]
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_persistent_worker_runs_its_new_code(self, buck: Buck) -> None:
+        # The session keeps its persistent workers, but a worker whose code changed is started
+        # again, and the old one is shut down. Analysis does not run again for a change to the
+        # worker's code, so the worker keeps its id.
+        def pids() -> List[int]:
+            return [int(p) for p in read(buck, "buck-out/worker_pids.txt").split()]
+
+        dev = await start_dev(buck, "//app:worker")
+        try:
+            await dev.wait_for("ready")
+            first = await dev.wait_for("built")
+            assert site(first) == "worker v1\napp v1\n", site(first)
+
+            # A change to a source file reuses the worker.
+            write(buck, "app/main.txt", "app v2\n")
+            built = await dev.wait_for("built")
+            assert site(built) == "worker v1\napp v2\n", site(built)
+            assert len(pids()) == 1, pids()
+
+            replace(buck, "app/worker.py", 'MESSAGE = "worker v1"', 'MESSAGE = "worker v2"')
+            built = await dev.wait_for("built")
+            assert site(built) == "worker v2\napp v2\n", site(built)
+            old, new = pids()
+            await wait_until(lambda: not alive(old), "the old worker exits")
+            assert alive(new)
         finally:
             await dev.stop()
 
