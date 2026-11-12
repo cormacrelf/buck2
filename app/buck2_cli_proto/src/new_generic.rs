@@ -362,7 +362,7 @@ pub struct DevBuilt {
     pub dynamic: BTreeMap<String, DevWatchState>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DevBuiltOutput {
     /// Absolute path of the output, for an output that is an artifact.
     #[serde(default)]
@@ -380,7 +380,7 @@ pub struct DevBuiltOutput {
     pub sidecars: BTreeMap<String, DevBuiltSidecar>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DevBuiltSidecar {
     /// Absolute path of the sidecar.
     pub path: String,

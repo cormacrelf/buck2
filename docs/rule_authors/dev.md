@@ -704,7 +704,9 @@ reaches only `buck2 dev`, which stops the server and exits.
 When `buck2 dev` uses the superconsole, it keeps it for the whole session. Each
 build shows its progress there, and between builds one line says how many
 targets `buck2 dev` watches, whether the server runs, and how the last build
-went. The
+went. When several builds run at the same time (see
+[Builds at the same time](#builds-at-the-same-time)), the superconsole shows the
+first of them, and `buck2 dev` prints the errors of the others itself. The
 server's stdout and stderr are one pseudo-terminal that `buck2 dev` reads, so
 the server still writes to a terminal and keeps its colours and line buffering.
 Its lines appear above the superconsole. Other terminal control, such as moving
@@ -741,7 +743,7 @@ console, and prints only errors and that the server exited or restarts.
 | `building`      | `gen`, `outputs`: names, `files`: the changes of these outputs since the server got them | The server asked for a build, and it starts.                                     |
 | `built`         | `gen`, `outputs`: name to `{path, digest, changed}`, with `sidecars`: name to `{path, digest, changed}` for an output that has [sidecars](#sidecars), `failed`: name to error if some outputs failed, and `last_of_generation` | A build of at least one output succeeded, or, for a streaming build, an output finished. `path` is absolute. An output that is a [command line](#a-command-line-as-an-output) has `argv` in place of `path`. `changed` is false when the output is the same as at the last build. The outputs in `failed` did not build. `last_of_generation` is true on the last `built` of the build. |
 | `failed`        | `gen`, `error`                                            | A build of every output, unless it streams, or the analysis of the target, failed. For an action that failed, `error` has what the terminal shows for it: the command, its exit code, and the end of its output. |
-| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped. Its outputs that the server did not get are in the next `stale`. |
+| `cancelled`     | `gen`                                                     | A source file changed during the build, so it was stopped, or a build that it waited for an output of was stopped (see [Builds at the same time](#builds-at-the-same-time)). Its outputs that the server did not get are in the next `stale`. |
 | `stale`         | `outputs`: name to `{within, files}`, for each output that the server asked for and that changes since it got it may affect. `within`: the scopes that hold all of those changes. `files`: the changed files, absolute | Files changed that may affect an output that the server asked for. After missed changes the project root is in `files`. See [Stale outputs](#stale-outputs) and [Scopes](#scopes). |
 | `graph_changed` |                                                           | A build file, a `.bzl` file or a target changed, or an analysis that failed works again, and `buck2 dev` analysed the target again. |
 | `shutdown`      |                                                           | `buck2 dev` is stopping the server. See [Stopping the server](#stopping-the-server).                         |
@@ -749,7 +751,8 @@ console, and prints only errors and that the server exited or restarts.
 `gen` is a number that increases with each build. `building` and `built` for
 the same build have the same `gen`. A `building` is followed by a `built` whose
 `last_of_generation` is true, or by `failed` or `cancelled`, unless `buck2 dev`
-exits first.
+exits first. Several builds can run at the same time, and then their messages
+can come in any order between their `building` and their end.
 
 By default a build sends one `built`, once every output is done. A server that
 sends `build` with `"streaming": true` gets a `built` for each output as soon
@@ -767,15 +770,15 @@ Messages
 are sent only to a server that has sent `hello`. If a second connection sends
 `hello` while outputs are stale, its `ready` is followed by `stale`.
 
-While the daemon builds, it watches the files that the build depends on: the
+While the daemon builds, it watches the files that each build depends on: the
 files that the outputs it builds may be built from, and the build files and
 `.bzl` files of the graph. If one of them gets different contents, the daemon
 stops the build, and `buck2 dev` sends `cancelled`, asks about the changes once
-the files stop changing, and sends `stale` with the stopped build's outputs.
-Saving a file without changing it, and a change to a file that the build does
-not use, do not stop a build. Other
-changes during a build, and changes while the daemon analyses the target or says
-what changed, are asked about once that is done. If analysing fails,
+the files stop changing and no build runs, and sends `stale` with the stopped
+build's outputs. Saving a file without changing it, and a change to a file that
+the build does not use, do not stop a build. Other changes during a build are
+asked about once no build runs, and changes while the daemon analyses the target
+or says what changed, once that is done. If analysing fails,
 `buck2 dev` sends `failed`, and analyses again after the next change, and
 before the next build that the server asks for, which then gets `building` and
 `failed` if the analysis still fails. The same errors again, after a change that did not touch what failed,
@@ -793,8 +796,12 @@ are not sent again. Once the analysis works again, the server gets
 | `restart` |                           | Build the server again and restart it. The new server has asked for nothing. If the build fails, the old server keeps running until the next analysis restarts it. |
 
 `buck2 dev` reads the connection all the time, also while it builds, so a
-server never waits for it to read. Requests that arrive during a build are
-handled after it.
+server never waits for it to read. A `build` that arrives during a build
+usually starts at once (see
+[Builds at the same time](#builds-at-the-same-time)). `ack` and `forget` are
+handled at once too. `restart` waits until no build runs. Requests are handled
+in the order that they arrive, so a request that comes after one that waits
+waits too.
 
 A typical server sends `hello`, then `{"type": "build", "outputs": [...]}` when
 it gets `ready`, and again for the outputs that it wants when it gets `stale`.
@@ -810,10 +817,54 @@ for message in messages:
         serve(message["outputs"]["www"]["path"])
 ```
 
+### Builds at the same time
+
+A `build` that arrives while other builds run starts at once, as long as the
+file watcher has reported no change since they started: they all see the same
+files, and the daemon runs them side by side. So a server can ask for outputs
+as it learns that it needs them, such as the modules of a page that the browser
+finds one level of imports at a time, and the outputs of the second request do
+not wait for the slowest output of the first.
+
+Each build is a build of its own, as described above. It has its own `gen`, its
+own `building`, and its own end: a `built` with `last_of_generation`, `failed`,
+or `cancelled`. `stale_until_ack` and `streaming` apply to the outputs of the
+`build` that asked for them, and a `built` clears an output's changes as of
+when the build that built it started.
+
+An output that a build that runs is still building is not built twice. The new
+build joins that build for it: the server gets the output in a `built` of the
+new build as soon as the other build has it, which for a build that does not
+stream is when it ends. The server gets it twice, once for each build, and the
+second time `changed` is false. If the other build fails as a whole, such as
+when the analysis fails, the output fails in the new build too, with the same
+error. If the other build is cancelled before the output is done, a file that
+the output is built from changed, so the new build is cancelled as well. An
+output that the server has forgotten since the other build started, or defined
+with another call, is not joined but built again.
+
+Once the file watcher has reported a change, a `build` waits until the builds
+that run are done, and is then handled as it would be with no other build: a
+build that the change stops ends in `cancelled`, and once no build runs,
+`buck2 dev` asks the daemon about the changes and sends `stale`. A `build`
+also waits while `buck2 dev` has to analyse the target again first, after a
+change to the graph or an analysis that failed. Changes are asked about only
+when no build runs, so the server is restarted for a change to its command
+only then too.
+
+`forget` does not stop a build that is building the output: the server still
+gets it in that build's `built`, but the output is no longer tracked, and is not
+in `stale` again until the server asks for it.
+
+The daemon can still stop a build when a later one starts, if a file changed
+that the file watcher did not report to `buck2 dev` because nothing of the
+target is built from it. The stopped build starts again by itself; the server
+sees only that it takes longer.
+
 ## Other buck2 commands
 
 Each build and each analysis that `buck2 dev` does is a separate, short daemon
-command. Between them `buck2 dev` holds no lock in the daemon, only the
+command, and builds that run at the same time are separate commands too. Between them `buck2 dev` holds no lock in the daemon, only the
 server's [local resources](#local-resources), so other commands, such as
 `buck2 build` in another terminal, run as usual.
 

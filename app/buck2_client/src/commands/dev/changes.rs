@@ -65,6 +65,8 @@ pub(super) struct FileChanges {
     resubscribing: bool,
     delay: Duration,
     buffered: VecDeque<FileChange>,
+    /// How many changes `next` has returned.
+    heard: u64,
 }
 
 /// What a subscription needs to run.
@@ -126,6 +128,7 @@ impl FileChanges {
             resubscribing: false,
             delay: RESUBSCRIBE_DELAY,
             buffered: VecDeque::new(),
+            heard: 0,
         })
     }
 
@@ -133,6 +136,7 @@ impl FileChanges {
     pub(super) async fn next(&mut self) -> FileChange {
         loop {
             if let Some(change) = self.buffered.pop_front() {
+                self.heard += 1;
                 return change;
             }
             tokio::select! {
@@ -155,6 +159,12 @@ impl FileChanges {
                 }
             }
         }
+    }
+
+    /// How many changes `next` has returned. While this stays the same, no file that matters to
+    /// the session has changed, as far as the file watcher has said.
+    pub(super) fn heard(&self) -> u64 {
+        self.heard
     }
 
     fn receive(&mut self, changes: buck2_subscription_proto::FileChanges) {

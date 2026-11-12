@@ -125,16 +125,18 @@ class DevTimingTest(BuckTestCase):
 
     @dev_test()
     async def test_build_request_during_a_build(self, buck: Buck) -> None:
-        """The server asks for a build during one: it builds after it, unchanged."""
+        """The server asks for a build of the same output during one: the second build starts
+        at once, and gets the output of the first."""
         dev = await start_dev(buck, "//app:slow")
         try:
             await dev.start()
             write(buck, "app/delay.txt", "3\n")
             _, first = await dev.expect("stale", "building")
             dev.request({"type": "build", "outputs": ["site"]})
-            built, second, built2 = await dev.expect("built", "building", "built")
-            assert built["gen"] == first["gen"]
+            second, built, built2 = await dev.expect("building", "built", "built")
             assert second["gen"] == first["gen"] + 1
+            assert built["gen"] == first["gen"]
+            assert built2["gen"] == second["gen"]
             assert changed(built2) == {"site": False}
             await dev.quiet()
         finally:

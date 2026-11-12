@@ -16,6 +16,7 @@ buck2_core_tests(
     },
     target_extra_attrs = {
         "test_dev_bxl": _DEV_FIXTURE,
+        "test_dev_concurrent": _DEV_FIXTURE,
         "test_dev_failures": _DEV_FIXTURE,
         "test_dev_files": _DEV_FIXTURE,
         "test_dev_graph": _DEV_FIXTURE,

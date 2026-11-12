@@ -278,12 +278,14 @@ class DevTest(BuckTestCase):
                 if e["type"] in ("built", "failed")
             ), dev._events()
 
-            # The build finishes, and then the request is handled.
-            built = await dev.wait_for("built")
-            assert built["gen"] == building["gen"]
+            # The request is handled during the build, and its build joins the first for
+            # `site`.
             second = await dev.wait_for("building")
             assert second["gen"] > building["gen"]
-            await dev.wait_for("built")
+            built = await dev.wait_for("built")
+            assert built["gen"] == building["gen"]
+            built = await dev.wait_for("built")
+            assert built["gen"] == second["gen"]
         finally:
             await dev.stop()
 
