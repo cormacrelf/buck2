@@ -20,6 +20,7 @@ import net from "node:net";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { createServer } from "vite";
+import { staticImports } from "@vitebuck/tools/imports.mjs";
 import { loadPlugins } from "@vitebuck/tools/plugins.mjs";
 
 const { values: args, positionals } = parseArgs({
@@ -47,6 +48,8 @@ class Buck {
     this.defined = new Set(); // the dynamic outputs that this server defined
     this.definitions = new Map(); // output name -> handler call, to define with the next build
     this.pending = new Set(); // output names to ask for with the next build
+    this.building = new Set(); // output names asked for and not yet answered
+    this.results = new Map(); // output name -> its last `built`, until it is stale
     this.handlers = { stale: () => {} };
     this.ready = new Promise((r) => (this.onReady = r));
     this.sock = net.connect(process.env.BUCK2_DEV_SOCKET);
@@ -67,8 +70,11 @@ class Buck {
     this.sock.write(JSON.stringify(m) + "\n");
   }
   // The output `name`, built: `{path, digest, changed, ...}`. `def` defines it the first time,
-  // as a call of a handler. What is asked for in one tick goes in one `build`.
+  // as a call of a handler. What is asked for in one tick goes in one `build`. An output that
+  // is built and not stale since is not asked for again, nor one that is building.
   get(name, def) {
+    const done = this.results.get(name);
+    if (done) return Promise.resolve(done);
     return new Promise((resolve, reject) => {
       if (!this.waiters.has(name)) this.waiters.set(name, []);
       this.waiters.get(name).push({ resolve, reject });
@@ -76,6 +82,8 @@ class Buck {
         this.defined.add(name);
         this.definitions.set(name, def);
       }
+      if (this.building.has(name)) return;
+      this.building.add(name);
       this.pending.add(name);
       if (this.pending.size === 1) setImmediate(() => this.flush());
     });
@@ -102,21 +110,27 @@ class Buck {
         break;
       case "built":
         log("built", m.output, m.changed ? "changed" : "same");
+        this.building.delete(m.output);
+        this.results.set(m.output, m);
         this.settle(m.output, (w) => w.resolve(m));
         break;
       case "failed":
         // Defined again with the next request for it, in case its definition was what failed.
+        this.building.delete(m.output);
         this.defined.delete(m.output);
         this.settle(m.output, (w) => w.reject(new Error(m.error)));
         break;
       case "cancelled":
         // A file changed during the build, and `stale` follows. Ask again if it is awaited.
+        this.building.delete(m.output);
         if (this.waiters.has(m.output)) {
+          this.building.add(m.output);
           this.pending.add(m.output);
           this.flush();
         }
         break;
       case "stale":
+        for (const name of Object.keys(m.outputs)) this.results.delete(name);
         this.handlers.stale(m.outputs);
         break;
     }
@@ -152,6 +166,46 @@ async function readOutput([name, def]) {
   return out.path;
 }
 
+// --- Building imports before the browser asks for them ------------------------------------
+//
+// The browser finds a page's modules one level of imports at a time, and each level would wait
+// for a round trip through Vite and buck2. So once a module is built, its static imports are
+// built too, and theirs once they are, as Vite's `preTransformRequests` does: by the time the
+// browser asks for a module, it is usually built. The imports of a compiled module are already
+// the URLs that serve them; those of an npm bundle are relative to it, or other bundles.
+//
+// `import()`s are left for the browser to ask for. They are lazy routes, locale messages and
+// the like, which a page may never load, and on a first build they would take the daemon's
+// time from the modules that the page does need.
+
+const prefetched = new Set(); // the URLs whose imports have been built, or are building
+
+function urlOutput(url) {
+  if (url.startsWith("/@npm/")) {
+    if (!url.endsWith(".js")) return null;
+    const [, , entry, ...rest] = url.split("/");
+    return [npmOutput(entry), (dir) => path.join(dir, ...rest)];
+  }
+  if (!url.startsWith("/") || url.startsWith("/@")) return null;
+  return [moduleOutput(urlKey(url)), (file) => file];
+}
+
+function prefetch(url) {
+  if (prefetched.has(url)) return;
+  const output = urlOutput(url);
+  if (!output) return;
+  prefetched.add(url);
+  const [[name, def], file] = output;
+  buck.get(name, def).then(async (built) => {
+    const code = await fs.promises.readFile(file(built.path), "utf8");
+    for (const spec of staticImports(code)) {
+      prefetch(spec.startsWith(".") ? path.posix.join(path.posix.dirname(url), spec) : spec);
+    }
+  }).catch(() => {
+    // The browser gets the error when it asks for the module.
+  });
+}
+
 // --- The Vite plugin ----------------------------------------------------------------------
 
 let server;
@@ -180,11 +234,13 @@ function buckPlugin() {
     async load(id) {
       if (id === "/@react-refresh") return refreshRuntime;
       if (id.startsWith("/@npm/")) {
+        prefetch(id);
         const [, , entry, ...rest] = id.split("/");
         const dir = await readOutput(npmOutput(entry));
         return fs.readFileSync(path.join(dir, ...rest), "utf8");
       }
       if (!ours.has(id)) return null;
+      prefetch(id.slice(root.length));
       const key = urlKey(id.slice(root.length));
       const file = path.join(root, key.split("~")[0]);
       if (!idsByFile.has(file)) idsByFile.set(file, new Set());
@@ -232,7 +288,9 @@ window.$RefreshSig$ = () => (type) => type;`,
           if (req.method !== "GET" || (url !== "/" && extname(url) !== "" && !url.endsWith(".html"))) return next();
           try {
             if (!indexPath) indexPath = await readOutput(["index", null]);
-            const html = await s.transformIndexHtml(url, fs.readFileSync(indexPath, "utf8"), req.originalUrl);
+            const source = fs.readFileSync(indexPath, "utf8");
+            for (const [, src] of source.matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g)) prefetch(src);
+            const html = await s.transformIndexHtml(url, source, req.originalUrl);
             res.setHeader("Content-Type", "text/html");
             res.end(html);
           } catch (e) {
