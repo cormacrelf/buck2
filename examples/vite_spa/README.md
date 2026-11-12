@@ -190,10 +190,9 @@ a reload takes about 100ms.
 
 ### Limits
 
-- Every Sass module starts dart-sass again (about 100ms), which `_tokens.scss` shows.
-  `vite.persistent_worker = true` runs the transforms in a persistent worker, but buck2 gives
-  each command its own worker pool, and each build of `buck2 dev` is a command. So a
-  worker only pays off once it outlives the command.
+- The transforms run in a persistent worker (`vite.persistent_worker` in `.buckconfig`),
+  which `buck2 dev` keeps for the session, so oxc, lightningcss and Sass load once. The
+  images that image modules name are encoded by a new `node` each, outside the worker.
 - Each module is a dynamic output of `buck2 dev`, and each change is looked up in each one's
   graph, so the time per change grows with the modules loaded: about 70ms with 30 modules
   in `examples/dev_vite_buck`, against about 115ms here.

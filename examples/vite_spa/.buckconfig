@@ -21,4 +21,6 @@ target_platform_detector_spec = target:root//...->prelude//platforms:default
 execution_platforms = root//platforms:local
 
 [vite]
-persistent_worker = false
+# The module transforms run in a persistent worker, which `buck2 dev` keeps for its session.
+# `false` starts `node` for each one instead.
+persistent_worker = true

@@ -130,10 +130,12 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
     # Sass partials and CSS `@import`s are read from the source tree, so a stylesheet is built
     # with every stylesheet of the package.
     styles = [a for p, a in srcs.items() if p.endswith(_CSS)]
-    # With `vite.persistent_worker = true`, the transforms run in `tools/worker.mjs`, which keeps
-    # oxc, lightningcss and Sass loaded. buck2 gives each command a pool of workers of its own,
-    # and a `buck2 dev` session is one command, so the worker starts once per session. A module's
-    # transform then takes about 20ms in place of about 50ms for a new `node`.
+    # With `vite.persistent_worker = true`, the default in this project's `.buckconfig`, the
+    # transforms run in `tools/worker.mjs`, which keeps oxc, lightningcss and Sass loaded. buck2
+    # gives each command a pool of workers of its own, and a `buck2 dev` session is one command
+    # that keeps its workers across its builds, so the worker starts once per session. A module's
+    # transform then takes about 20ms in place of about 50ms for a new `node`. With `false`, each
+    # transform starts `node`, which an executor without persistent workers needs.
     # The build plugins of each extension. A module that no plugin is for does not depend on
     # the plugins, so it neither loads them nor builds again when one changes.
     by_ext = {}
