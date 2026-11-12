@@ -47,8 +47,10 @@ def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
         tarballs[package] = ctx.actions.download_file(
             "tarballs/" + npm_store_name(package) + ".tgz",
             url,
-            sri = sri,
             has_content_based_path = False,
+            # Passed through a dict so the module still loads under a buck2 that predates `sri`,
+            # such as the bootstrap binary that builds buck2.
+            **{"sri": sri}
         )
 
     snapshot_packages = {}
