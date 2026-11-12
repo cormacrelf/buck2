@@ -308,6 +308,10 @@ pub struct ServerCommandContext<'a> {
     exit_when: ExitWhen,
 
     command_start: Instant,
+
+    /// The persistent workers of the command. A command that enters many transactions, such as
+    /// a `buck2 dev` session, keeps its workers from one to the next.
+    worker_pool: std::sync::OnceLock<Arc<WorkerPool>>,
 }
 
 impl<'a> ServerCommandContext<'a> {
@@ -445,6 +449,7 @@ impl<'a> ServerCommandContext<'a> {
             preemptible: client_context.preemptible(),
             exit_when: client_context.exit_when(),
             command_start,
+            worker_pool: std::sync::OnceLock::new(),
         })
     }
 
@@ -1114,7 +1119,11 @@ impl DiceCommandUpdater<'_, '_> {
         };
         data.set_detailed_aggregated_metrics_events_holder();
 
-        let worker_pool = Arc::new(WorkerPool::new(persistent_worker_shutdown_timeout_s));
+        let worker_pool = self
+            .cmd_ctx
+            .worker_pool
+            .get_or_init(|| Arc::new(WorkerPool::new(persistent_worker_shutdown_timeout_s)))
+            .dupe();
 
         let critical_path_backend = root_config
             .parse(BuckconfigKeyRef {
