@@ -1,0 +1,24 @@
+{
+  "groups": {
+    "bird": { "label": "Birds", "colour": "#3d6b8f" },
+    "plant": { "label": "Plants", "colour": "#4f7a3a" },
+    "fungus": { "label": "Fungi", "colour": "#8a5a2b" },
+    "insect": { "label": "Insects", "colour": "#a8792a" },
+    "mammal": { "label": "Mammals", "colour": "#6b4f6e" }
+  },
+  "taxa": [
+    { "id": "erithacus-rubecula", "scientific": "Erithacus rubecula", "common": "European robin", "group": "bird", "status": "common" },
+    { "id": "cinclus-cinclus", "scientific": "Cinclus cinclus", "common": "White-throated dipper", "group": "bird", "status": "local" },
+    { "id": "aquila-chrysaetos", "scientific": "Aquila chrysaetos", "common": "Golden eagle", "group": "bird", "status": "scarce" },
+    { "id": "anthus-pratensis", "scientific": "Anthus pratensis", "common": "Meadow pipit", "group": "bird", "status": "common" },
+    { "id": "drosera-rotundifolia", "scientific": "Drosera rotundifolia", "common": "Round-leaved sundew", "group": "plant", "status": "local" },
+    { "id": "calluna-vulgaris", "scientific": "Calluna vulgaris", "common": "Heather", "group": "plant", "status": "common" },
+    { "id": "saxifraga-oppositifolia", "scientific": "Saxifraga oppositifolia", "common": "Purple saxifrage", "group": "plant", "status": "scarce" },
+    { "id": "amanita-muscaria", "scientific": "Amanita muscaria", "common": "Fly agaric", "group": "fungus", "status": "common" },
+    { "id": "cantharellus-cibarius", "scientific": "Cantharellus cibarius", "common": "Chanterelle", "group": "fungus", "status": "local" },
+    { "id": "aglais-io", "scientific": "Aglais io", "common": "Peacock butterfly", "group": "insect", "status": "common" },
+    { "id": "cordulegaster-boltonii", "scientific": "Cordulegaster boltonii", "common": "Golden-ringed dragonfly", "group": "insect", "status": "local" },
+    { "id": "cervus-elaphus", "scientific": "Cervus elaphus", "common": "Red deer", "group": "mammal", "status": "common" },
+    { "id": "lutra-lutra", "scientific": "Lutra lutra", "common": "Eurasian otter", "group": "mammal", "status": "scarce" }
+  ]
+}

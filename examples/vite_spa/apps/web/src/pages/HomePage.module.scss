@@ -1,0 +1,67 @@
+.hero {
+  position: relative;
+  margin-bottom: var(--fn-space-5);
+
+  img {
+    display: block;
+    width: 100%;
+    max-height: 60vh;
+    object-fit: cover;
+    border-radius: var(--fn-radius);
+  }
+}
+
+.intro {
+  margin: 0;
+  padding: var(--fn-space-3) var(--fn-space-4);
+  color: #1f2a24;
+  font-size: 1.15rem;
+  font-style: italic;
+  background-repeat: repeat;
+
+  @include above(narrow) {
+    position: absolute;
+    left: var(--fn-space-4);
+    bottom: var(--fn-space-4);
+    max-width: 28rem;
+    border-radius: var(--fn-radius);
+    box-shadow: var(--fn-shadow);
+  }
+}
+
+.sites {
+  display: grid;
+  gap: var(--fn-space-2);
+  padding: 0;
+  list-style: none;
+
+  li {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0 var(--fn-space-2);
+    align-items: baseline;
+    padding: var(--fn-space-2) 0;
+    border-bottom: 1px solid var(--fn-rule);
+
+    > :not(:first-child, :nth-child(2)) {
+      grid-column: 2;
+    }
+
+    @include above(wide) {
+      grid-template-columns: auto 12rem 12rem 1fr auto;
+
+      > :not(:first-child, :nth-child(2)) {
+        grid-column: auto;
+      }
+    }
+  }
+}
+
+.habitat {
+  color: var(--fn-ink-muted);
+}
+
+.coords {
+  font-family: $mono;
+  font-size: 0.85rem;
+}

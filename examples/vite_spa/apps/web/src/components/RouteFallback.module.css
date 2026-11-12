@@ -1,0 +1,20 @@
+.fallback {
+  height: 3px;
+  background: linear-gradient(90deg, transparent, var(--fn-accent), transparent) 0 0 / 40% 100% no-repeat;
+  animation: slide 1s linear infinite;
+}
+
+@keyframes slide {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fallback {
+    animation: none;
+  }
+}

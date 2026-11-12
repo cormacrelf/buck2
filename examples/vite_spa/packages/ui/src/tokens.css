@@ -1,0 +1,30 @@
+/* Design tokens shared by the components and the app. Imported once by the app
+   entry; the components only read the custom properties. */
+:root {
+  --fn-paper: #f6f1e7;
+  --fn-paper-raised: #fffdf8;
+  --fn-ink: #1f2a24;
+  --fn-ink-muted: #5c665f;
+  --fn-rule: #d9cfbd;
+  --fn-accent: #2f6b4f;
+  --fn-accent-ink: #f6f1e7;
+  --fn-warn: #a4502a;
+  --fn-radius: 6px;
+  --fn-space-1: 4px;
+  --fn-space-2: 8px;
+  --fn-space-3: 12px;
+  --fn-space-4: 20px;
+  --fn-space-5: 32px;
+  --fn-shadow: 0 1px 2px rgb(31 42 36 / 0.08), 0 4px 12px rgb(31 42 36 / 0.06);
+}
+
+:root[data-theme='dark'] {
+  --fn-paper: #171c19;
+  --fn-paper-raised: #1f2622;
+  --fn-ink: #e8e4da;
+  --fn-ink-muted: #a2a99f;
+  --fn-rule: #343d37;
+  --fn-accent: #7cc39b;
+  --fn-accent-ink: #10150f;
+  --fn-warn: #e39468;
+}

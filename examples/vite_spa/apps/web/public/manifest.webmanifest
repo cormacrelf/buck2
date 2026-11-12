@@ -1,0 +1,9 @@
+{
+  "name": "Field Notes",
+  "short_name": "Field Notes",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f1e7",
+  "theme_color": "#2f6b4f",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

@@ -1,0 +1,31 @@
+// Sass-side tokens. Injected into every .scss file by
+// css.preprocessorOptions.scss.additionalData in vite.config.ts, so nothing
+// imports this directly. Colours stay CSS custom properties (from
+// @fieldnotes/ui/tokens.css) so the theme can switch at runtime.
+
+@use 'sass:map';
+
+$breakpoints: (
+  narrow: 560px,
+  wide: 960px,
+);
+
+$content-width: 46rem;
+$page-width: 72rem;
+
+@mixin above($name) {
+  @media (min-width: map.get($breakpoints, $name)) {
+    @content;
+  }
+}
+
+@mixin visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+$mono: 'Plex Mono', ui-monospace, monospace;

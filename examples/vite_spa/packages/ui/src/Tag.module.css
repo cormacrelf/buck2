@@ -1,0 +1,19 @@
+.tag {
+  --tag-colour: var(--fn-ink-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tag-colour) 14%, transparent);
+  color: var(--fn-ink);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tag-colour);
+}

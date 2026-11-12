@@ -1,0 +1,23 @@
+.badge {
+  display: flex;
+  gap: var(--fn-space-2);
+  align-items: center;
+  margin: 0;
+  font-family: 'Plex Mono', ui-monospace, monospace;
+}
+
+.commit {
+  opacity: 0.7;
+}
+
+.channel {
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.channel[data-channel='stable'] {
+  display: none;
+}

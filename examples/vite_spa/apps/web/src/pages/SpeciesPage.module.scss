@@ -1,0 +1,55 @@
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--fn-space-2) var(--fn-space-3);
+  margin-bottom: var(--fn-space-4);
+
+  input {
+    flex: 1 1 14rem;
+    padding: var(--fn-space-1) var(--fn-space-2);
+    border: 1px solid var(--fn-rule);
+    border-radius: var(--fn-radius);
+    background: var(--fn-paper-raised);
+    color: inherit;
+    font: inherit;
+  }
+}
+
+.groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--fn-space-1);
+}
+
+.count {
+  color: var(--fn-ink-muted);
+  font-family: $mono;
+  font-size: 0.85rem;
+}
+
+.table {
+  td:first-child {
+    width: 1px;
+  }
+
+  td:last-child {
+    font-size: 0.85rem;
+    text-transform: capitalize;
+  }
+}
+
+// Status classes are looked up by name from the generated taxa data. With
+// localsConvention camelCaseOnly these single-word names map one to one.
+.common {
+  color: var(--fn-ink-muted);
+}
+
+.local {
+  color: var(--fn-ink);
+}
+
+.scarce {
+  color: var(--fn-warn);
+  font-weight: 600;
+}

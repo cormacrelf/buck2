@@ -1,0 +1,30 @@
+.about {
+  max-width: 46rem;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--fn-space-1) var(--fn-space-4);
+}
+
+.facts dt {
+  color: var(--fn-ink-muted);
+}
+
+.facts dd {
+  margin: 0;
+  font-family: 'Plex Mono', ui-monospace, monospace;
+}
+
+.pair {
+  display: contents;
+}
+
+.licence {
+  max-height: 20rem;
+  overflow: auto;
+  padding: var(--fn-space-3);
+  background: var(--fn-paper-raised);
+  white-space: pre-wrap;
+}

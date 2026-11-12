@@ -1,0 +1,12 @@
+{
+  "name": "fieldnotes-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.17.0",
+  "scripts": {
+    "build:packages": "pnpm --filter @fieldnotes/taxa generate && pnpm --filter @fieldnotes/geo build",
+    "build": "pnpm build:packages && pnpm --filter @fieldnotes/web build",
+    "dev": "pnpm build:packages && pnpm --parallel --filter @fieldnotes/geo --filter @fieldnotes/web dev",
+    "typecheck": "pnpm build:packages && pnpm -r typecheck"
+  }
+}

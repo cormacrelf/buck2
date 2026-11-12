@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="A notebook of walks, weather and wildlife." />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- Percent-wrapped VITE_ names are replaced from the env files at serve and build time. -->
+    <title>%VITE_APP_TITLE%</title>
+    <script>
+      // Before first paint, so a dark-mode reader never sees a light flash.
+      // The key matches src/components/ThemeToggle.tsx.
+      try {
+        const stored = localStorage.getItem('fieldnotes:theme');
+        const dark = stored ? stored === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>%VITE_APP_TITLE% needs JavaScript.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

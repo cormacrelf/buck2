@@ -1,0 +1,10 @@
+.icon {
+  display: inline-flex;
+  flex: none;
+  vertical-align: -0.2em;
+}
+
+.icon > svg {
+  width: 100%;
+  height: 100%;
+}

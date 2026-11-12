@@ -1,0 +1,78 @@
+/* Plain global CSS: element defaults and layout primitives. Component styles
+   live in CSS modules next to their components. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light dark;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--fn-paper);
+  color: var(--fn-ink);
+  font-family: 'Literata', Georgia, serif;
+  font-size: 1.0625rem;
+  line-height: 1.6;
+}
+
+a {
+  color: var(--fn-accent);
+  text-underline-offset: 0.15em;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.2;
+  text-wrap: balance;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+code,
+kbd,
+pre {
+  font-family: 'Plex Mono', ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--fn-rule);
+  text-align: left;
+}
+
+blockquote {
+  margin: 1.5em 0;
+  padding-left: 1em;
+  border-left: 3px solid var(--fn-rule);
+  color: var(--fn-ink-muted);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--fn-accent) 30%, transparent);
+}
+
+.grid {
+  display: grid;
+  gap: var(--fn-space-4);
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  padding: 0;
+  margin: 0;
+}

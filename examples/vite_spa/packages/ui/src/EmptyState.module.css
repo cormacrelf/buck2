@@ -1,0 +1,22 @@
+.empty {
+  display: grid;
+  justify-items: center;
+  gap: var(--fn-space-2);
+  padding: var(--fn-space-5) var(--fn-space-4);
+  border: 1px dashed var(--fn-rule);
+  border-radius: var(--fn-radius);
+  text-align: center;
+}
+
+.icon {
+  color: var(--fn-ink-muted);
+}
+
+.title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.detail {
+  color: var(--fn-ink-muted);
+}

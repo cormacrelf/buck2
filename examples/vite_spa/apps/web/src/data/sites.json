@@ -1,0 +1,10 @@
+{
+  "sites": [
+    { "id": "tarn", "name": "The tarn", "lat": 54.4712, "lon": -3.0721, "habitat": "upland water" },
+    { "id": "north-ridge", "name": "North ridge", "lat": 54.4731, "lon": -3.0884, "habitat": "summit ridge" },
+    { "id": "birch-wood", "name": "Birch wood", "lat": 54.4518, "lon": -3.0602, "habitat": "broadleaf woodland" },
+    { "id": "boundary-moor", "name": "Boundary moor", "lat": 54.4893, "lon": -3.1127, "habitat": "heather moor" },
+    { "id": "footbridge-pool", "name": "Footbridge pool", "lat": 54.4577, "lon": -3.0815, "habitat": "beck" }
+  ],
+  "updated": "2026-10-04"
+}

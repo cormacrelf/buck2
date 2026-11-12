@@ -1,0 +1,23 @@
+.frame {
+  display: block;
+  overflow: hidden;
+  border-radius: var(--fn-radius);
+  background-size: cover;
+  background-position: center;
+}
+
+.img {
+  display: block;
+  width: 100%;
+  height: auto;
+  opacity: 0;
+  transition: opacity 300ms ease;
+
+  &.loaded {
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+  }
+}

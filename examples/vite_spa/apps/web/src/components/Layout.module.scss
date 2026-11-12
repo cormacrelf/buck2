@@ -1,0 +1,75 @@
+// `above`, `$page-width` and friends come from styles/_tokens.scss through
+// additionalData; this file doesn't import them.
+
+.shell {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 100vh;
+}
+
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--fn-space-3) var(--fn-space-4);
+  padding: var(--fn-space-3) var(--fn-space-4);
+  border-bottom: 1px solid var(--fn-rule);
+  // Resolved relative to this file, copied to dist and rewritten to the
+  // hashed name (or inlined if small enough).
+  background: url('../assets/contours.svg') right center / auto 100% no-repeat;
+
+  @include above(wide) {
+    padding-inline: max(var(--fn-space-4), calc((100vw - #{$page-width}) / 2));
+  }
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fn-space-2);
+  color: var(--fn-ink);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--fn-space-1) var(--fn-space-3);
+}
+
+.link {
+  color: var(--fn-ink-muted);
+  text-decoration: none;
+
+  &:hover {
+    color: var(--fn-ink);
+  }
+}
+
+.active {
+  color: var(--fn-ink);
+  text-decoration: underline;
+  text-decoration-color: var(--fn-accent);
+  text-decoration-thickness: 2px;
+}
+
+.tools {
+  display: flex;
+  gap: var(--fn-space-2);
+  margin-left: auto;
+}
+
+.main {
+  width: 100%;
+  max-width: $page-width;
+  margin: 0 auto;
+  padding: var(--fn-space-4);
+}
+
+.footer {
+  padding: var(--fn-space-3) var(--fn-space-4);
+  border-top: 1px solid var(--fn-rule);
+  color: var(--fn-ink-muted);
+  font-size: 0.85rem;
+}

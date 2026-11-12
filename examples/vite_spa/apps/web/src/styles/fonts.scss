@@ -1,0 +1,16 @@
+// Body text comes from the @fontsource/literata package (see main.tsx); its
+// CSS references .woff2 files inside node_modules, which Vite copies out and
+// hashes.
+//
+// The monospace face is a file in this repo: IBM Plex Mono, SIL Open Font
+// License 1.1 (assets/fonts/ibm-plex-mono-OFL.txt). Vite resolves the url()
+// relative to this file and rewrites it to the hashed asset. build-info
+// preloads it from index.html.
+
+@font-face {
+  font-family: 'Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('../assets/fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2');
+}

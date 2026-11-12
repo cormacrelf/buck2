@@ -1,0 +1,32 @@
+.gallery {
+  display: grid;
+  gap: var(--fn-space-4);
+  padding: 0;
+  list-style: none;
+
+  @include above(narrow) {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  @include above(wide) {
+    grid-template-columns: repeat(3, 1fr);
+  }
+
+  figure {
+    margin: 0;
+  }
+
+  figcaption {
+    padding-top: var(--fn-space-1);
+    color: var(--fn-ink-muted);
+    font-size: 0.9rem;
+  }
+}
+
+.picture img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  object-fit: cover;
+  border-radius: var(--fn-radius);
+}

@@ -1,0 +1,18 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# sass pulls in @parcel/watcher for its CLI --watch mode, which Vite doesn't
+# use; its prebuilt binaries arrive as optional dependencies anyway.
+allowBuilds:
+  '@parcel/watcher': false
+
+# Shared versions, referenced from each package.json as "catalog:".
+catalog:
+  '@types/node': ^26.6.6
+  '@types/react': ^19.3.0
+  '@types/react-dom': ^19.3.0
+  react: ^19.3.1
+  react-dom: ^19.3.1
+  typescript: ^7.0.2
+  vite: ^8.3.8

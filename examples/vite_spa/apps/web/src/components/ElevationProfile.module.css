@@ -1,0 +1,27 @@
+.figure {
+  margin: var(--fn-space-3) 0 0;
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.area {
+  fill: color-mix(in srgb, var(--fn-accent) 18%, transparent);
+}
+
+.line {
+  fill: none;
+  stroke: var(--fn-accent);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.caption {
+  display: flex;
+  justify-content: space-between;
+  color: var(--fn-ink-muted);
+  font-size: 0.8rem;
+}
