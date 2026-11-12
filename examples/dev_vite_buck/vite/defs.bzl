@@ -84,7 +84,15 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
     # Sass partials and CSS `@import`s are read from the source tree, so a stylesheet is built
     # with every stylesheet of the package.
     styles = [a for p, a in srcs.items() if p.endswith(_CSS)]
-    tool = ctx.attrs._transform[RunInfo]
+    # With `vite.persistent_worker = true`, the transforms run in `tools/worker.mjs`, which keeps
+    # oxc, lightningcss and Sass loaded. buck2 gives each command a pool of workers of its own,
+    # though, and each build of `buck2 dev` is a command, so a dev session starts the worker
+    # again for every build and is slower with it than without. It pays off once workers outlive
+    # the command.
+    if read_root_config("vite", "persistent_worker", "false") == "true":
+        tool = WorkerRunInfo(worker = ctx.attrs._worker[WorkerInfo], exe = ctx.attrs._transform[RunInfo].args)
+    else:
+        tool = ctx.attrs._transform[RunInfo]
     modules = {}
     for path, src in srcs.items():
         for query in _queries(path):
@@ -92,7 +100,6 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
             out = ctx.actions.declare_output("vite/m/" + key[len(pkg) + 1:] + ".js")
             ctx.actions.run(
                 cmd_args(
-                    tool,
                     "--ctx",
                     resolve_ctx,
                     "--path",
@@ -106,6 +113,7 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 ),
                 category = "vite_transform",
                 identifier = key[len(pkg) + 1:],
+                exe = tool,
             )
             modules[key] = out
 
@@ -150,6 +158,7 @@ vite_library = rule(
         "srcs": attrs.list(attrs.source(), default = []),
         "_html": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:html")),
         "_transform": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:transform")),
+        "_worker": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:transform_worker")),
     },
 )
 
@@ -189,4 +198,13 @@ vite_npm = rule(
         "store": attrs.dep(providers = [NodejsNpmStoreInfo]),
         "_npm_esm": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:npm_esm")),
     },
+)
+
+def _vite_worker_impl(ctx: AnalysisContext) -> list[Provider]:
+    return [DefaultInfo(), WorkerInfo(exe = ctx.attrs.worker[RunInfo].args, concurrency = None)]
+
+# A persistent worker that runs `worker`, a program that serves buck2's worker protocol.
+vite_worker = rule(
+    impl = _vite_worker_impl,
+    attrs = {"worker": attrs.dep(providers = [RunInfo])},
 )

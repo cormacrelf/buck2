@@ -15,3 +15,10 @@ buck = none
 
 [parser]
 target_platform_detector_spec = target:root//...->prelude//platforms:default
+
+[build]
+# Local execution with persistent workers on, for `vite.persistent_worker`.
+execution_platforms = root//platforms:local
+
+[vite]
+persistent_worker = false

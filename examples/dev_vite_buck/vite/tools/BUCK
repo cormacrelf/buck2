@@ -1,3 +1,4 @@
+load("//vite:defs.bzl", "vite_worker")
 load("@prelude//nodejs:pnpm.bzl", "pnpm_package")
 
 pnpm_package(
@@ -13,5 +14,13 @@ pnpm_package(
         entry_point = name + ".mjs",
         visibility = ["PUBLIC"],
     )
-    for name in ["html", "npm_esm", "transform"]
+    for name in ["html", "npm_esm", "transform", "worker"]
 ]
+
+
+# `transform`, in a persistent worker.
+vite_worker(
+    name = "transform_worker",
+    worker = ":worker",
+    visibility = ["PUBLIC"],
+)
