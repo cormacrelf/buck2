@@ -1,4 +1,5 @@
 load("@prelude//nodejs:pnpm.bzl", "pnpm_workspace")
+load("//platforms:defs.bzl", "BROWSER")
 load("//vite:defs.bzl", "vite_npm")
 load(":pnpm-lock.yaml", lock = "value")
 load(":pnpm-workspace.yaml", workspace = "value")
@@ -10,5 +11,6 @@ pnpm_workspace(lock, workspace)
 vite_npm(
     name = "esm",
     store = ":npm",
+    modifiers = BROWSER,
     visibility = ["PUBLIC"],
 )

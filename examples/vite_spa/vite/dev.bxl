@@ -6,28 +6,23 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("//vite:defs.bzl", "ViteModulesInfo", "ViteNpmInfo", "vite_ext")
+load("//vite:defs.bzl", "ViteDevServerInfo", "ViteModulesInfo", "ViteNpmInfo", "vite_ext")
 
 def _dev(ctx):
-    """`buck2 dev vite/dev.bxl:dev -- --app //apps/web:web`: the Vite dev server for the app,
-    with each module built on demand by the handler `module`, and each npm package by `npm`."""
-    app = ctx.configured_targets(ctx.cli_args.app)
-    info = ctx.analysis(app).providers()[ViteModulesInfo]
-    if info.html == None:
-        fail("{} has no `html`".format(ctx.cli_args.app))
-    server = ctx.analysis(ctx.configured_targets("root//vite/server:main")).providers()[RunInfo]
-    args = ["--app", info.package, "--npm", ctx.cli_args.npm]
-    if info.public:
-        args += ["--public", info.public]
-    if info.server_plugins:
-        args.append(info.server_plugins)
-    for key in info.tailwind:
-        args += ["--tailwind", key]
+    """`buck2 dev vite/dev.bxl:dev -- --server //apps/web:dev`: the Vite dev server of a
+    `vite_dev_server`, with each module built on demand by the handler `module`, and each npm
+    package by `npm`.
+
+    The server is configured as any target is with no modifiers: for this machine, which runs it.
+    The app and its npm packages reach the browser's configuration through its transitions, and
+    the handlers configure the libraries they build modules of with their own `BROWSER`
+    modifiers, which give the same configuration."""
+    info = ctx.analysis(ctx.configured_targets(ctx.cli_args.server)).providers()[ViteDevServerInfo]
     return [
         DefaultInfo(),
         DevInfo(
-            server = cmd_args(server, args),
-            outputs = {"index": info.html},
+            server = info.server,
+            outputs = {"index": info.app.html},
             handlers = {
                 "image": "root//vite/dev.bxl:image",
                 "module": "root//vite/dev.bxl:module",
@@ -39,10 +34,7 @@ def _dev(ctx):
 
 dev = bxl_main(
     impl = _dev,
-    cli_args = {
-        "app": cli_args.target_label(),
-        "npm": cli_args.string(default = "root//:esm"),
-    },
+    cli_args = {"server": cli_args.target_label()},
 )
 
 def _package_of(ctx, path):

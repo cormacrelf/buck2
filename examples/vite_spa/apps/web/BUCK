@@ -1,9 +1,9 @@
 load("@prelude//nodejs:pnpm.bzl", "pnpm_importer")
-load("//vite:defs.bzl", "vite_constants", "vite_package")
+load("//vite:defs.bzl", "vite_constants", "vite_dev_server", "vite_package")
 load("//:lock.bzl", "LOCK")
 load(":vite.bzl", "PACKAGE", "STYLE")
 
-# The app's modules for `buck2 dev vite/dev.bxl:dev -- --app //apps/web:web`. What
+# The app's modules for `buck2 dev vite/dev.bxl:dev -- --server //apps/web:dev`. What
 # vite.config.ts configures, said again for buck2.
 vite_package(
     srcs = glob(["src/**"]),
@@ -23,20 +23,27 @@ vite_package(
     tailwind = ["src/styles/tailwind.css"],
     # vite-imagetools and @vitejs/plugin-react are built in. The app's own plugins run as they
     # are: the build hooks of markdown and photo in each module's action, and the server hooks
-    # of build-info and markdown in the dev server.
+    # of build-info and markdown in the dev server (`:dev`).
     plugins = ":vite_plugins",
     build_plugins = {
         "plugins/markdown.ts:markdown": [".md"],
         "plugins/photo.ts:photo": [".jpg"],
     },
-    server_plugins = [
-        'plugins/build-info.ts:buildInfo:[{"preloadFonts":["src/assets/fonts/ibm-plex-mono-latin-400-normal.woff2"]}]',
-        "plugins/markdown.ts:markdown",
-    ],
     # build-info's module reads git and the clock when Vite starts, which an action must not.
     # Here it is built from what buck2 knows.
     virtual = {"virtual:build-info": ":build_info"},
     **STYLE
+)
+
+# `buck2 dev vite/dev.bxl:dev -- --server //apps/web:dev`
+vite_dev_server(
+    name = "dev",
+    app = ":web",
+    plugins = ":vite_plugins",
+    server_plugins = [
+        'plugins/build-info.ts:buildInfo:[{"preloadFonts":["src/assets/fonts/ibm-plex-mono-latin-400-normal.woff2"]}]',
+        "plugins/markdown.ts:markdown",
+    ],
 )
 
 nodejs_library(

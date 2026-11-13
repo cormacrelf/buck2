@@ -19,6 +19,7 @@
 load("@prelude//nodejs:nodejs_npm_store.bzl", "NodejsNpmStoreInfo", "npm_store_name")
 load("@prelude//nodejs:nodejs_providers.bzl", "NodejsLibraryInfo", "NodejsLinksInfo")
 load("@prelude//nodejs:pnpm.bzl", "pnpm_importer")
+load("//platforms:defs.bzl", "BROWSER")
 
 ViteModulesInfo = provider(fields = {
     # The package's directory in the project.
@@ -45,8 +46,6 @@ ViteModulesInfo = provider(fields = {
     "transform": provider_field(RunInfo),
     # The `--plugins-dir` and `--plugin` args of the build plugins for each extension.
     "plugins": provider_field(dict[str, cmd_args]),
-    # The plugins whose server hooks the dev server runs: `--plugins-dir` and `--plugin` args.
-    "server_plugins": provider_field(cmd_args | None),
 })
 
 ViteNpmInfo = provider(fields = {
@@ -127,12 +126,7 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
             return None
         if ctx.attrs.plugins == None:
             fail("{}: plugins named without `plugins`, the library they are in".format(ctx.label))
-        lib = ctx.attrs.plugins[NodejsLibraryInfo].direct[0]
-        return cmd_args(
-            # The package sits in its entry at `node_modules/<name>`, beside its dependencies.
-            ["--plugins-dir", lib.entry.project("node_modules/" + lib.dir_name)] + [arg for spec in specs for arg in ["--plugin", spec]],
-            hidden = lib.inputs.project_as_args("inputs"),
-        )
+        return _plugin_args(ctx.attrs.plugins, specs)
 
     # Sass partials and CSS `@import`s are read from the source tree, so a stylesheet is built
     # with every stylesheet of the package.
@@ -227,7 +221,6 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
             styles = styles,
             transform = RunInfo(args = cmd_args(ctx.attrs._transform[RunInfo], base)),
             plugins = plugins,
-            server_plugins = plugin_args(ctx.attrs.server_plugins),
         ),
     ]
 
@@ -253,13 +246,11 @@ vite_library = rule(
         # Named sets of image directives, used as `?preset=NAME`, as vite-imagetools'
         # `defaultDirectives` would.
         "image_presets": attrs.dict(attrs.string(), attrs.dict(attrs.string(), attrs.string()), default = {}),
-        # A `nodejs_library` with the app's own Vite plugins and their npm dependencies.
-        "plugins": attrs.option(attrs.dep(), default = None),
+        # A `nodejs_library` with the app's own Vite plugins and their npm dependencies. The
+        # module actions run them, so they are built for where actions run.
+        "plugins": attrs.option(attrs.exec_dep(providers = [NodejsLibraryInfo]), default = None),
         # Prepended to every Sass stylesheet, as Vite's `css.preprocessorOptions.scss.additionalData`.
         "scss_additional_data": attrs.string(default = ""),
-        # Vite plugins of `plugins` whose server hooks (`configureServer`, `configResolved`,
-        # `transformIndexHtml`, `hotUpdate`) the dev server runs.
-        "server_plugins": attrs.list(attrs.string(), default = []),
         # Modules that Vite plugins would make up, by the ID they are imported as, such as
         # `virtual:build-info`: here they are built by targets like any other file.
         "virtual": attrs.dict(attrs.string(), attrs.dep(), default = {}),
@@ -284,9 +275,19 @@ vite_library = rule(
     },
 )
 
+def _plugin_args(plugins: Dependency, specs: list[str]) -> cmd_args:
+    """`--plugins-dir` and `--plugin` args that load `specs` from `plugins`, a `nodejs_library`."""
+    lib = plugins[NodejsLibraryInfo].direct[0]
+    return cmd_args(
+        # The package sits in its entry at `node_modules/<name>`, beside its dependencies.
+        ["--plugins-dir", lib.entry.project("node_modules/" + lib.dir_name)] + [arg for spec in specs for arg in ["--plugin", spec]],
+        hidden = lib.inputs.project_as_args("inputs"),
+    )
+
 def vite_package(srcs, exports = {}, **kwargs):
     """A `vite_library` for this pnpm workspace package, with the dependencies the lockfile
-    gives it, named after its directory as `pnpm_package` names its library."""
+    gives it, named after its directory as `pnpm_package` names its library. It is for the
+    browser: built directly, it has the `BROWSER` modifiers."""
     importer = pnpm_importer()
     vite_library(
         name = importer.name,
@@ -295,9 +296,53 @@ def vite_package(srcs, exports = {}, **kwargs):
         exports = exports,
         deps = importer.deps,
         node_modules = importer.node_modules,
+        modifiers = kwargs.pop("modifiers", BROWSER),
         visibility = ["PUBLIC"],
         **kwargs
     )
+
+ViteDevServerInfo = provider(fields = {
+    # The app, as the browser gets it.
+    "app": provider_field(typing.Any),
+    # The dev server, without the args that `buck2 dev` gives it.
+    "server": provider_field(cmd_args),
+})
+
+def _vite_dev_server_impl(ctx: AnalysisContext) -> list[Provider]:
+    app = ctx.attrs.app[ViteModulesInfo]
+    if app.html == None:
+        fail("{}: `{}` has no `html`".format(ctx.label, ctx.attrs.app.label.raw_target()))
+    args = ["--app", app.package, "--npm", str(ctx.attrs.npm.label.raw_target())]
+    if app.public:
+        args += ["--public", app.public]
+    if ctx.attrs.server_plugins:
+        if ctx.attrs.plugins == None:
+            fail("{}: `server_plugins` without `plugins`, the library they are in".format(ctx.label))
+        args.append(_plugin_args(ctx.attrs.plugins, ctx.attrs.server_plugins))
+    for key in app.tailwind:
+        args += ["--tailwind", key]
+    return [
+        DefaultInfo(),
+        ViteDevServerInfo(app = app, server = cmd_args(ctx.attrs.server[RunInfo], args)),
+    ]
+
+# The Vite dev server for `app`, for `buck2 dev vite/dev.bxl:dev`. The server runs on the
+# machine that runs buck2, so it is built for it, as is anything a target is built for when no
+# modifier says otherwise. What it serves is for the browser: `app` and `npm` go there through
+# the transition `//platforms:browser`, and the tools that build their modules are exec deps, built
+# for wherever the actions run.
+vite_dev_server = rule(
+    impl = _vite_dev_server_impl,
+    attrs = {
+        "app": attrs.transition_dep(cfg = "root//platforms:browser", providers = [ViteModulesInfo]),
+        "npm": attrs.transition_dep(cfg = "root//platforms:browser", providers = [ViteNpmInfo], default = "root//:esm"),
+        # A `nodejs_library` with Vite plugins whose server hooks (`configureServer`,
+        # `configResolved`, `transformIndexHtml`, `hotUpdate`) the dev server runs.
+        "plugins": attrs.option(attrs.dep(providers = [NodejsLibraryInfo]), default = None),
+        "server": attrs.dep(providers = [RunInfo], default = "root//vite/server:main"),
+        "server_plugins": attrs.list(attrs.string(), default = []),
+    },
+)
 
 def _vite_npm_impl(ctx: AnalysisContext) -> list[Provider]:
     store = ctx.attrs.store[NodejsNpmStoreInfo]

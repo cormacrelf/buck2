@@ -118,7 +118,7 @@ the React Compiler, WebAssembly, `server.proxy`, and tests (Vitest).
 The same app also runs under `buck2 dev`, with buck2 compiling every module:
 
 ```sh
-buck2 dev vite/dev.bxl:dev -- --app //apps/web:web
+buck2 dev vite/dev.bxl:dev -- --server //apps/web:dev
 ```
 
 Open <http://localhost:5173/> (or set `PORT`). It needs `node` on `PATH` and network

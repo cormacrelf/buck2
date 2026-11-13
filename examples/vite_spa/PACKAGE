@@ -1,4 +1,23 @@
+load("@prelude//cfg/modifier:cfg_constructor.bzl", "cfg_constructor_post_constraint_analysis", "cfg_constructor_pre_constraint_analysis")
+load("@prelude//cfg/modifier:common.bzl", "MODIFIER_METADATA_KEY")
+load("@prelude//cfg/modifier:set_cfg_modifiers.bzl", "set_cfg_modifiers")
 load("@prelude//nodejs:pnpm.bzl", "pnpm_workspace_package")
+load("@prelude//platforms:defs.bzl", "host_configuration")
+load("//platforms:defs.bzl", "BROWSER")
 load(":pnpm-lock.yaml", lock = "value")
+
+# Configurations come from modifiers only: there is no target platform. A target is built for
+# the machine that runs buck2, unless a modifier says otherwise: `-m browser` on the command line,
+# the `modifiers` of a target (every `vite_package` has `BROWSER`), or a transition on the way
+# to it (`//platforms:browser`).
+native.set_cfg_constructor(
+    stage0 = cfg_constructor_pre_constraint_analysis,
+    stage1 = cfg_constructor_post_constraint_analysis,
+    key = MODIFIER_METADATA_KEY,
+    aliases = struct(browser = BROWSER),
+    extra_data = struct(),
+)
+
+set_cfg_modifiers(cfg_modifiers = [host_configuration.cpu, host_configuration.os])
 
 pnpm_workspace_package(lock)
