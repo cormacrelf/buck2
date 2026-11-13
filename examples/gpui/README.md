@@ -26,9 +26,10 @@ NVIDIA shell reads the version of the host's driver, so `.envrc` enters it with
 
 ## How it works
 
-`dev.bxl`, `server/server.py` and `toolchains/` are those of
+`dev.bxl`, `server/server.py`, `toolchains/`, `dev/` and `PACKAGE` are those of
 `examples/subsecond`, whose README says how they work. The server here starts
-the app with `--runner`, which `dev.bxl` sets to `nixVulkan`.
+the app with `--runner`, which `dev.bxl` sets to `nixVulkan`. As there,
+`buck2 build //app:main?subsecond` builds what `buck2 dev` runs.
 
 `Render::render` calls `view` through `subsecond::HotFn`, so a frame runs the
 newest patch of it. A patch arrives on the app's stdin, on a thread of its own,

@@ -23,10 +23,11 @@ would: it needs no target of its own, and runs any binary and crate given to it.
 ### Building for hot patching
 
 A binary that subsecond patches links differently from a plain one. The
-function configures `--binary` and `--lib` for `//dev:subsecond_platform`, the
-default platform with the constraint `//dev:subsecond`, and the targets in
-`app/BUCK` select their link on that constraint. So `buck2 build //app:main`
-builds a plain binary, and `buck2 dev` a binary that can be patched.
+function configures `--binary` and `--lib` with the modifier `//dev:subsecond`,
+a constraint, and the targets in `app/BUCK` select their link on it. So
+`buck2 build //app:main` builds a plain binary, and `buck2 dev` a binary that
+can be patched. `PACKAGE` turns on modifiers, and names this one `subsecond`:
+`buck2 build //app:main?subsecond` builds what `buck2 dev` runs.
 `//app:app` includes a module that `//app:slow` makes after a 10 second sleep,
 so each build of the crate is slow: change `src/lib.rs` again during a build,
 and the daemon stops the build, and `buck2 dev` starts a new one.

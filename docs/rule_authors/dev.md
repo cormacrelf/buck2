@@ -167,7 +167,7 @@ implementation of a rule does, with a `DefaultInfo`, and a `DevInfo` or a
 
 ```python
 def _dev(ctx):
-    target = ctx.configured_targets(ctx.cli_args.target, target_platform = "root//dev:hot_platform")
+    target = ctx.configured_targets(ctx.cli_args.target, modifiers = ["root//dev:hot"])
     exe = ctx.analysis(target).providers()[DefaultInfo].default_outputs[0]
     return [
         DefaultInfo(),
@@ -191,10 +191,10 @@ buck2 dev tools/dev.bxl:dev -- --target //app:main -- --port 8080
 A function needs no rule and no target of its own, so one function can run many
 targets. It can configure the targets as it likes, so a target can build in
 one way for `buck2 dev` and in another for `buck2 build`: the target selects on
-a constraint, and the function configures it with a platform that has the
-constraint.
+a constraint, and the function configures it with that constraint as a
+[modifier](../../concepts/modifiers).
 [`examples/subsecond`](https://github.com/facebook/buck2/tree/main/examples/subsecond)
-does that: its targets link for hot patching only on the platform that its
+does that: its targets link for hot patching only with the modifier that its
 function uses. The outputs can also be artifacts that the function makes with
 its own actions (`ctx.bxl_actions().actions`).
 

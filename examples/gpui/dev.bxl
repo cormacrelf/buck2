@@ -10,24 +10,25 @@
 # and patches the code of the crate `--lib` into it when a source file of the crate changes,
 # with subsecond (https://crates.io/crates/subsecond).
 #
-# The targets are built for `//dev:subsecond_platform`, on which they select how they link:
+# The targets are built with the modifier `//dev:subsecond`, on which they select how they link:
 # `--binary` with `SUBSECOND_LINK = "fat"`, and `--lib` with `SUBSECOND_LINK = "thin"` and
 # `-Clink-dead-code`. A plain `buck2 build` of them links as usual.
 #
 # Only Linux is supported: ThinLink, the toolchain's linker, handles ELF only.
 
-PLATFORM = "root//dev:subsecond_platform"
+# Builds for hot patching. See `dev/BUCK`.
+MODIFIERS = ["root//dev:subsecond"]
 
 def _app(ctx):
-    binary = ctx.configured_targets(ctx.cli_args.binary, target_platform = PLATFORM)
-    lib = ctx.configured_targets(ctx.cli_args.lib, target_platform = PLATFORM)
+    binary = ctx.configured_targets(ctx.cli_args.binary, modifiers = MODIFIERS)
+    lib = ctx.configured_targets(ctx.cli_args.lib, modifiers = MODIFIERS)
     exe = ctx.analysis(binary).providers()[DefaultInfo].default_outputs[0]
 
     # The crate as a shared library. ThinLink links it as a patch: only the crate's own code.
     patch = ctx.analysis(lib).providers()[DefaultInfo].sub_targets["cdylib"][DefaultInfo].default_outputs[0]
 
-    # The server runs ThinLink here, so it is built for this machine.
-    thinlink = ctx.configured_targets("toolchains//:thinlink", target_platform = "prelude//platforms:default")
+    # The server runs ThinLink here, so it is built for this machine, without the modifiers.
+    thinlink = ctx.configured_targets("toolchains//:thinlink")
     thinlink = ctx.analysis(thinlink).providers()[RunInfo]
     server = cmd_args(
         "python3",
