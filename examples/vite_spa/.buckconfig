@@ -14,7 +14,7 @@ buck = none
   prelude = bundled
 
 [parser]
-target_platform_detector_spec = target:root//...->prelude//platforms:default
+target_platform_detector_spec = target:root//...->root//platforms:local
 
 [build]
 # Local execution with persistent workers on, for `vite.persistent_worker`.

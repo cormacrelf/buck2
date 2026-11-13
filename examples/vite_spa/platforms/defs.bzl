@@ -10,9 +10,10 @@ def _local_impl(ctx):
     constraints = {}
     constraints.update(ctx.attrs.cpu[ConfigurationInfo].constraints)
     constraints.update(ctx.attrs.os[ConfigurationInfo].constraints)
+    configuration = ConfigurationInfo(constraints = constraints, values = {})
     platform = ExecutionPlatformInfo(
         label = ctx.label.raw_target(),
-        configuration = ConfigurationInfo(constraints = constraints, values = {}),
+        configuration = configuration,
         executor_config = CommandExecutorConfig(
             local_enabled = True,
             remote_enabled = False,
@@ -20,9 +21,16 @@ def _local_impl(ctx):
             use_persistent_workers = True,
         ),
     )
-    return [DefaultInfo(), ExecutionPlatformRegistrationInfo(platforms = [platform])]
+    return [
+        DefaultInfo(),
+        ExecutionPlatformRegistrationInfo(platforms = [platform]),
+        # The same label and constraints as the execution platform, so that targets and their
+        # exec deps share one configuration. With different ones, a package that is both, like
+        # the tools that the dev server and every transform use, is built twice, npm store and all.
+        PlatformInfo(label = str(ctx.label.raw_target()), configuration = configuration),
+    ]
 
-# Local execution, with persistent workers.
+# Local execution, with persistent workers, and the target platform too.
 local_platform = rule(
     impl = _local_impl,
     attrs = {
