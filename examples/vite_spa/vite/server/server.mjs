@@ -339,7 +339,8 @@ function buckPlugin() {
       if (importer?.startsWith("/@npm/") && source.startsWith(".")) {
         return path.posix.join(path.posix.dirname(importer), source);
       }
-      if (source.startsWith("/") && !source.startsWith("/@") && !source.startsWith(root + "/")) {
+      // A module's URL names a source, which has an extension. `/notes` is a route of the app.
+      if (source.startsWith("/") && !source.startsWith("/@") && !source.startsWith(root + "/") && extname(urlKey(source.split("?")[0])) !== "") {
         ours.add(root + source);
         return root + source;
       }
@@ -437,23 +438,24 @@ window.$RefreshSig$ = () => (type) => type;`,
           next(e);
         }
       });
-      return () => {
-        // The SPA's page, for `/` and any route without a file extension.
-        s.middlewares.use(async (req, res, next) => {
-          const url = req.url.split("?")[0];
-          if (req.method !== "GET" || (url !== "/" && extname(url) !== "" && !url.endsWith(".html"))) return next();
-          try {
-            if (!indexPath) indexPath = await readOutput(["index", null]);
-            const source = fs.readFileSync(indexPath, "utf8");
-            for (const [, src] of source.matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g)) prefetch(src);
-            const html = await s.transformIndexHtml(url, source, req.originalUrl);
-            res.setHeader("Content-Type", "text/html");
-            res.end(html);
-          } catch (e) {
-            next(e);
-          }
-        });
-      };
+      // The SPA's page, for `/` and any route without a file extension. Before Vite's own
+      // middlewares, which take a URL without an extension for a module unless a browser
+      // navigates to it: a `fetch("/notes")` would otherwise ask buck2 for the module `notes`.
+      s.middlewares.use(async (req, res, next) => {
+        const url = req.url.split("?")[0];
+        const route = url === "/" || url.endsWith(".html") || (extname(url) === "" && !url.startsWith("/@") && !url.startsWith("/__"));
+        if (req.method !== "GET" || !route) return next();
+        try {
+          if (!indexPath) indexPath = await readOutput(["index", null]);
+          const source = fs.readFileSync(indexPath, "utf8");
+          for (const [, src] of source.matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g)) prefetch(src);
+          const html = await s.transformIndexHtml(url, source, req.originalUrl);
+          res.setHeader("Content-Type", "text/html");
+          res.end(html);
+        } catch (e) {
+          next(e);
+        }
+      });
     },
   };
 }
