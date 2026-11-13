@@ -29,7 +29,6 @@ use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::io::trace::TracingIoProvider;
 use buck2_core::category::CategoryRef;
-use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
@@ -62,10 +61,6 @@ use crate::actions::impls::offline;
 enum DownloadFileActionError {
     #[error("Exactly one output file must be specified for a download file action, got {0}")]
     WrongNumberOfOutputs(usize),
-    #[error(
-        "Downloads using content-based path {0} must supply metadata (usually in the form of a sha1)!"
-    )]
-    ContentBasedPathWithoutMetadata(BuildArtifactPath),
 }
 
 enum DeclaredMetadata {
@@ -328,6 +323,11 @@ impl DownloadFileAction {
         metadata: Option<&FileMetadata>,
     ) -> buck2_error::Result<(ArtifactValue, ActionExecutionKind)> {
         let materializer = ctx.materializer();
+        let output = self.output().get_path();
+        // A content-based output whose digest is only known once it is downloaded, such as one
+        // with only a sha512 checksum, is downloaded to its configuration's path, which no other
+        // configuration of this action writes, and then published at its content-based path.
+        let publish = metadata.is_none() && output.is_content_based_path();
 
         let path = match metadata {
             Some(metadata) => {
@@ -341,7 +341,8 @@ impl DownloadFileAction {
                 }
                 path
             }
-            None => ctx.fs().resolve_build(self.output().get_path(), None)?,
+            None if publish => ctx.fs().resolve_build_configuration_hash_path(output)?,
+            None => ctx.fs().resolve_build(output, None)?,
         };
 
         // Whatever is at the path is stale or untracked; the `declare_existing` below replaces
@@ -395,15 +396,22 @@ impl DownloadFileAction {
                     is_executable: self.inner.is_executable,
                 }),
             };
-            materializer
-                .declare_existing(
-                    &output_lease,
-                    vec![DeclareArtifactPayload {
-                        path,
-                        artifact: value.dupe(),
-                    }],
-                )
-                .await?;
+            if publish {
+                let dest = self.output_path(ctx, &value)?;
+                materializer
+                    .publish(&output_lease, path, dest, value.dupe())
+                    .await?;
+            } else {
+                materializer
+                    .declare_existing(
+                        &output_lease,
+                        vec![DeclareArtifactPayload {
+                            path,
+                            artifact: value.dupe(),
+                        }],
+                    )
+                    .await?;
+            }
             buck2_error::Ok(value)
         }
         .await;
@@ -478,15 +486,11 @@ impl Action for DownloadFileAction {
 
         let client = ctx.http_client();
         let url = self.url(client);
-        let is_content_based = self.output().get_path().is_content_based_path();
 
         let metadata = match self.declared_metadata(client, ctx.digest_config()).await {
             DeclaredMetadata::Known(metadata) => Some(metadata),
             DeclaredMetadata::Unknown => None,
             DeclaredMetadata::HeadFailed(e) => {
-                if is_content_based {
-                    return Err(e.into());
-                }
                 // Not a soft error: servers legitimately refuse HEAD, and a server that is
                 // actually down fails the GET that follows.
                 tracing::debug!(
@@ -497,14 +501,6 @@ impl Action for DownloadFileAction {
                 None
             }
         };
-        if metadata.is_none() && is_content_based {
-            return Err(ExecuteError::Error {
-                error: DownloadFileActionError::ContentBasedPathWithoutMetadata(
-                    self.output().get_path().dupe(),
-                )
-                .into(),
-            });
-        }
 
         let (value, execution_kind) = match &metadata {
             Some(metadata) => match self.declare_from_cas(ctx, metadata).await? {

@@ -9,6 +9,7 @@
 # pyre-strict
 
 
+import hashlib
 import json
 import subprocess
 import time
@@ -312,14 +313,19 @@ class ContentBasedPathsTest(BuckTestCase):
     async def test_download_with_content_based_path_and_no_metadata(
         self, buck: Buck
     ) -> None:
-        await expect_failure(
-            buck.build(
+        # Downloaded to the configuration's path, then published at the content-based path.
+        content = b"no usable digest\n"
+        async with StaticHttpServer({"/file": content}) as server:
+            await build_target_with_different_platforms_and_verify_output_paths_are_identical(
+                buck,
                 "root//:download_with_content_based_path_and_no_metadata",
-                "-c",
-                "test.url=http://localhost:1/archive",
-            ),
-            stderr_regex=r"Downloads using content-based path .* must supply metadata \(usually in the form of a sha1\)!",
-        )
+                [
+                    "-c",
+                    f"test.url={server.url('/file')}",
+                    "-c",
+                    f"test.sha256={hashlib.sha256(content).hexdigest()}",
+                ],
+            )
 
     @buck_test()
     async def test_offline_cas_artifact_with_content_based_path(

@@ -309,18 +309,16 @@ cas_artifact_with_content_based_path = rule(
 )
 
 def _download_with_content_based_path_impl(ctx: AnalysisContext):
-    url = read_config("test", "url")
-
     if ctx.attrs.defer_download:
-        sha1 = read_config("test", "sha1")
-        dummy_sha_256 = None
+        sha1 = ctx.attrs.sha1
+        sha256 = None
     else:
         # The digest config only accepts sha1 here, so a sha256 alone gives the action no usable
-        # digest, which is the path this case wants to exercise.
+        # digest: the path is only known once the file is downloaded and hashed.
         sha1 = None
-        dummy_sha_256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        sha256 = ctx.attrs.sha256
 
-    download = ctx.actions.download_file("download", url, sha1 = sha1, sha256 = dummy_sha_256, has_content_based_path = True)
+    download = ctx.actions.download_file("download", ctx.attrs.url, sha1 = sha1, sha256 = sha256, has_content_based_path = True)
     return [
         DefaultInfo(default_output = download),
     ]
@@ -329,6 +327,9 @@ download_with_content_based_path = rule(
     impl = _download_with_content_based_path_impl,
     attrs = {
         "defer_download": attrs.bool(default = True),
+        "sha1": attrs.option(attrs.string(), default = None),
+        "sha256": attrs.option(attrs.string(), default = None),
+        "url": attrs.string(),
     },
 )
 

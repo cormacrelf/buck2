@@ -118,11 +118,15 @@ cas_artifact_with_content_based_path(
 
 download_with_content_based_path(
     name = "download_with_content_based_path",
+    sha1 = read_config("test", "sha1"),
+    url = read_config("test", "url", ""),
 )
 
 download_with_content_based_path(
     name = "download_with_content_based_path_and_no_metadata",
     defer_download = False,
+    sha256 = read_config("test", "sha256"),
+    url = read_config("test", "url", ""),
 )
 
 failing_validation_with_content_based_path(
