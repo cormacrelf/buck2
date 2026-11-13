@@ -83,6 +83,10 @@ enum DevInfoError {
         "A `buck2 dev` handler returns a `DefaultInfo` with one default output, but `{0}` returned {1} default outputs"
     )]
     NotOneDefaultOutput(String, usize),
+    #[error(
+        "A `buck2 dev` handler's `DevOutput` must be an artifact, but `{0}` returned a command line"
+    )]
+    HandlerOutputNotArtifact(String),
 }
 
 /// An artifact of a `DevInfo`, an output or a sidecar, with the artifacts associated with it
@@ -109,6 +113,34 @@ impl DevArtifact {
         };
         let artifact = ValueAsInputArtifactLike::unpack_value_err(*output)?;
         DevArtifact::new(&artifact)
+    }
+
+    /// The output of a `buck2 dev` handler, `what`, with its sidecars by name: the `DevOutput`
+    /// among the providers that it returned, or else the one artifact in
+    /// `DefaultInfo.default_outputs`, without sidecars.
+    pub fn of_handler(
+        providers: &FrozenProviderCollectionValue,
+        what: &str,
+    ) -> buck2_error::Result<(DevArtifact, Vec<(String, DevArtifact)>)> {
+        let collection = providers.provider_collection();
+        let Some(output) = collection.builtin_provider::<DevOutput>()? else {
+            return Ok((Self::of_default_info(providers, what)?, Vec::new()));
+        };
+        let artifact = ValueAsInputArtifactLike::unpack_value(output.as_ref().artifact())?
+            .ok_or_else(|| DevInfoError::HandlerOutputNotArtifact(what.to_owned()))?;
+        let artifact = DevArtifact::new(&artifact)?;
+        let sidecars = DictRef::from_value(output.as_ref().sidecars()).expect("Value is a Dict");
+        let sidecars = DevInfo::outputs_iter(&sidecars)
+            .map(|x| {
+                let (k, v) = x?;
+                Ok((
+                    k.to_owned(),
+                    DevArtifact::new(&v)
+                        .with_buck_error_context(|| format!("For sidecar `{k}` of `{what}`"))?,
+                ))
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
+        Ok((artifact, sidecars))
     }
 
     fn new(artifact: &ValueAsInputArtifactLike<'_>) -> buck2_error::Result<DevArtifact> {

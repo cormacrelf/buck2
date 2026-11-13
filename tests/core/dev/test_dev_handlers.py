@@ -11,8 +11,9 @@
 # Outputs that the server defines while it runs, with the handlers of `DevInfo.handlers`. They
 # use the fixture of `test_dev`: `//app:handlers` has `site`, built from `app/main.txt`, the
 # scope `lib`, and the handlers `owner`, which builds the default output of the target that owns
-# the file `--path`, and `broken`, whose output is no artifact. Both are in `dev.bxl`. The tests
-# send `define` and `build` themselves.
+# the file `--path`, `sidecar`, which does that too and has the output of the owner of
+# `--sidecar` as its sidecar `side`, and `broken`, whose output is no artifact. They are in
+# `dev.bxl`. The tests send `define` and `build` themselves.
 
 from typing import Any, Dict, List, Tuple
 
@@ -52,6 +53,14 @@ def build(dev: DevSession, outputs: List[str]) -> None:
     dev.request({"type": "build", "outputs": outputs})
 
 
+def sidecars(output: Dict[str, Any]) -> Dict[str, Tuple[str, bool]]:
+    """The content of each sidecar of a built output, and whether it changed."""
+    return {
+        name: (sidecar["content"], sidecar["changed"])
+        for name, sidecar in output["sidecars"].items()
+    }
+
+
 def stale(buck: Buck, message: Dict[str, Any]) -> Dict[str, Tuple[List[str], List[str]]]:
     return {
         name: (entry["within"], files(buck, entry))
@@ -68,7 +77,7 @@ class DevHandlersTest(BuckTestCase):
         try:
             _, ready, _, _ = await dev.expect("started", "ready", "build", "built")
             assert ready["outputs"] == ["site"]
-            assert ready["handlers"] == ["broken", "owner"]
+            assert ready["handlers"] == ["broken", "owner", "sidecar"]
 
             define(dev, {"lib": owner("lib/lib.txt"), "part": owner("app/part.txt")})
             build(dev, ["lib", "part"])
@@ -108,6 +117,33 @@ class DevHandlersTest(BuckTestCase):
             write(buck, "app/other.txt", "other v2\n")
             (message,) = await dev.expect("stale")
             assert stale(buck, message) == {"part": ([], ["app/other.txt"])}
+        finally:
+            await dev.stop()
+
+    @dev_test()
+    async def test_dynamic_output_with_sidecars(self, buck: Buck) -> None:
+        """A handler that returns a `DevOutput` gives its output sidecars. They are built with
+        it, and a change to what one is built from makes the output stale."""
+        dev, _ = await start_manual(buck)
+        try:
+            call = {
+                "handler": "sidecar",
+                "args": ["--path", "app/part.txt", "--sidecar", "lib/lib.txt"],
+            }
+            define(dev, {"part": call})
+            build(dev, ["part"])
+            _, built = await dev.expect("build", "built")
+            assert contents(built) == {"part": "part v1\n"}
+            assert sidecars(built) == {"side": ("lib v1\n", True)}
+
+            # Only the sidecar is built from `lib/lib.txt`.
+            write(buck, "lib/lib.txt", "lib v2\n")
+            (message,) = await dev.expect("stale")
+            assert stale(buck, message) == {"part": (["lib"], ["lib/lib.txt"])}
+            build(dev, ["part"])
+            _, built = await dev.expect("build", "built")
+            assert not built["changed"]
+            assert sidecars(built) == {"side": ("lib v2\n", True)}
         finally:
             await dev.stop()
 

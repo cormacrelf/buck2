@@ -682,7 +682,7 @@ async fn build_job(
         let outputs = target.info.view().outputs()?;
         match &call {
             Some(call) => {
-                let (handler, output) = resolve_dynamic(
+                let (handler, output, sidecars) = resolve_dynamic(
                     server_ctx,
                     dice,
                     &target.subject,
@@ -695,7 +695,7 @@ async fn build_job(
                 let wanted = Wanted {
                     name: name.clone(),
                     output,
-                    sidecars: Vec::new(),
+                    sidecars,
                 };
                 buck2_error::Ok((wanted, Some(handler), slot_bit(1)))
             }

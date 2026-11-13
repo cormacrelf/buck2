@@ -475,6 +475,8 @@ them:
 Each sidecar says by itself whether it changed since the last build that the
 server got, and the `changed` of the output is about the output's own artifact.
 
+The output of a [handler](#handlers) can have sidecars in the same way.
+
 A sidecar is not an output: `ready` does not name it, and the server cannot ask
 for it. An output whose sidecar fails to build has failed. What a sidecar is
 built from counts as what the output may be built from, so a change to it makes
@@ -586,6 +588,15 @@ def _module(ctx):
 module = bxl_main(impl = _module, cli_args = {"path": cli_args.string()})
 ```
 
+To give the output [sidecars](#sidecars), the function also returns a
+`DevOutput` with them. The output is then the artifact of the `DevOutput`:
+
+```python
+    js = modules.js[ctx.cli_args.path]
+    deps = modules.deps[ctx.cli_args.path]
+    return [DefaultInfo(default_output = js), DevOutput(js, sidecars = {"deps": deps})]
+```
+
 The server defines an output with `define`, with a name that it picks, the name
 of a handler, and the function's arguments:
 
@@ -612,8 +623,8 @@ another call replaces it, and the server has not got the new one.
   of `DevInfo`. The output is then not defined, and an output of `DevInfo` of
   that name stays as it was.
 - A dynamic output fails to build, with `failed`, if the function fails, or if
-  it returns anything but one artifact in `DefaultInfo.default_outputs`. It
-  stays defined.
+  it returns neither a `DevOutput` of an artifact nor one artifact in
+  `DefaultInfo.default_outputs`. It stays defined.
 - A server that starts, or starts again, has defined no output.
 
 `buck2 dev` evaluates each call with the files as they are at each build, and

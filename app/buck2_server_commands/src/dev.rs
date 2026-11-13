@@ -1983,7 +1983,7 @@ async fn dynamic_subject(
         .with_buck_error_context(|| format!("For handler `{}`", call.handler))
 }
 
-/// The handler of a dynamic output, and what to build for it.
+/// The handler of a dynamic output, and what to build for it: the output and its sidecars.
 async fn resolve_dynamic(
     server_ctx: &dyn ServerCommandContextTrait,
     ctx: &DiceTransaction,
@@ -1992,29 +1992,29 @@ async fn resolve_dynamic(
     outputs: &BuckMutInsertionMap<String, DevOutputSpec>,
     global_cfg_options: &GlobalCfgOptions,
     call: &DevDynamicCall,
-) -> buck2_error::Result<(DevSubject, DevOutputSpec)> {
+) -> buck2_error::Result<(DevSubject, DevOutputSpec, Vec<(String, DevArtifact)>)> {
     if outputs.contains_key(&call.name) {
         return Err(DevError::DynamicNameTaken(call.name.clone()).into());
     }
     let handler =
         dynamic_subject(server_ctx, ctx, subject, info, global_cfg_options, call).await?;
-    let output = handler_output(&mut ctx.ctx(), &handler).await?;
-    Ok((handler, output))
+    let (output, sidecars) = handler_output(&mut ctx.ctx(), &handler).await?;
+    Ok((handler, output, sidecars))
 }
 
-/// The output of a handler: the one default output of the providers that it returns.
+/// The output of a handler, with its sidecars: the `DevOutput` among the providers that it
+/// returns, or else their one default output.
 async fn handler_output(
     dice: &mut DiceComputations<'_>,
     handler: &DevSubject,
-) -> buck2_error::Result<DevOutputSpec> {
+) -> buck2_error::Result<(DevOutputSpec, Vec<(String, DevArtifact)>)> {
     let providers = handler.providers(dice).await?;
     let what = match handler {
         DevSubject::Bxl { key, .. } => key.to_string(),
         DevSubject::Target(label) => label.to_string(),
     };
-    Ok(DevOutputSpec::Artifact(DevArtifact::of_default_info(
-        &providers, &what,
-    )?))
+    let (output, sidecars) = DevArtifact::of_handler(&providers, &what)?;
+    Ok((DevOutputSpec::Artifact(output), sidecars))
 }
 
 /// The `Policy` of a dynamic output `name`: an empty slot for the server, and one for the
@@ -2067,7 +2067,12 @@ impl Key for DevDynamicClaimsKey {
         let providers = self.main.providers(ctx).await?;
         let info = DevProvider::of(&providers, &self.main)?;
         let scopes: Vec<(String, Vec<String>)> = info.view().scopes().into_iter().collect();
-        let output = handler_output(ctx, &self.handler).await?;
+        let (output, sidecars) = handler_output(ctx, &self.handler).await?;
+        // What the sidecars are built from counts as what the output is built from.
+        let mut inputs = output.groups();
+        for (_, sidecar) in &sidecars {
+            inputs.extend(sidecar.groups());
+        }
         let policy = Policy {
             names: vec![String::new()],
             slots: vec![
@@ -2077,7 +2082,7 @@ impl Key for DevDynamicClaimsKey {
                 },
                 Slot {
                     what: format!("The output of {}", self.handler),
-                    inputs: output.groups(),
+                    inputs,
                 },
             ],
             scopes,

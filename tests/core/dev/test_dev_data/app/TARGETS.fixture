@@ -308,6 +308,7 @@ dev_app(
     handlers = {
         "broken": "root//dev.bxl:broken_handler",
         "owner": "root//dev.bxl:owner",
+        "sidecar": "root//dev.bxl:owner_with_sidecar",
     },
     server = "server.py",
 )

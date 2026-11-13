@@ -60,6 +60,27 @@ owner = bxl_main(
     cli_args = {"path": cli_args.string()},
 )
 
+def _owner_with_sidecar(ctx):
+    """A `buck2 dev` handler: as `owner` for `--path`, with the default output of the owner of
+    `--sidecar` as its sidecar `side`."""
+    def output_of(path):
+        owner = ctx.uquery().owner(path)
+        if len(owner) != 1:
+            fail("{} has {} owners".format(path, len(owner)))
+        providers = ctx.analysis(ctx.configured_targets(owner[0].label)).providers()
+        return providers[DefaultInfo].default_outputs[0]
+
+    out = output_of(ctx.cli_args.path)
+    return [
+        DefaultInfo(default_output = out),
+        DevOutput(out, sidecars = {"side": output_of(ctx.cli_args.sidecar)}),
+    ]
+
+owner_with_sidecar = bxl_main(
+    impl = _owner_with_sidecar,
+    cli_args = {"path": cli_args.string(), "sidecar": cli_args.string()},
+)
+
 def _broken_handler(_ctx):
     """A handler whose output is not one artifact."""
     return [DefaultInfo()]
