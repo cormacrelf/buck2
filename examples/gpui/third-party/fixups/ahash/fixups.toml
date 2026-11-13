@@ -1,0 +1,5 @@
+buildscript.run = true
+# `compile-time-rng` makes a random seed with a proc macro, so each build of ahash is different, and
+# a crate built against its metadata does not link with its rlib. Cargo.toml turns on
+# `runtime-rng` in its place.
+omit_features = ["compile-time-rng", "const-random"]

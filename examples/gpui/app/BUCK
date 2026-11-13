@@ -1,0 +1,42 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+# `buck2 dev dev.bxl:app -- --binary //app:main --lib //app:app` runs `:main`, and patches `:app`
+# into it.
+
+# The crate that `buck2 dev` patches while the app runs.
+rust_library(
+    name = "app",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    env = select({
+        "//dev:subsecond": {"SUBSECOND_LINK": "thin"},
+        "DEFAULT": {},
+    }),
+    rustc_flags = select({
+        "//dev:subsecond": ["-Clink-dead-code"],
+        "DEFAULT": [],
+    }),
+    deps = [
+        "//third-party:futures",
+        "//third-party:gpui",
+        "//third-party:serde_json",
+        "//third-party:subsecond",
+    ],
+)
+
+rust_binary(
+    name = "main",
+    srcs = ["main.rs"],
+    crate_root = "main.rs",
+    env = select({
+        "//dev:subsecond": {"SUBSECOND_LINK": "fat"},
+        "DEFAULT": {},
+    }),
+    deps = [":app"],
+)

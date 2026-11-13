@@ -1,0 +1,3 @@
+# The build script finds freetype with pkg-config, or builds it from source.
+buildscript.run = false
+rustc_flags = ["-lfreetype"]

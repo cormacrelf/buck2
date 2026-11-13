@@ -1,0 +1,28 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+# Whether a build is for hot patching. `buck2 dev dev.bxl:app` builds for `:subsecond`, and the
+# targets of `//app` select their link on it. A plain `buck2 build` builds for the default
+# platform, without it.
+constraint_setting(
+    name = "hot_patch",
+)
+
+constraint_value(
+    name = "subsecond",
+    constraint_setting = ":hot_patch",
+    visibility = ["PUBLIC"],
+)
+
+# The default platform, built for hot patching with subsecond.
+platform(
+    name = "subsecond_platform",
+    constraint_values = [":subsecond"],
+    deps = ["prelude//platforms:default"],
+    visibility = ["PUBLIC"],
+)

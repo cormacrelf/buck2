@@ -1,0 +1,12 @@
+# psm assembles its stack switching code with cc-rs. The prelude's shims for the C compiler and the
+# archiver run the tools that the C++ toolchain names, `clang` and `ar` from the PATH, with
+# os.execl, which does not search the PATH. cc-rs reads OPT_LEVEL, which Buck sets only when the
+# toolchain names one.
+[buildscript.run]
+rustc_link_lib = true
+rustc_link_search = true
+
+[buildscript.run.env]
+AR = "ar"
+CC = "clang"
+OPT_LEVEL = "2"

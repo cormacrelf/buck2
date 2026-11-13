@@ -1,0 +1,5 @@
+# gpui asks for image's default features. The app reads neither format:
+# - `avif`: its encoder is rav1e, a large crate whose build script needs Cargo's environment.
+# - `exr`: exr uses multiversion's proc macro, which iterates a HashMap into its output, so each
+#   build of exr is different, and a crate built against its metadata does not link with its rlib.
+omit_features = ["avif", "exr"]

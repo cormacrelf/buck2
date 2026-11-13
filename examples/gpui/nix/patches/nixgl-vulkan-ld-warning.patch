@@ -1,0 +1,26 @@
+Local-only: drop nixVulkanIntel's false LD_LIBRARY_PATH warning.
+
+The script does not overwrite LD_LIBRARY_PATH — it prepends its own library
+paths and preserves the inherited value:
+
+    export LD_LIBRARY_PATH=<nix libs>"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+The warning dates from a version that did overwrite. It is printed on every
+invocation, so it heads every e2e log, and it has already caused one wrong
+diagnosis (a Vulkan loader problem attributed to a clobbered library path).
+
+Applies to the mesa/Intel wrapper only; the NVIDIA wrapper has no such warning.
+Independent of nixgl-nvidia-595.patch — no shared hunks, order does not matter.
+
+--- a/nixGL.nix
++++ b/nixGL.nix
+@@ -179,9 +179,6 @@
+           + ''cat f | xargs | sed "s/ /:/g" > $out'');
+       in ''
+         #!${runtimeShell}
+-        if [ -n "$LD_LIBRARY_PATH" ]; then
+-          echo "Warning, nixVulkanIntel overwriting existing LD_LIBRARY_PATH" 1>&2
+-        fi
+         export VK_LAYER_PATH=${vulkan-validation-layers}/share/vulkan/explicit_layer.d
+         ICDS=$(cat ${icd})
+         export VK_ICD_FILENAMES=$ICDS"''${VK_ICD_FILENAMES:+:$VK_ICD_FILENAMES}"
