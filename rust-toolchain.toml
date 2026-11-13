@@ -11,3 +11,4 @@
 
 channel = "nightly-2026-08-15"
 components = ["llvm-tools-preview", "rust-src"]
+targets = ["wasm32-unknown-unknown"]

@@ -6,7 +6,13 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+load(":demo.bzl", "demo_toolchains")
+load(":toolchains.bzl", "cxx_toolchain", "rust_toolchain")
 
-# The prelude refers to a `toolchains` cell. This example's rules use none of them.
-system_demo_toolchains()
+demo_toolchains()
+
+# A Rust target is built for the configuration's cpu and os, wasm32 for the browser: see
+# toolchains.bzl.
+rust_toolchain()
+
+cxx_toolchain()

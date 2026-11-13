@@ -1,0 +1,9 @@
+# Shaded relief for the Terrain page. An ordinary binary: `-m browser` (or a transition to the
+# browser) builds it for wasm32, as a module whose exports JavaScript calls; otherwise it is
+# built for the host.
+rust_binary(
+    name = "hillshade",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    visibility = ["PUBLIC"],
+)
