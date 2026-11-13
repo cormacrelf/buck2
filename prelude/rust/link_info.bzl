@@ -172,6 +172,24 @@ RustProcMacroInfo = provider(
     },
 )
 
+# A library's `-Zno-codegen` rlib, which its dependents compile against, and
+# the rlib built with codegen, which they link.
+RustCrateHashPair = record(
+    label = field(str),
+    hollow = field(Artifact),
+    codegen = field(Artifact),
+)
+
+def _project_crate_hash_pair_args(pair: RustCrateHashPair) -> cmd_args:
+    return cmd_args("--pair", pair.label, pair.hollow, pair.codegen)
+
+# Set of RustCrateHashPair.
+RustCrateHashPairs = transitive_set(
+    args_projections = {
+        "pairs": _project_crate_hash_pair_args,
+    },
+)
+
 # Information which is keyed on link_style
 RustLinkStrategyInfo = record(
     # Path to the rlib, rmeta, dylib, etc.
@@ -189,6 +207,10 @@ RustLinkStrategyInfo = record(
     # In the `advanced_unstable_linking` case, this is left empty; split debug info is just
     # tracked in the native link providers like it usually would be.
     rust_debug_info = ArtifactTSet | None,
+    # The crate hash pairs of this library and its transitive Rust deps, for
+    # the `rust_crate_hash` validation of the binaries that link them. None
+    # when nothing in the graph is pipelined.
+    crate_hash_pairs = field(RustCrateHashPairs | None, None),
 )
 
 # Set of list[(ConfiguredTargetLabel, MergedLinkInfo)]
@@ -705,6 +727,43 @@ def dfs_dedupe_by_label(tset: TransitiveSet) -> list[typing.Any]:
                 )
             entries[label] = value
     return entries.values()
+
+# Checks that each pipelined Rust library a binary links records the same crate
+# hash in the rlib its dependents compiled against as in the one being linked.
+# It is an optional validation, run only when requested with
+# `--enable-optional-validations rust_crate_hash`, and it reads only the rlibs
+# of the link strategy that this binary uses, which its build produces anyway.
+def crate_hash_validation(
+    actions: AnalysisActions,
+    internal_tools_info: RustInternalToolsInfo,
+    toolchain_info: RustToolchainInfo,
+    deps: list[RustDependency],
+    dep_link_strategy: LinkStrategy,
+) -> ValidationInfo | None:
+    children = []
+    for dep in deps:
+        if isinstance(dep.info, RustProcMacroInfo):
+            continue
+        pairs = strategy_info(toolchain_info, dep.info, dep_link_strategy).crate_hash_pairs
+        if pairs != None:
+            children.append(pairs)
+    if not children:
+        return None
+
+    pairs = actions.tset(RustCrateHashPairs, children = children).project_as_args("pairs")
+    argsfile = actions.write("crate_hash_validation.args", pairs)
+    result = actions.declare_output("crate_hash_validation.json")
+    actions.run(
+        cmd_args(
+            internal_tools_info.crate_hash_check,
+            cmd_args(result.as_output(), format = "--out={}"),
+            cmd_args(argsfile, format = "@{}", hidden = pairs),
+        ),
+        category = "rust_crate_hash",
+    )
+    return ValidationInfo(validations = [
+        ValidationSpec(name = "rust_crate_hash", validation_result = result, optional = True),
+    ])
 
 def run_action_shlib_symlink_tree(
     actions: AnalysisActions,

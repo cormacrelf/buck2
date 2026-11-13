@@ -126,10 +126,12 @@ load(
     ":link_info.bzl",
     "DEFAULT_STATIC_LINK_STRATEGY",
     "attr_simple_crate_for_filenames",
+    "crate_hash_validation",
     "inherited_external_debug_info",
     "inherited_linkable_graphs",
     "inherited_rust_cxx_link_group_info",
     "inherited_shared_libs",
+    "resolve_rust_deps",
 )
 load(":named_deps.bzl", "write_named_deps_names")
 load(":outputs.bzl", "RustcExtraOutputsInfo", "output_as_diag_subtargets")
@@ -982,6 +984,15 @@ def _rust_binary_common(
             default_roots = default_roots,
         )
     )
+    validation = crate_hash_validation(
+        actions = ctx.actions,
+        internal_tools_info = compile_ctx.internal_tools_info,
+        toolchain_info = toolchain_info,
+        deps = resolve_rust_deps(ctx, compile_ctx.dep_ctx),
+        dep_link_strategy = params.dep_link_strategy,
+    )
+    if validation != None:
+        providers.append(validation)
     return NativeBinary(
         providers = providers,
         default_info = default_info,

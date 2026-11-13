@@ -113,6 +113,8 @@ load(
     ":link_info.bzl",
     "DEFAULT_STATIC_LIB_OUTPUT_STYLE",
     "DEFAULT_STATIC_LINK_STRATEGY",
+    "RustCrateHashPair",
+    "RustCrateHashPairs",
     "RustExportedLinkDeps",  # @unused Used as a type
     "RustLinkInfo",
     "RustLinkStrategyInfo",
@@ -210,6 +212,7 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
     param_metadata_outputs = {}
     param_output = {}
     param_subtargets = {}
+    param_crate_hash_pair = {}
     for params, langs in param_lang.items():
         link = rust_compile(
             ctx = ctx,
@@ -248,6 +251,12 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
                     default_roots = _DEFAULT_ROOTS,
                     incremental_enabled = ctx.attrs.incremental_enabled,
                 )
+                if params.crate_type == CrateType("rlib"):
+                    param_crate_hash_pair[params] = RustCrateHashPair(
+                        label = str(ctx.label.raw_target()),
+                        hollow = metadata_full.product.output,
+                        codegen = link.product.output,
+                    )
             else:
                 # Pipelining requires the unstable `-Zno-codegen`; dependents
                 # wait for the real rlib instead.
@@ -532,6 +541,7 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
             compile_ctx = compile_ctx,
             lang_style_param = lang_style_param,
             param_metadata_outputs = param_metadata_outputs,
+            param_crate_hash_pair = param_crate_hash_pair,
         )
         if toolchain_info.advanced_unstable_linking:
             providers += _advanced_unstable_link_providers(
@@ -731,6 +741,7 @@ def _rust_artifacts(
     compile_ctx: CompileContext,
     lang_style_param: dict[(LinkageLang, LibOutputStyle), BuildParams],
     param_metadata_outputs: dict[BuildParams, dict[MetadataKind, RustcOutput]],
+    param_crate_hash_pair: dict[BuildParams, RustCrateHashPair],
 ) -> dict[LinkStrategy, RustLinkStrategyInfo]:
     pic_behavior = compile_ctx.cxx_toolchain_info.pic_behavior
     preferred_linkage = Linkage(ctx.attrs.preferred_linkage)
@@ -752,18 +763,29 @@ def _rust_artifacts(
         if miri_output != None:
             outputs = dict(outputs)
             outputs[MetadataKind("miri")] = miri_output
-        rust_artifacts[link_strategy] = _handle_rust_artifact(ctx, compile_ctx.dep_ctx, link_strategy, outputs)
+        rust_artifacts[link_strategy] = _handle_rust_artifact(ctx, compile_ctx.dep_ctx, link_strategy, outputs, param_crate_hash_pair.get(params))
     return rust_artifacts
 
 def _handle_rust_artifact(
-    ctx: AnalysisContext, dep_ctx: DepCollectionContext, link_strategy: LinkStrategy, outputs: dict[MetadataKind, RustcOutput]
+    ctx: AnalysisContext,
+    dep_ctx: DepCollectionContext,
+    link_strategy: LinkStrategy,
+    outputs: dict[MetadataKind, RustcOutput],
+    crate_hash_pair: RustCrateHashPair | None,
 ) -> RustLinkStrategyInfo:
     """
     Return the RustLinkStrategyInfo for a given set of artifacts. The main consideration
     is computing the right set of dependencies.
     """
     link_output = outputs[MetadataKind("link")]
-    tdeps, rust_debug_info, tprocmacrodeps = _compute_transitive_deps(ctx, dep_ctx, link_strategy)
+    tdeps, rust_debug_info, tprocmacrodeps, dep_crate_hash_pairs = _compute_transitive_deps(ctx, dep_ctx, link_strategy)
+
+    if crate_hash_pair != None:
+        crate_hash_pairs = ctx.actions.tset(RustCrateHashPairs, value = crate_hash_pair, children = dep_crate_hash_pairs)
+    elif dep_crate_hash_pairs:
+        crate_hash_pairs = ctx.actions.tset(RustCrateHashPairs, children = dep_crate_hash_pairs)
+    else:
+        crate_hash_pairs = None
 
     toolchain_info = ctx.attrs._rust_toolchain[RustToolchainInfo]
     if toolchain_info.advanced_unstable_linking:
@@ -781,6 +803,7 @@ def _handle_rust_artifact(
         transitive_deps = tdeps,
         transitive_proc_macro_deps = tprocmacrodeps,
         rust_debug_info = rust_debug_info,
+        crate_hash_pairs = crate_hash_pairs,
     )
 
 def _default_providers(
@@ -1237,11 +1260,13 @@ def _compute_transitive_deps(
     dict[MetadataKind, TransitiveDeps],
     list[ArtifactTSet],
     set[TargetLabel],
+    list[RustCrateHashPairs],
 ):
     toolchain_info = ctx.attrs._rust_toolchain[RustToolchainInfo]
     transitive_deps = {m: [] for m in MetadataKind}
     rust_debug_info = []
     transitive_proc_macro_deps = set()
+    crate_hash_pairs = []
 
     for dep in resolve_rust_deps(ctx, dep_ctx):
         if isinstance(dep.info, RustProcMacroInfo):
@@ -1262,9 +1287,12 @@ def _compute_transitive_deps(
 
         transitive_proc_macro_deps.update(strategy.transitive_proc_macro_deps)
 
+        if strategy.crate_hash_pairs != None:
+            crate_hash_pairs.append(strategy.crate_hash_pairs)
+
     transitive_deps = {m: ctx.actions.tset(TransitiveDeps, children = children) for m, children in transitive_deps.items()}
 
-    return transitive_deps, rust_debug_info, transitive_proc_macro_deps
+    return transitive_deps, rust_debug_info, transitive_proc_macro_deps, crate_hash_pairs
 
 def rust_library_macro_wrapper(rust_library: typing.Callable) -> typing.Callable:
     def wrapper(**kwargs):

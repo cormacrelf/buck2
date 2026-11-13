@@ -116,6 +116,13 @@ prelude.python_bootstrap_binary(
     visibility = ["PUBLIC"],
 )
 
+prelude.python_bootstrap_binary(
+    name = "crate_hash_check",
+    has_content_based_path = True,
+    main = "crate_hash_check.py",
+    visibility = ["PUBLIC"],
+)
+
 prelude.export_file(
     name = "linkable_symbol.rs",
     has_content_based_path = True,
@@ -144,6 +151,7 @@ prelude.python_library(
     srcs = [
         "buildscript_run.py",
         "cd_run.py",
+        "crate_hash_check.py",
         "extract_link_action.py",
         "failure_filter_action.py",
         "redirect_stdout.py",
@@ -190,6 +198,15 @@ prelude.python_test(
     srcs = [
         "shared_libraries_symlink_tree.py",
         "tests/test_shared_libraries_symlink_tree.py",
+    ],
+    base_module = "",
+)
+
+prelude.python_test(
+    name = "test_crate_hash_check",
+    srcs = [
+        "crate_hash_check.py",
+        "tests/test_crate_hash_check.py",
     ],
     base_module = "",
 )
