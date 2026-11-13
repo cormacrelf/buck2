@@ -57,7 +57,7 @@ const MIME = {
   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
   ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif", ".ico": "image/x-icon",
   ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf", ".txt": "text/plain",
-  ".md": "text/markdown",
+  ".md": "text/markdown", ".wasm": "application/wasm",
 };
 
 export function extname(p) {
@@ -182,7 +182,7 @@ class Module {
       if (hosted != null) return this.compileScript(hosted, "js");
     }
     if (q === "worker") return this.compileWorker();
-    if (q === "url") return `export default ${JSON.stringify(JS_EXTS.includes(this.ext) ? keyUrl(this.path) : "/" + this.path)};\n`;
+    if (q === "url") return `export default ${JSON.stringify(this.url())};\n`;
     if (q === "raw" && !CSS_EXTS.includes(this.ext)) return this.compileAsset();
     if (q && !["inline", "raw"].includes(q)) this.fail(`no plugin or built-in handles the query "${q}"`);
     const source = () => fs.readFileSync(this.args.src, "utf8");
@@ -190,6 +190,16 @@ class Module {
     if (CSS_EXTS.includes(this.ext)) return this.compileStyle(source());
     if (this.ext === ".json") return this.compileJson(source());
     return this.compileAsset();
+  }
+
+  // The URL that serves the file. Vite serves a source from the project, as it is; a file that
+  // a build makes is served from buck2 by the dev server, at `/@asset/<path>`, with its digest
+  // in the URL, so that this module changes, and the page updates, when it does.
+  url() {
+    if (JS_EXTS.includes(this.ext)) return keyUrl(this.path);
+    if (path.normalize(this.args.src) === this.path) return "/" + this.path;
+    const version = createHash("sha256").update(fs.readFileSync(this.args.src)).digest("hex").slice(0, 12);
+    return `/@asset/${this.path}?v=${version}`;
   }
 
   // --- Resolution -----------------------------------------------------------------------

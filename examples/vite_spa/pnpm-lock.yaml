@@ -37,6 +37,9 @@ importers:
       '@fieldnotes/geo':
         specifier: workspace:^
         version: link:../../packages/geo
+      '@fieldnotes/hillshade':
+        specifier: workspace:^
+        version: link:../../packages/hillshade
       '@fieldnotes/taxa':
         specifier: workspace:^
         version: link:../../packages/taxa
@@ -122,6 +125,15 @@ importers:
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
+
+  packages/hillshade:
+    devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vite:
+        specifier: 'catalog:'
+        version: 8.3.8(@types/node@26.6.6)(esbuild@0.28.2)(jiti@2.7.0)(sass@1.108.2)
 
   packages/taxa:
     devDependencies:

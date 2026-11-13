@@ -1,8 +1,23 @@
-# Shaded relief for the Terrain page. An ordinary binary: `-m browser` (or a transition to the
-# browser) builds it for wasm32, as a module whose exports JavaScript calls; otherwise it is
-# built for the host.
+load("//apps/web:vite.bzl", "STYLE")
+load("//vite:defs.bzl", "vite_package")
+
+# The package the app imports: TypeScript that loads `:shade`'s wasm module.
+vite_package(
+    srcs = glob(
+        ["src/**/*.ts"],
+        exclude = ["src/generated/**"],
+    ),
+    exports = {".": "src/index.ts"},
+    # Built for the browser, as this package is: wasm32.
+    generated = {"src/generated/shade.wasm": ":shade"},
+    **STYLE
+)
+
+# Shaded relief for the Terrain page. An ordinary binary: for the browser (`-m browser`, or as a
+# dependency of the package above) it is built for wasm32, as a module whose exports JavaScript
+# calls; otherwise it is built for the host.
 rust_binary(
-    name = "hillshade",
+    name = "shade",
     srcs = ["src/main.rs"],
     edition = "2024",
     visibility = ["PUBLIC"],

@@ -32,6 +32,7 @@
   "terrain.waiting": "Das Gelände wird bei Bedarf in einer buck2-Aktion gebaut… {seconds} s",
   "terrain.highest": "Höchster Punkt",
   "terrain.land": "Über dem Meeresspiegel",
+  "terrain.relief": "Schummerung",
   "species.title": "Artenliste",
   "species.search": "Nach Namen suchen",
   "species.favourites": "Nur markierte",

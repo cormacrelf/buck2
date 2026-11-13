@@ -39,6 +39,7 @@ const root = process.cwd();
 // The React refresh runtime of @vitejs/plugin-react, beside its `dist/index.js`.
 const refreshRuntime = fs.readFileSync(new URL("refresh-runtime.js", import.meta.resolve("@vitejs/plugin-react")), "utf8");
 const JS_EXTS = [".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs"];
+const ASSET_TYPES = { ".wasm": "application/wasm", ".json": "application/json", ".txt": "text/plain" };
 const IMAGE_TYPES = {
   avif: "image/avif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
   gif: "image/gif", tiff: "image/tiff",
@@ -415,6 +416,22 @@ window.$RefreshSig$ = () => (type) => type;`,
         try {
           const out = await readOutput([`img:${file}/${width}w${quality ? "-q" + quality : ""}.${format}`, { handler: "image", args }]);
           res.setHeader("Content-Type", IMAGE_TYPES[format] ?? "application/octet-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          fs.createReadStream(out).pipe(res);
+        } catch (e) {
+          next(e);
+        }
+      });
+      // Files that builds make, imported with `?url`: `/@asset/<path>?v=<digest>` (see `url` in
+      // vite/tools/transform.mjs), each built when the browser asks for it, by the handler
+      // `asset`. A Rust crate's wasm module is one.
+      s.middlewares.use(async (req, res, next) => {
+        const url = req.url.split("?")[0];
+        if (!url.startsWith("/@asset/")) return next();
+        const file = decodeURIComponent(url.slice("/@asset/".length));
+        try {
+          const out = await readOutput([`asset:${file}`, { handler: "asset", args: ["--path", file] }]);
+          res.setHeader("Content-Type", ASSET_TYPES[extname(file)] ?? "application/octet-stream");
           res.setHeader("Cache-Control", "no-cache");
           fs.createReadStream(out).pipe(res);
         } catch (e) {

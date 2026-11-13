@@ -32,6 +32,7 @@
   "terrain.waiting": "Lazily building the terrain in a buck2 action… {seconds}s",
   "terrain.highest": "Highest point",
   "terrain.land": "Above sea level",
+  "terrain.relief": "Shaded relief",
   "species.title": "Species checklist",
   "species.search": "Search by name",
   "species.favourites": "Starred only",

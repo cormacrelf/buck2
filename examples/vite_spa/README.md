@@ -21,6 +21,7 @@ packages/ui/            React components, consumed as TypeScript source
 packages/geo/           GPX parsing and distance maths, compiled with tsc to dist/
 packages/taxa/          species list; TypeScript generated from taxa.json
 packages/terrain/       heightmap for the Terrain page; TypeScript generated from terrain.json
+packages/hillshade/     shaded relief for the Terrain page: a Rust binary, built to wasm for the browser
 ```
 
 ## Running it
@@ -169,6 +170,31 @@ after that:
   it draws with. Nothing waits for any of it until the browser opens that page, and the page
   shows how long it waited. A second visit is instant. Change `seed` in `terrain.json` to wait
   again, as an HMR update.
+- **`packages/hillshade`** is a plain `rust_binary` that the page loads as a wasm module, a
+  generated source of the package, imported with `?url`. Change `AZIMUTH` in its `src/main.rs`
+  and the relief is drawn again, lit from there, in about half a second. Its wasm32 std comes
+  from the dev shell's rustc (`rust-toolchain.toml` lists the target).
+
+### Configurations
+
+There is no target platform; configurations come from modifiers (root `PACKAGE`). A target is
+built for the machine that runs buck2, unless something says otherwise:
+
+- The browser is wasm32 with no OS (`BROWSER` in `platforms/defs.bzl`, `-m browser`). JavaScript
+  and CSS are the same for any configuration; a wasm module is built for this one.
+- Every `vite_package` and `//:esm` has `BROWSER` as its `modifiers`, so a direct
+  `buck2 build //apps/web:web` builds for the browser, and so does a Rust crate the app depends
+  on. The toolchains `select` on cpu and os: wasm32 gives `wasm32-unknown-unknown`, linked by
+  `wasm-ld` through the C++ toolchain.
+- `//apps/web:dev`, a `vite_dev_server`, is built for the machine the server runs on. It reaches
+  the app and `//:esm` through `//platforms:browser`, a transition that gives the same
+  configuration as the modifiers.
+- The tools that the actions run (`vite/tools`, the app's Vite plugins, rustc, wasm-ld) are
+  exec deps, configured for the execution platform, wherever the actions run.
+- npm's store is configured per platform, as it leaves out the native packages of others, but
+  its outputs have content-based paths, and its tarballs are downloaded in one configuration
+  (`prelude//nodejs:unconfigured`). A package the browser and a build tool both use is
+  downloaded and extracted once.
 
 The app's own plugins run unmodified. Their build hooks run inside the actions: `markdown`
 for `.md` and `photo` for `.jpg`, as listed in `apps/web/BUCK`. Their server hooks run in

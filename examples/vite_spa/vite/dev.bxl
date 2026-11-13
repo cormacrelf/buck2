@@ -24,6 +24,7 @@ def _dev(ctx):
             server = info.server,
             outputs = {"index": info.app.html},
             handlers = {
+                "asset": "root//vite/dev.bxl:asset",
                 "image": "root//vite/dev.bxl:image",
                 "module": "root//vite/dev.bxl:module",
                 "npm": "root//vite/dev.bxl:npm",
@@ -178,6 +179,17 @@ image = bxl_main(
         "width": cli_args.string(),
     },
 )
+
+def _asset(ctx):
+    """A `buck2 dev` handler: the file at `--path`, a source of a `vite_library` that a target
+    generates, such as a wasm module, for the dev server to serve as it is."""
+    path = ctx.cli_args.path
+    for info in _libraries(ctx, path):
+        if path in info.srcs:
+            return [DefaultInfo(default_output = info.srcs[path])]
+    fail("no `vite_library` in //{} has the source `{}`".format(_package_of(ctx, path), path))
+
+asset = bxl_main(impl = _asset, cli_args = {"path": cli_args.string()})
 
 def _npm(ctx):
     """A `buck2 dev` handler: the pre-bundled ES modules of the npm store entry `--entry`."""

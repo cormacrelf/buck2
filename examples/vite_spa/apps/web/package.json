@@ -15,6 +15,7 @@
   ],
   "dependencies": {
     "@fieldnotes/geo": "workspace:^",
+    "@fieldnotes/hillshade": "workspace:^",
     "@fieldnotes/taxa": "workspace:^",
     "@fieldnotes/terrain": "workspace:^",
     "@fieldnotes/ui": "workspace:^",
