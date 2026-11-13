@@ -1,0 +1,12 @@
+load("@prelude//utils:source_listing.bzl", "source_listing")
+load(":nodejs_npm_store.bzl", "unconfigured_transition")
+
+oncall("build_infra")
+
+source_listing()
+
+# For targets whose outputs are the same in every configuration, such as `nodejs_npm_tarballs`.
+unconfigured_transition(
+    name = "unconfigured",
+    visibility = ["PUBLIC"],
+)

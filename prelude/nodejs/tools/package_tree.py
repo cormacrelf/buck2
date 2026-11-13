@@ -15,8 +15,9 @@ package_tree.py archive --src DIR --format FORMAT --out FILE [--root ROOT] [--ex
 package_tree.py compress --src FILE --out OUT [--sha256 FILE] --zstd ZSTD...
 package_tree.py manifest --tree DIR --out FILE
 package_tree.py strip-types --src DIR --out DIR
-package_tree.py npm-entry --tarball FILE --name NAME --links FILE --out DIR [--patch FILE --patch-hash HASH]
-    [--build --node NODE [--node-gyp DIR]]
+package_tree.py npm-entry --out DIR [--node NODE [--node-gyp DIR]]
+    (--entry SUBDIR --tarball FILE --name NAME [--patch FILE --patch-hash HASH] [--build]
+     [--link ALIAS=DIR]... [--sibling ALIAS=TARGET]...)...
 package_tree.py npm-bins --out DIR [--package ALIAS=DIR]... [--windows]
 package_tree.py localize --src DIR --out DIR
 package_tree.py validate-package --package DIR --name NAME [--dir-name NAME] [--main PATH] [--bin NAME:PATH]... [--type TYPE] [--version VERSION]
@@ -28,6 +29,13 @@ and `name` describes the entry in error messages.
 
 `validate-package` writes a Buck2 validation result: a failure lists every
 problem with the package's `package.json`.
+
+`npm-entry` extracts each `--entry` group's package into `DIR/SUBDIR` (`.` for `DIR`
+itself), with each `--link` a relative symlink to another entry's package directory,
+wherever that is, and each `--sibling` a symlink with the given relative target, to an
+entry of the same `DIR`. The packages of a dependency cycle are entries of one `DIR`, so
+that they can link to each other. Those with `--build` then run their install scripts,
+in order, with `--node`.
 """
 
 from __future__ import annotations
@@ -1572,12 +1580,56 @@ def localize(src: Path, out: Path) -> None:
             shutil.copy2(root, target)
 
 
+def _npm_entry_member_parser() -> argparse.ArgumentParser:
+    member = argparse.ArgumentParser(prog="npm-entry --entry", add_help=False)
+    member.add_argument("--tarball", type=_path, required=True)
+    member.add_argument("--name", required=True)
+    member.add_argument("--patch", type=_path)
+    member.add_argument("--patch-hash")
+    member.add_argument("--build", action="store_true")
+    member.add_argument("--link", type=_alias_dir, action="append", default=[])
+    member.add_argument("--sibling", type=_alias_dir, action="append", default=[])
+    return member
+
+
 def _run_npm_entry(args: argparse.Namespace) -> int:
-    with open(args.links) as f:
-        links = json.load(f)
-    if args.build != (args.node is not None):
-        raise ValueError("--build and --node go together")
-    npm_entry(args.tarball, args.name, links, args.out, args.patch, args.patch_hash, args.node, args.node_gyp)
+    groups: list[list[str]] = []
+    for arg in ["--entry"] + (args.entries or []) if args.entries is not None else []:
+        if arg == "--entry":
+            groups.append([])
+        elif not groups:
+            raise ValueError(f"npm-entry: {arg!r} before the first --entry")
+        else:
+            groups[-1].append(arg)
+    if not groups:
+        raise ValueError("npm-entry: no --entry")
+    parser = _npm_entry_member_parser()
+    members = []
+    for group in groups:
+        if not group:
+            raise ValueError("npm-entry: --entry needs a SUBDIR")
+        member = parser.parse_args(group[1:])
+        member.out = args.out / group[0]
+        members.append(member)
+    if any(m.build for m in members) and args.node is None:
+        raise ValueError("--build needs --node")
+    # Packages without install scripts first, so that those with them see their whole cycle.
+    for member in sorted(members, key=lambda m: m.build):
+        links = []
+        for alias, directory in member.link:
+            parent = member.out.joinpath("node_modules", *alias.split("/")).parent
+            links.append([alias, os.path.relpath(directory, parent)])
+        links += [[alias, str(target)] for alias, target in member.sibling]
+        npm_entry(
+            member.tarball,
+            member.name,
+            links,
+            member.out,
+            member.patch,
+            member.patch_hash,
+            args.node if member.build else None,
+            args.node_gyp,
+        )
     return 0
 
 
@@ -1653,15 +1705,11 @@ def _parser() -> argparse.ArgumentParser:
         errors=(ValueError, OSError, subprocess.CalledProcessError),
     )
     entry = commands.add_parser("npm-entry")
-    entry.add_argument("--tarball", type=_path, required=True)
-    entry.add_argument("--name", required=True)
-    entry.add_argument("--links", type=_path, required=True)
     entry.add_argument("--out", type=_path, required=True)
-    entry.add_argument("--patch", type=_path)
-    entry.add_argument("--patch-hash")
-    entry.add_argument("--build", action="store_true")
     entry.add_argument("--node")
     entry.add_argument("--node-gyp", type=_path)
+    # Everything from the first `--entry` on: the groups that `_npm_entry_member_parser` parses.
+    entry.add_argument("--entry", dest="entries", nargs=argparse.REMAINDER, default=None)
     entry.set_defaults(run=_run_npm_entry, errors=(ValueError, OSError, RuntimeError, tarfile.TarError))
     bins = commands.add_parser("npm-bins")
     bins.add_argument("--out", type=_path, required=True)

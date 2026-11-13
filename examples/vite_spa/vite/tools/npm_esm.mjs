@@ -42,10 +42,10 @@ for (const name of fs.readdirSync(modulesDir)) {
   const names = name.startsWith("@") ? fs.readdirSync(path.join(modulesDir, name)).map((n) => `${name}/${n}`) : [name];
   for (const n of names) {
     if (n === pkg.name) continue;
+    // A link to the dependency's package in its own entry: `.../<entry>/node_modules/<name>`.
     const link = fs.readlinkSync(path.join(modulesDir, n));
-    // `../../<entry>/node_modules/<name>`, one more `..` for a scoped name.
-    const m = /(?:\.\.\/)+([^/]+)\/node_modules\//.exec(link);
-    if (m) deps.set(n, m[1]);
+    const suffix = `/node_modules/${n}`;
+    if (link.endsWith(suffix)) deps.set(n, path.basename(link.slice(0, -suffix.length)));
   }
 }
 const depUrl = (spec) => {

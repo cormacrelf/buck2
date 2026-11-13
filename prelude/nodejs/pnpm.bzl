@@ -72,6 +72,9 @@ _CPU_SETTINGS = {
     "arm64": "prelude//cpu:arm64",
     "ia32": "prelude//cpu:x86_32",
     "riscv64": "prelude//cpu:riscv64",
+    # A browser, or another runtime of WebAssembly: what packages with a wasm build of their
+    # native code, such as `@img/sharp-wasm32`, are for.
+    "wasm32": "prelude//cpu:wasm32",
     "x64": "prelude//cpu:x86_64",
 }
 
@@ -242,7 +245,7 @@ def pnpm_workspace(
         cpu_settings: dict[str, str] = _CPU_SETTINGS,
         visibility: list[str] = ["PUBLIC"]):
     """Defines a `nodejs_npm_store` named `name` with the npm packages of the lockfile `lock`,
-    and a `nodejs_npm_links` named `<name>/<path>` with the npm dependencies of each importer at
+    their `nodejs_npm_tarballs` as `<name>_tarballs`, and a `nodejs_npm_links` named `<name>/<path>` with the npm dependencies of each importer at
     `path` that has any (`<name>/_` for the workspace root).
 
     `workspace` is the loaded `pnpm-workspace.yaml` and `root_package` the loaded root
@@ -310,9 +313,17 @@ def pnpm_workspace(
     root = importers.get(".")
     node_gyp_snapshot = root.npm.get(node_gyp) if root != None else None
 
+    # The tarballs are the same on every platform, so they are downloaded in one configuration,
+    # whatever the configurations of the stores.
+    _rules["nodejs_npm_tarballs"](
+        name = name + "_tarballs",
+        packages = store_packages,
+        incoming_transition = "prelude//nodejs:unconfigured",
+        visibility = visibility,
+    )
     _rules["nodejs_npm_store"](
         name = name,
-        packages = store_packages,
+        tarballs = ":" + name + "_tarballs",
         snapshot_packages = snapshot_packages,
         snapshots = snapshot_deps,
         exclude = excluded + _platform_excludes(packages, os_settings, "os") + _platform_excludes(packages, cpu_settings, "cpu"),

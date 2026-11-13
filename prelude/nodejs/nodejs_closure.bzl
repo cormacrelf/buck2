@@ -227,7 +227,7 @@ def npm_bins_dir(actions: AnalysisActions, package_tree_tool: RunInfo, name: str
     `node_modules/.bin/.default/<alias>` for the bin each package runs when named alone. Its
     symlinks lead out of it by relative path, so it works where it is, on PATH or linked in as
     another tree's `node_modules/.bin`, with the entries of `packages` as inputs."""
-    out = actions.declare_output(name, dir = True, has_content_based_path = False)
+    out = actions.declare_output(name, dir = True)
     cmd = cmd_args(package_tree_tool, "npm-bins", "--out", out.as_output())
     for alias in sorted(packages):
         cmd.add("--package", cmd_args(alias, packages[alias], delimiter = "="))

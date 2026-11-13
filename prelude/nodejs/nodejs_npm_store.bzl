@@ -27,6 +27,11 @@ NodejsNpmStoreInfo = provider(
     },
 )
 
+NodejsNpmTarballsInfo = provider(
+    doc = "The tarballs of a `nodejs_npm_tarballs`, by package key, such as `react@19.1.1`.",
+    fields = {"tarballs": provider_field(dict[str, Artifact])},
+)
+
 def npm_store_name(snapshot: str) -> str:
     """The directory name of a snapshot's entry in the store: pnpm's encoding, roughly."""
     name = snapshot.replace("/", "+").replace("(", "_").replace(")", "").replace(":", "+")
@@ -94,88 +99,115 @@ def strongly_connected_components(nodes: list[str], edges: dict[str, list[str]])
                 components.append(component)
     return components
 
-def _entry_action(
-        ctx: AnalysisContext,
+def _member_args(
         snapshot: str,
+        subdir: str,
         tarball: Artifact,
         name: str,
-        links: list,
-        entry: Artifact,
+        links: list[(str, str)],
+        component: dict[str, bool],
+        entries: dict[str, Artifact],
+        names: dict[str, str],
         patch: (Artifact, str) | None,
-        build: cmd_args | None) -> None:
-    links_file = ctx.actions.write_json("links/" + npm_store_name(snapshot) + ".json", links, has_content_based_path = False)
-    cmd = cmd_args(
-        ctx.attrs._package_tree_tool[RunInfo],
-        "npm-entry",
-        "--tarball",
-        tarball,
-        "--name",
-        name,
-        "--links",
-        links_file,
-        "--out",
-        entry.as_output(),
-    )
+        build: bool) -> cmd_args:
+    """The `--entry` group of `npm-entry` for `snapshot`, extracted into `subdir` of its
+    component's output. A dependency in another component is linked by its entry's path, which
+    is an input, so the link is right wherever the content-based paths put the two; one in the
+    same component, a dependency cycle, is a sibling in the same output."""
+    args = cmd_args("--entry", subdir, "--tarball", tarball, "--name", name)
     if patch != None:
-        cmd.add("--patch", patch[0], "--patch-hash", patch[1])
-    if build != None:
-        cmd.add(build)
-    ctx.actions.run(
-        cmd,
-        category = "npm_entry" if build == None else "npm_install_scripts",
-        identifier = snapshot,
-        local_only = build != None and ctx.attrs.build_local_only,
-    )
+        args.add("--patch", patch[0], "--patch-hash", patch[1])
+    if build:
+        args.add("--build")
+    for alias, dep in links:
+        if dep in component:
+            args.add("--sibling", alias + "=" + _link_target(alias, dep, names[dep]))
+        else:
+            args.add("--link", cmd_args(alias, entries[dep].project("node_modules/" + names[dep]), delimiter = "="))
+    return args
 
 def _script_args(
         ctx: AnalysisContext,
         toolchain: NodejsToolchainInfo,
-        snapshot: str,
         component: list[str],
         below: list[NodejsInputsTSet],
-        build: dict[str, bool],
         entries: dict[str, Artifact],
         names: dict[str, str],
         node_gyp: str | None,
         component_of: dict[str, int],
         tsets: list[NodejsInputsTSet]) -> cmd_args:
-    """The arguments of `npm-entry` that run the install scripts of `snapshot`, with the entries
-    its links lead to as inputs: the closures below its component, and the entries of the other
-    members of its component that run no install scripts (a package in a dependency cycle with
-    another that runs them does not see it while its own run)."""
+    """The arguments of `npm-entry` that run install scripts in a component, with the entries its
+    links lead to as inputs: the closures below the component, and node-gyp's."""
     if toolchain.node_exec == None:
-        fail("{}: `{}` runs install scripts, which need `node_exec` on the nodejs toolchain".format(ctx.label, snapshot))
-    args = cmd_args("--build", "--node", toolchain.node_exec)
+        fail("{}: `{}` runs install scripts, which need `node_exec` on the nodejs toolchain".format(ctx.label, sorted(component)[0]))
+    args = cmd_args("--node", toolchain.node_exec)
     children = list(below)
     if node_gyp != None and node_gyp in component_of:
         children.append(tsets[component_of[node_gyp]])
         args.add("--node-gyp", entries[node_gyp].project("node_modules/" + names[node_gyp]))
-    value = [entries[s] for s in sorted(component) if s not in build]
-    kwargs = {"children": children} if children else {}
-    if value:
-        kwargs["value"] = value
-    args.add(cmd_args(hidden = ctx.actions.tset(NodejsInputsTSet, **kwargs).project_as_args("inputs")))
+    if children:
+        args.add(cmd_args(hidden = ctx.actions.tset(NodejsInputsTSet, children = children).project_as_args("inputs")))
     return args
 
-def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
-    excluded = {p: True for p in ctx.attrs.exclude}
+def _nodejs_npm_tarballs_impl(ctx: AnalysisContext) -> list[Provider]:
     tarballs = {}
     for package, (url, sri) in ctx.attrs.packages.items():
-        if package in excluded:
-            continue
         tarballs[package] = ctx.actions.download_file(
-            "tarballs/" + npm_store_name(package) + ".tgz",
+            npm_store_name(package) + ".tgz",
             url,
-            has_content_based_path = False,
             # Passed through a dict so the module still loads under a buck2 that predates `sri`,
             # such as the bootstrap binary that builds buck2.
             **{"sri": sri}
         )
+    return [
+        DefaultInfo(sub_targets = {npm_store_name(p): [DefaultInfo(default_output = t)] for p, t in tarballs.items()}),
+        NodejsNpmTarballsInfo(tarballs = tarballs),
+    ]
+
+nodejs_npm_tarballs = prelude_rule(
+    name = "nodejs_npm_tarballs",
+    impl = _nodejs_npm_tarballs_impl,
+    docs = """The tarballs of npm packages, for a `nodejs_npm_store`, usually made
+    by `pnpm_workspace` from a `pnpm-lock.yaml`. `packages` maps each package
+    key, `name@version`, to its tarball URL and its integrity, a Subresource
+    Integrity string such as the lockfile's `sha512-...`. Each is downloaded
+    only when something needs it.
+
+    A tarball is the same whatever the platform, so give the target the
+    incoming transition `prelude//nodejs:unconfigured`, as `pnpm_workspace`
+    does: then however many configurations the stores that use it are built
+    in, each tarball is one download, to one path.""",
+    examples = None,
+    further = None,
+    attrs = {
+        "packages": attrs.dict(attrs.string(), attrs.tuple(attrs.string(), attrs.string()), sorted = False, default = {}),
+    },
+    supports_incoming_transition = True,
+)
+
+def _unconfigured_transition_impl(_ctx: AnalysisContext) -> list[Provider]:
+    def impl(platform: PlatformInfo) -> PlatformInfo:
+        _ = platform  # @unused
+        return PlatformInfo(label = "<unconfigured>", configuration = ConfigurationInfo(constraints = {}, values = {}))
+
+    return [DefaultInfo(), TransitionInfo(impl = impl)]
+
+# A transition to the configuration with no constraints, for targets whose outputs are the same in
+# every configuration, such as downloads: built in one configuration, they are built once.
+unconfigured_transition = rule(
+    impl = _unconfigured_transition_impl,
+    attrs = {},
+    is_configuration_rule = True,
+)
+
+def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
+    excluded = {p: True for p in ctx.attrs.exclude}
+    tarballs = ctx.attrs.tarballs[NodejsNpmTarballsInfo].tarballs
 
     snapshot_packages = {}
     for snapshot, package in ctx.attrs.snapshot_packages.items():
-        if package not in ctx.attrs.packages:
-            fail("{}: snapshot `{}` is of package `{}`, which is not in `packages`".format(ctx.label, snapshot, package))
+        if package not in tarballs:
+            fail("{}: snapshot `{}` is of package `{}`, which `{}` does not have".format(ctx.label, snapshot, package, ctx.attrs.tarballs.label.raw_target()))
         if package not in excluded:
             snapshot_packages[snapshot] = package
     for snapshot in ctx.attrs.patches:
@@ -191,9 +223,6 @@ def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
     if node_gyp != None and node_gyp not in snapshot_packages:
         fail("{}: `node_gyp` is snapshot `{}`, which is not in `snapshot_packages`".format(ctx.label, node_gyp))
 
-    # Every entry is declared first: the closures hold them, and a package with install scripts
-    # runs them with the closures of its dependencies as inputs.
-    entries = {}
     names = {}
     links = {}
     deps = {}
@@ -210,48 +239,69 @@ def _nodejs_npm_store_impl(ctx: AnalysisContext) -> list[Provider]:
             if alias == name:
                 # A package cannot sit beside itself; a dependency on itself resolves to itself.
                 continue
-            snapshot_links.append((alias, _link_target(alias, dep, _package_name(snapshot_packages[dep]))))
+            snapshot_links.append((alias, dep))
             snapshot_deps.append(dep)
-        entries[snapshot] = ctx.actions.declare_output("store/" + npm_store_name(snapshot), dir = True, has_content_based_path = False)
         names[snapshot] = name
         links[snapshot] = snapshot_links
         deps[snapshot] = snapshot_deps
 
-    # Entries without install scripts need only their tarballs.
-    for snapshot, package in snapshot_packages.items():
-        if snapshot not in build:
-            _entry_action(ctx, snapshot, tarballs[package], names[snapshot], links[snapshot], entries[snapshot], ctx.attrs.patches.get(snapshot), None)
-
-    # One tset node per strongly connected component, each after the components it depends on,
-    # whose entries are bound by then: an entry that runs install scripts takes the closures of
-    # the components below its own as inputs. node-gyp goes first, so that its closure is
-    # there for every package that runs scripts.
+    # One action per strongly connected component, each after the components it depends on, whose
+    # entries are inputs of its own: its links lead to them by their paths. The outputs have
+    # content-based paths, so an entry built in two configurations is built once, as long as its
+    # tarball, patch and links are the same in both. A component of one snapshot is its entry; a
+    # dependency cycle is one directory with an entry for each member, linked to each other as
+    # siblings. node-gyp goes first, so that its closure is there for every package that runs
+    # scripts.
     toolchain = ctx.attrs._nodejs_toolchain[NodejsToolchainInfo]
-    roots = ([node_gyp] if node_gyp != None else []) + [s for s in entries if s != node_gyp]
+    roots = ([node_gyp] if node_gyp != None else []) + [s for s in snapshot_packages if s != node_gyp]
+    entries = {}
     tsets = []
     component_of = {}
     for component in strongly_connected_components(roots, deps):
+        members = sorted(component)
+        in_component = {s: True for s in members}
         children = {}
-        for s in component:
+        for s in members:
             for dep in deps[s]:
-                if dep not in component:
+                if dep not in in_component:
                     children[component_of[dep]] = True
         below = [tsets[c] for c in children]
-        for snapshot in sorted(component):
-            if snapshot in build:
-                _entry_action(
-                    ctx,
-                    snapshot,
-                    tarballs[snapshot_packages[snapshot]],
-                    names[snapshot],
-                    links[snapshot],
-                    entries[snapshot],
-                    ctx.attrs.patches.get(snapshot),
-                    _script_args(ctx, toolchain, snapshot, component, below, build, entries, names, node_gyp, component_of, tsets),
-                )
+        if len(members) == 1:
+            out = ctx.actions.declare_output("store/" + npm_store_name(members[0]), dir = True)
+            entries[members[0]] = out
+            subdirs = {members[0]: "."}
+        else:
+            out = ctx.actions.declare_output("store/" + npm_store_name(members[0]) + "+cycle", dir = True)
+            subdirs = {}
+            for s in members:
+                subdirs[s] = npm_store_name(s)
+                entries[s] = out.project(subdirs[s])
+        builds = [s for s in members if s in build]
+        cmd = cmd_args(ctx.attrs._package_tree_tool[RunInfo], "npm-entry", "--out", out.as_output())
+        if builds:
+            cmd.add(_script_args(ctx, toolchain, members, below, entries, names, node_gyp, component_of, tsets))
+        for s in members:
+            cmd.add(_member_args(
+                s,
+                subdirs[s],
+                tarballs[snapshot_packages[s]],
+                names[s],
+                links[s],
+                in_component,
+                entries,
+                names,
+                ctx.attrs.patches.get(s),
+                s in build,
+            ))
+        ctx.actions.run(
+            cmd,
+            category = "npm_install_scripts" if builds else "npm_entry",
+            identifier = members[0],
+            local_only = bool(builds) and ctx.attrs.build_local_only,
+        )
         kwargs = {"children": below} if below else {}
-        tsets.append(ctx.actions.tset(NodejsInputsTSet, value = [entries[s] for s in sorted(component)], **kwargs))
-        for s in component:
+        tsets.append(ctx.actions.tset(NodejsInputsTSet, value = [entries[s] for s in members], **kwargs))
+        for s in members:
             component_of[s] = len(tsets) - 1
     closures = {s: tsets[c] for s, c in component_of.items()}
 
@@ -264,10 +314,9 @@ nodejs_npm_store = prelude_rule(
     name = "nodejs_npm_store",
     impl = _nodejs_npm_store_impl,
     docs = """Third-party npm packages in a pnpm-style store, usually made by
-    `pnpm_workspace` from a `pnpm-lock.yaml`. `packages` maps each package
-    key, `name@version`, to its tarball URL and its integrity, a
-    Subresource Integrity string such as the lockfile's `sha512-...`.
-    `snapshot_packages` maps each snapshot key (a package key, with the
+    `pnpm_workspace` from a `pnpm-lock.yaml`. `tarballs`, a
+    `nodejs_npm_tarballs`, has the package tarballs by package key,
+    `name@version`. `snapshot_packages` maps each snapshot key (a package key, with the
     versions of its peer dependencies in parentheses when they decide
     which package it links to, as in `react-dom@19.1.1(react@19.1.1)`) to
     its package, and `snapshots` maps a snapshot key to its dependencies:
@@ -277,21 +326,26 @@ nodejs_npm_store = prelude_rule(
     optional dependencies that do not match the target platform.
 
     Each snapshot is one entry, built only when something needs it: the
-    tarball is downloaded and checked against its integrity, then
-    extracted to `node_modules/<name>` inside the entry, and each
+    tarball is extracted to `node_modules/<name>` inside the entry, and each
     dependency is a relative symlink beside it to the dependency's entry,
     as in pnpm's `node_modules/.pnpm`. Node resolves a package from its
     real path, so a package finds exactly its declared dependencies.
-    Entries refer to each other only by path, so dependency cycles, which
-    npm allows, need nothing special. `nodejs_npm_links` targets link the
-    store's packages into the `node_modules` of other targets. Each entry
-    is a sub-target, named by its directory name in the store.""",
+    The packages of a dependency cycle, which npm allows, are entries of
+    one directory, linked to each other as siblings.
+
+    Every output has a content-based path, so the store is configured
+    for each platform, and leaves out the optional packages of others,
+    yet a package that is the same in two configurations, with the same
+    dependencies, is downloaded and extracted once. `nodejs_npm_links`
+    targets link the store's packages into the `node_modules` of other
+    targets. Each entry is a sub-target, named by its directory name in
+    the store.""",
     examples = None,
     further = None,
     attrs = (
         # @unsorted-dict-items
         {
-            "packages": attrs.dict(attrs.string(), attrs.tuple(attrs.string(), attrs.string()), sorted = False, default = {}),
+            "tarballs": attrs.dep(providers = [NodejsNpmTarballsInfo]),
             "snapshot_packages": attrs.dict(attrs.string(), attrs.string(), sorted = False, default = {}),
             "snapshots": attrs.dict(attrs.string(), attrs.dict(attrs.string(), attrs.string(), sorted = False), sorted = False, default = {}),
             "exclude": attrs.list(attrs.string(), default = []),

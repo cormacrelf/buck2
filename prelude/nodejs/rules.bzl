@@ -10,7 +10,7 @@ load("@prelude//:prelude_rule.bzl", "make_rules")
 load(":nodejs_binary.bzl", nodejs_binary_spec = "nodejs_binary")
 load(":nodejs_library.bzl", nodejs_library_spec = "nodejs_library")
 load(":nodejs_node_modules.bzl", nodejs_node_modules_spec = "nodejs_node_modules")
-load(":nodejs_npm_store.bzl", nodejs_npm_bin_spec = "nodejs_npm_bin", nodejs_npm_links_spec = "nodejs_npm_links", nodejs_npm_store_spec = "nodejs_npm_store")
+load(":nodejs_npm_store.bzl", nodejs_npm_bin_spec = "nodejs_npm_bin", nodejs_npm_links_spec = "nodejs_npm_links", nodejs_npm_store_spec = "nodejs_npm_store", nodejs_npm_tarballs_spec = "nodejs_npm_tarballs")
 load(":nodejs_runtime.bzl", "nodejs_runtime")
 load(":nodejs_test.bzl", nodejs_test_spec = "nodejs_test")
 
@@ -21,6 +21,7 @@ specs = {
     "nodejs_npm_bin": nodejs_npm_bin_spec,
     "nodejs_npm_links": nodejs_npm_links_spec,
     "nodejs_npm_store": nodejs_npm_store_spec,
+    "nodejs_npm_tarballs": nodejs_npm_tarballs_spec,
     "nodejs_runtime": nodejs_runtime,
     "nodejs_test": nodejs_test_spec,
 }
