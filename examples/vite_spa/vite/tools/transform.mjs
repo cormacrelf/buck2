@@ -136,6 +136,8 @@ export async function transform(argv) {
       "plugins-dir": { type: "string" },
       plugin: { type: "string", multiple: true, default: [] },
       tailwind: { type: "string" },
+      "tailwind-candidates": { type: "string" },
+      candidates: { type: "string" },
     },
   });
   const job = new Module(args);
@@ -143,6 +145,15 @@ export async function transform(argv) {
   const code = await job.compile();
   fs.mkdirSync(path.dirname(args.out), { recursive: true });
   fs.writeFileSync(args.out, code);
+  if (args.candidates) fs.writeFileSync(args.candidates, JSON.stringify(await candidatesOf(args.src)));
+}
+
+// The strings in a source that Tailwind could take for class names, sorted, as its scanner
+// finds them. Most are not class names; Tailwind ignores those when it builds.
+async function candidatesOf(file) {
+  const { Scanner } = await import("@tailwindcss/oxide");
+  const found = new Scanner({ sources: [] }).scanFiles([{ content: fs.readFileSync(file, "utf8"), extension: extname(file).slice(1) }]);
+  return [...new Set(found)].sort();
 }
 
 class Module {
@@ -412,7 +423,7 @@ function __variableDynamicImport(glob, path) {
         style: "expanded",
       }).css;
     }
-    if (this.args.tailwind) text = await this.tailwind(text);
+    if (this.args.tailwind || this.args["tailwind-candidates"]) text = await this.tailwind(text);
     let targets;
     if (css.browserslist?.length) {
       const { default: browserslist } = await import("browserslist");
@@ -449,9 +460,10 @@ function __variableDynamicImport(glob, path) {
     return styleModule("/" + this.path, text, imports, isModule ? classMap(result.exports, css.modules?.camelCaseOnly) : null);
   }
 
-  // Generates Tailwind's utilities into the stylesheet, for the class names in the sources that
-  // `--tailwind` lists, as @tailwindcss/vite does with the files it scans. Tailwind's own
-  // stylesheets come from the copy that these tools depend on.
+  // Generates Tailwind's utilities into the stylesheet: for the class names in the sources that
+  // `--tailwind` lists, as @tailwindcss/vite does with the files it scans, or for the candidates
+  // in the file `--tailwind-candidates`, which the dev server collects from the modules that it
+  // has built. Tailwind's own stylesheets come from the copy that these tools depend on.
   async tailwind(source) {
     const { compile } = await import("@tailwindcss/node");
     const { Scanner } = await import("@tailwindcss/oxide");
@@ -467,6 +479,7 @@ function __variableDynamicImport(glob, path) {
         return file ? path.join(pkg, file) : undefined;
       },
     });
+    if (this.args["tailwind-candidates"]) return compiler.build(JSON.parse(fs.readFileSync(this.args["tailwind-candidates"], "utf8")));
     const files = JSON.parse(fs.readFileSync(this.args.tailwind, "utf8")).filter((f) => TAILWIND_SCANNED.includes(extname(f)));
     const scanner = new Scanner({ sources: [] });
     const candidates = scanner.scanFiles(files.map((f) => ({ content: fs.readFileSync(f, "utf8"), extension: extname(f).slice(1) })));

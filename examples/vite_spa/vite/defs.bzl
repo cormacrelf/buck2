@@ -26,6 +26,11 @@ ViteModulesInfo = provider(fields = {
     "package_name": provider_field(str | None),
     # The module that each subpath the package exports names, as a path in the project.
     "exports": provider_field(dict[str, str]),
+    # For each module of a source that Tailwind looks in, by key: the strings in the source that
+    # could be class names, which the module's action finds, as a sorted JSON list.
+    "candidates": provider_field(dict[str, Artifact]),
+    # The keys of the package's stylesheets that Tailwind generates utilities into.
+    "tailwind": provider_field(list[str]),
     # Each module by its key: the source's path in the project, with `~<query>` for a query.
     "modules": provider_field(dict[str, Artifact]),
     # `index.html`, with its paths made absolute in the project, for a package that has one.
@@ -50,6 +55,8 @@ ViteNpmInfo = provider(fields = {
 })
 
 _JS = (".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs")
+# What Tailwind looks for class names in, as `TAILWIND_SCANNED` in tools/transform.mjs.
+_TAILWIND_SCANNED = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".html", ".md", ".mdx")
 _CSS = (".css", ".scss", ".sass")
 
 def _ext(path: str) -> str:
@@ -148,10 +155,11 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
         tool = WorkerRunInfo(worker = ctx.attrs._worker[WorkerInfo], exe = ctx.attrs._transform[RunInfo].args)
     else:
         tool = ctx.attrs._transform[RunInfo]
-    # Tailwind's stylesheets are built from every source that @tailwindcss/vite would scan: the
-    # package's and those of its workspace packages, except generated ones, which the plugin
-    # skips as git ignores them. Naive: an edit to any source builds the stylesheets again, and
-    # the first page waits for all of them. See `tailwind` in the attributes.
+    # Tailwind's stylesheets, as modules of the package, are built from every source that
+    # @tailwindcss/vite would scan: the package's and those of its workspace packages, except
+    # generated ones, which the plugin skips as git ignores them. That suits a build of the whole
+    # app. The dev server builds them instead from the candidates of the modules that the browser
+    # has loaded, with the handler `tailwind` of dev.bxl, so that a page waits for no more.
     tailwind = {}
     if ctx.attrs.tailwind:
         scanned = [a for a in srcs.values() if a.is_source]
@@ -164,10 +172,15 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
         tailwind = {pkg + "/" + p: args for p in ctx.attrs.tailwind}
 
     modules = {}
+    candidates = {}
     for path, src in srcs.items():
         for query in _queries(path):
             key = path + ("~" + query if query else "")
             out = ctx.actions.declare_output("vite/m/" + key[len(pkg) + 1:] + ".js")
+            found = []
+            if not query and path.endswith(_TAILWIND_SCANNED):
+                candidates[key] = ctx.actions.declare_output("vite/c/" + key[len(pkg) + 1:] + ".json")
+                found = ["--candidates", candidates[key].as_output()]
             ctx.actions.run(
                 cmd_args(
                     base,
@@ -180,6 +193,7 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
                     src,
                     "--out",
                     out.as_output(),
+                    found,
                     hidden = styles if path.endswith(_CSS) else [],
                 ),
                 category = "vite_transform",
@@ -204,6 +218,8 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
             package = pkg,
             package_name = ctx.attrs.package_name,
             exports = exports,
+            candidates = candidates,
+            tailwind = [pkg + "/" + p for p in ctx.attrs.tailwind],
             modules = modules,
             html = html,
             public = pkg + "/" + ctx.attrs.public if ctx.attrs.public else None,

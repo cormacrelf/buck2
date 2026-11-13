@@ -21,6 +21,8 @@ def _dev(ctx):
         args += ["--public", info.public]
     if info.server_plugins:
         args.append(info.server_plugins)
+    for key in info.tailwind:
+        args += ["--tailwind", key]
     return [
         DefaultInfo(),
         DevInfo(
@@ -30,6 +32,7 @@ def _dev(ctx):
                 "image": "root//vite/dev.bxl:image",
                 "module": "root//vite/dev.bxl:module",
                 "npm": "root//vite/dev.bxl:npm",
+                "tailwind": "root//vite/dev.bxl:tailwind",
             },
         ),
     ]
@@ -65,6 +68,11 @@ def _module(ctx):
     key = ctx.cli_args.key
     path, _, query = key.partition("~")
     for info in _libraries(ctx, path):
+        if key in info.candidates:
+            # The strings that could be Tailwind class names come with the module, for the server
+            # to collect for the handler `tailwind`.
+            module = info.modules[key]
+            return [DefaultInfo(default_output = module), DevOutput(module, sidecars = {"candidates": info.candidates[key]})]
         if key in info.modules:
             return [DefaultInfo(default_output = info.modules[key])]
         if path in info.srcs:
@@ -97,6 +105,45 @@ def _compile(ctx, info, path, query):
     return out
 
 module = bxl_main(impl = _module, cli_args = {"key": cli_args.string()})
+
+def _tailwind(ctx):
+    """A `buck2 dev` handler: the Tailwind stylesheet `--key`, with the utilities of the
+    candidates in `--candidates`, a JSON list. The server collects them from the modules that it
+    has built, so the stylesheet is built from what the browser has loaded, and not from every
+    source of the app, as @tailwindcss/vite collects them in dev from the files that it scans."""
+    key = ctx.cli_args.key
+    for info in _libraries(ctx, key):
+        if key in info.tailwind:
+            actions = ctx.bxl_actions().actions
+            candidates = actions.write("vite/tw/{}.candidates.json".format(key), ctx.cli_args.candidates)
+            out = actions.declare_output("vite/tw/{}.js".format(key))
+            actions.run(
+                cmd_args(
+                    info.transform,
+                    "--path",
+                    key,
+                    "--query=",
+                    "--src",
+                    info.srcs[key],
+                    "--out",
+                    out.as_output(),
+                    "--tailwind-candidates",
+                    candidates,
+                    hidden = info.styles,
+                ),
+                category = "vite_tailwind",
+                identifier = key,
+            )
+            return [DefaultInfo(default_output = out)]
+    fail("no `vite_library` in //{} has the Tailwind stylesheet `{}`".format(_package_of(ctx, key), key))
+
+tailwind = bxl_main(
+    impl = _tailwind,
+    cli_args = {
+        "candidates": cli_args.string(),
+        "key": cli_args.string(),
+    },
+)
 
 def _image(ctx):
     """A `buck2 dev` handler: one image that an image module names, the source at `--path`

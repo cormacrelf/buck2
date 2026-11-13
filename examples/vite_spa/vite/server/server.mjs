@@ -31,6 +31,7 @@ const { values: args, positionals } = parseArgs({
     port: { type: "string", default: process.env.PORT ?? "5173" },
     "plugins-dir": { type: "string" },
     plugin: { type: "string", multiple: true, default: [] },
+    tailwind: { type: "string", multiple: true, default: [] },
   },
   allowPositionals: true,
 });
@@ -54,7 +55,8 @@ class Buck {
     this.pending = new Set(); // output names to ask for with the next build
     this.building = new Set(); // output names asked for and not yet answered
     this.results = new Map(); // output name -> its last `built`, until it is stale
-    this.handlers = { stale: () => {} };
+    this.handlers = { stale: () => {}, built: () => {} };
+    this.idlers = []; // resolved when no module is building
     this.ready = new Promise((r) => (this.onReady = r));
     this.sock = net.connect(process.env.BUCK2_DEV_SOCKET);
     let buf = "";
@@ -106,6 +108,22 @@ class Buck {
     const ws = this.waiters.get(name);
     this.waiters.delete(name);
     for (const w of ws ?? []) f(w);
+    if (this.idlers.length && ![...this.building].some((n) => n.startsWith("m:"))) {
+      for (const resolve of this.idlers.splice(0)) resolve();
+    }
+  }
+  // Resolves when no module is building, as when the modules of a page that the prefetcher
+  // found are all built.
+  idle() {
+    if (![...this.building].some((n) => n.startsWith("m:"))) return Promise.resolve();
+    return new Promise((resolve) => this.idlers.push(resolve));
+  }
+  forget(names) {
+    for (const name of names) {
+      this.defined.delete(name);
+      this.results.delete(name);
+    }
+    this.send({ type: "forget", outputs: names });
   }
   message(m) {
     switch (m.type) {
@@ -116,6 +134,7 @@ class Buck {
         log("built", m.output, m.changed ? "changed" : "same");
         this.building.delete(m.output);
         this.results.set(m.output, m);
+        this.handlers.built(m);
         this.settle(m.output, (w) => w.resolve(m));
         break;
       case "failed":
@@ -210,6 +229,98 @@ function prefetch(url) {
   });
 }
 
+// --- Tailwind ------------------------------------------------------------------------------
+//
+// @tailwindcss/vite scans every file of the app for class names, and so the stylesheet waits for
+// every file. Here each module's action finds the strings in its source that could be class
+// names, and they come with the module as its sidecar `candidates`. The server keeps those of
+// every module that it has built, as the plugin keeps what it has found in dev: the set only
+// grows. The handler `tailwind` builds a stylesheet from the set, and a page waits only for its
+// own modules. When a module brings new candidates, the stylesheet is built again, and the
+// browser gets it as an HMR update. Each set is an output of its own, so the old one is
+// forgotten.
+
+const candidates = new Set();
+const tailwind = new Map(
+  args.tailwind.map((key) => [key, { version: 0, size: -1, name: null, building: null, digest: null, served: false }]),
+);
+// A buck2 without sidecars for the outputs of handlers sends modules without their candidates.
+// The stylesheets are then the modules of their packages, built from every source.
+let noSidecars = false;
+const SCANNED = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".md", ".mdx"];
+
+buck.handlers.built = (m) => {
+  if (!tailwind.size) return;
+  const file = m.sidecars?.candidates?.path;
+  if (!file) {
+    const key = m.output.startsWith("m:") ? m.output.slice(2) : "";
+    if (!noSidecars && !key.includes("~") && SCANNED.includes(extname(key))) {
+      noSidecars = true;
+      console.warn("buck2 dev sends modules without their Tailwind candidates, so the stylesheets are built from every source");
+    }
+    return;
+  }
+  const before = candidates.size;
+  for (const c of JSON.parse(fs.readFileSync(file, "utf8"))) candidates.add(c);
+  if (candidates.size === before) return;
+  // A module brought new class names: once the browser has a stylesheet, it gets one with them
+  // before it gets the module, so that the module's elements are never shown without their
+  // styles. See `stylesheetFirst`.
+  if ([...tailwind.values()].some((state) => state.served)) waits.set(m.output, scheduleStylesheets());
+};
+
+const waits = new Map(); // module output name -> the stylesheet update with its candidates
+let scheduled = null;
+
+// Builds the stylesheets again, and sends them to the browser, once the modules that are building
+// now are built, so that one update has the candidates of all of them.
+function scheduleStylesheets() {
+  scheduled ??= new Promise((resolve) => setTimeout(resolve, 5))
+    .then(() => buck.idle())
+    .then(() => {
+      scheduled = null;
+      return Promise.all([...tailwind].filter(([, state]) => state.served).map(([key]) => updateStylesheet(key)));
+    });
+  return scheduled;
+}
+
+// Waits for the stylesheet update that has the candidates of the module output `name`, if it
+// brought new ones.
+async function stylesheetFirst(name) {
+  const wait = waits.get(name);
+  if (!wait) return;
+  await wait;
+  waits.delete(name);
+}
+
+// The stylesheet `key`, built from the candidates as they are now.
+function buildStylesheet(key) {
+  const state = tailwind.get(key);
+  if (state.size === candidates.size && state.building) return state.building;
+  const sorted = [...candidates].sort();
+  const old = state.name;
+  state.size = candidates.size;
+  state.name = `tw:${key}@${++state.version}`;
+  state.building = buck.get(state.name, { handler: "tailwind", args: ["--key", key, "--candidates", JSON.stringify(sorted)] });
+  if (old) state.building.then(() => buck.forget([old]), () => {});
+  return state.building;
+}
+
+async function updateStylesheet(key) {
+  const state = tailwind.get(key);
+  let built;
+  try {
+    built = await buildStylesheet(key);
+  } catch (e) {
+    server.environments.client.hot.send({ type: "error", err: { message: e.message, stack: "", plugin: "buck2-dev", id: key } });
+    return;
+  }
+  if (built.digest === state.digest) return;
+  state.digest = built.digest;
+  const mod = server.environments.client.moduleGraph.getModuleById(root + "/" + key + ".js");
+  if (mod) await server.environments.client.reloadModule(mod);
+}
+
 // --- The Vite plugin ----------------------------------------------------------------------
 
 let server;
@@ -244,13 +355,35 @@ function buckPlugin() {
         return fs.readFileSync(path.join(dir, ...rest), "utf8");
       }
       if (!ours.has(id)) return null;
-      prefetch(id.slice(root.length));
       const key = urlKey(id.slice(root.length));
+      if (tailwind.has(key)) {
+        // Once the page's modules that are building are built, so that the first stylesheet
+        // has their class names.
+        await buck.idle();
+        const state = tailwind.get(key);
+        if (noSidecars) {
+          try {
+            return { code: fs.readFileSync(await readOutput(moduleOutput(key)), "utf8"), moduleType: "js" };
+          } catch (e) {
+            this.error(e.message);
+          }
+        }
+        try {
+          const built = await buildStylesheet(key);
+          state.digest = built.digest;
+          state.served = true;
+          return { code: fs.readFileSync(built.path, "utf8"), moduleType: "js" };
+        } catch (e) {
+          this.error(e.message);
+        }
+      }
+      prefetch(id.slice(root.length));
       const file = path.join(root, key.split("~")[0]);
       if (!idsByFile.has(file)) idsByFile.set(file, new Set());
       idsByFile.get(file).add(id);
       try {
         const file = await readOutput(moduleOutput(key));
+        await stylesheetFirst("m:" + key);
         return { code: fs.readFileSync(file, "utf8"), moduleType: "js" };
       } catch (e) {
         this.error(e.message);
@@ -336,6 +469,15 @@ buck.handlers.stale = async (outputs) => {
     await Promise.allSettled(names.filter((n) => n === "index" || n.startsWith("npm:")).map((n) => buck.get(n)));
     server.environments.client.hot.send({ type: "full-reload" });
   }
+  // A Tailwind stylesheet is stale when it or its theme changed.
+  for (const name of names.filter((n) => n.startsWith("tw:"))) {
+    const key = name.slice(3, name.lastIndexOf("@"));
+    const state = tailwind.get(key);
+    if (state?.name === name) {
+      state.size = -1;
+      updateStylesheet(key);
+    }
+  }
   const modules = names.filter((n) => n.startsWith("m:"));
   const env = server.environments.client;
   const changed = new Map(); // source file -> the Vite modules of it that changed
@@ -349,6 +491,7 @@ buck.handlers.stale = async (outputs) => {
       return;
     }
     stale.delete(name);
+    await stylesheetFirst(name);
     if (!out.changed) return;
     const key = name.slice(2);
     const url = "/" + key + (key.includes("~") || !JS_EXTS.includes(extname(key)) ? ".js" : "");
