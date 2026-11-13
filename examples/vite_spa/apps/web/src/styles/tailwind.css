@@ -1,0 +1,8 @@
+/* Tailwind's theme and utilities, without its preflight reset, so that the app's own base styles
+   stay as they are. @tailwindcss/vite scans the app, and the workspace packages through
+   @source, for class names. Under buck2 this stylesheet's action reads the same sources: see
+   `tailwind` in apps/web/BUCK. */
+@layer theme, utilities;
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities);
+@source '../../../../packages';

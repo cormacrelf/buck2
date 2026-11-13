@@ -14,7 +14,9 @@ export function TerrainFallback() {
   return (
     <>
       <RouteFallback />
-      <p>{t('terrain.waiting', { seconds: ((now - start) / 1000).toFixed(1) })}</p>
+      <p className="mt-4 font-mono text-sm text-amber-700 animate-pulse">
+        {t('terrain.waiting', { seconds: ((now - start) / 1000).toFixed(1) })}
+      </p>
     </>
   );
 }

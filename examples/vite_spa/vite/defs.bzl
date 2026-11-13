@@ -148,6 +148,21 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
         tool = WorkerRunInfo(worker = ctx.attrs._worker[WorkerInfo], exe = ctx.attrs._transform[RunInfo].args)
     else:
         tool = ctx.attrs._transform[RunInfo]
+    # Tailwind's stylesheets are built from every source that @tailwindcss/vite would scan: the
+    # package's and those of its workspace packages, except generated ones, which the plugin
+    # skips as git ignores them. Naive: an edit to any source builds the stylesheets again, and
+    # the first page waits for all of them. See `tailwind` in the attributes.
+    tailwind = {}
+    if ctx.attrs.tailwind:
+        scanned = [a for a in srcs.values() if a.is_source]
+        for dep in ctx.attrs.deps:
+            scanned.extend([a for a in dep[ViteModulesInfo].srcs.values() if a.is_source])
+        if ctx.attrs.html:
+            scanned.append(ctx.attrs.html)
+        listing = ctx.actions.write_json("vite/tailwind_sources.json", scanned)
+        args = cmd_args("--tailwind", listing, hidden = scanned)
+        tailwind = {pkg + "/" + p: args for p in ctx.attrs.tailwind}
+
     modules = {}
     for path, src in srcs.items():
         for query in _queries(path):
@@ -157,6 +172,7 @@ def _vite_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 cmd_args(
                     base,
                     plugins.get(_ext(path), []),
+                    tailwind.get(path, []) if not query else [],
                     "--path",
                     path,
                     "--query=" + query,
@@ -243,6 +259,9 @@ vite_library = rule(
         "package_name": attrs.option(attrs.string(), default = None),
         "public": attrs.option(attrs.string(), default = None),
         "srcs": attrs.list(attrs.source(), default = []),
+        # Stylesheets of the package that Tailwind generates utilities into, as @tailwindcss/vite
+        # does for those that `@import "tailwindcss"`.
+        "tailwind": attrs.list(attrs.string(), default = []),
         "_html": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:html")),
         "_transform": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:transform")),
         "_worker": attrs.default_only(attrs.exec_dep(default = "root//vite/tools:transform_worker")),

@@ -18,6 +18,9 @@ vite_package(
     },
     public = "public",
     scss_additional_data = '@use "@/styles/tokens" as *;\n',
+    # Stylesheets that @tailwindcss/vite generates utilities into. Each is built from every source
+    # of the app and its workspace packages, as the plugin scans them all.
+    tailwind = ["src/styles/tailwind.css"],
     # vite-imagetools and @vitejs/plugin-react are built in. The app's own plugins run as they
     # are: the build hooks of markdown and photo in each module's action, and the server hooks
     # of build-info and markdown in the dev server.

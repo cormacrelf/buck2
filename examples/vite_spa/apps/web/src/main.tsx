@@ -5,6 +5,7 @@ import '@fontsource/literata/latin-400-italic.css';
 import '@fontsource/literata/latin-600.css';
 import './styles/fonts.scss';
 import './styles/global.css';
+import './styles/tailwind.css';
 
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';

@@ -157,6 +157,10 @@ after that:
   there reaches the page without `tsc` writing `dist/`.
 - **`packages/taxa`**: `scripts/generate.mjs` runs as a genrule, and an edit to
   `taxa.json` is an HMR update of the pages that use it.
+- **Tailwind**: `src/styles/tailwind.css` is built by one action that reads every source of
+  the app and its workspace packages, which is what `@tailwindcss/vite` scans. Generated
+  sources are left out, as the plugin skips git-ignored files; otherwise the home page would
+  wait for the terrain genrule. Warm, the action takes about 6ms for the 103 sources here.
 - **`packages/terrain`** shows that buck2 builds only what the open page needs. Its genrule is
   made to take five seconds, and only the Terrain page imports the package and the d3 packages
   it draws with. Nothing waits for any of it until the browser opens that page, and the page

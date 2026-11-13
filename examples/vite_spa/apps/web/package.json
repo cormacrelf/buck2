@@ -27,6 +27,7 @@
     "react-router": "^8.5.1"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
     "@types/d3-contour": "^3.0.6",
     "@types/d3-geo": "^3.1.1",
     "@types/d3-scale-chromatic": "^3.1.0",
@@ -38,6 +39,7 @@
     "marked": "^18.2.0",
     "sass": "^1.108.2",
     "sharp": "^0.35.5",
+    "tailwindcss": "^4.3.5",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vite-imagetools": "^12.0.2"

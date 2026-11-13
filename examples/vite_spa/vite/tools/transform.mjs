@@ -34,6 +34,7 @@
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -41,10 +42,14 @@ import { transformSync } from "oxc-transform";
 import { init, parse } from "es-module-lexer";
 import { loadPlugins } from "./plugins.mjs";
 
+const require = createRequire(import.meta.url);
+
 export class TransformError extends Error {}
 
 const JS_EXTS = [".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs"];
 const CSS_EXTS = [".css", ".scss", ".sass"];
+// What Tailwind looks for class names in.
+const TAILWIND_SCANNED = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".html", ".md", ".mdx"];
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".avif", ".tiff", ".gif"];
 const PROBE = [...JS_EXTS, ".json", ...JS_EXTS.map((e) => "/index" + e)];
 const IMAGE_DIRECTIVES = ["w", "h", "format", "as", "preset", "quality"];
@@ -130,6 +135,7 @@ export async function transform(argv) {
       encode: { type: "boolean", default: false },
       "plugins-dir": { type: "string" },
       plugin: { type: "string", multiple: true, default: [] },
+      tailwind: { type: "string" },
     },
   });
   const job = new Module(args);
@@ -406,6 +412,7 @@ function __variableDynamicImport(glob, path) {
         style: "expanded",
       }).css;
     }
+    if (this.args.tailwind) text = await this.tailwind(text);
     let targets;
     if (css.browserslist?.length) {
       const { default: browserslist } = await import("browserslist");
@@ -440,6 +447,30 @@ function __variableDynamicImport(glob, path) {
     }
     if (this.query === "inline" || this.query === "raw") return `export default ${JSON.stringify(text)};\n`;
     return styleModule("/" + this.path, text, imports, isModule ? classMap(result.exports, css.modules?.camelCaseOnly) : null);
+  }
+
+  // Generates Tailwind's utilities into the stylesheet, for the class names in the sources that
+  // `--tailwind` lists, as @tailwindcss/vite does with the files it scans. Tailwind's own
+  // stylesheets come from the copy that these tools depend on.
+  async tailwind(source) {
+    const { compile } = await import("@tailwindcss/node");
+    const { Scanner } = await import("@tailwindcss/oxide");
+    const pkg = path.dirname(require.resolve("tailwindcss/package.json"));
+    const { exports } = JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf8"));
+    const compiler = await compile(source, {
+      base: path.dirname(path.join(this.root, this.path)),
+      onDependency() {},
+      async customCssResolver(id) {
+        if (id !== "tailwindcss" && !id.startsWith("tailwindcss/")) return undefined;
+        const target = exports["." + id.slice("tailwindcss".length)];
+        const file = typeof target === "string" ? target : target?.style;
+        return file ? path.join(pkg, file) : undefined;
+      },
+    });
+    const files = JSON.parse(fs.readFileSync(this.args.tailwind, "utf8")).filter((f) => TAILWIND_SCANNED.includes(extname(f)));
+    const scanner = new Scanner({ sources: [] });
+    const candidates = scanner.scanFiles(files.map((f) => ({ content: fs.readFileSync(f, "utf8"), extension: extname(f).slice(1) })));
+    return compiler.build(candidates);
   }
 
   compileJson(source) {
